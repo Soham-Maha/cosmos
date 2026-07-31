@@ -7,6 +7,12 @@ disagree, fix one of them — they must stay in sync.
 
 Audience: (a) us, building the library; (b) application authors embedding it.
 
+> **Structural spine:** the layering that makes Cosmos a simulation library
+> *and* a future hypervisor *and* a production runtime from one source is in
+> **`docs/architecture.md`** (two seams: backends for two binaries; substrates
+> for the hypervisor door). This document is the API reference; read
+> `architecture.md` first for the big picture.
+
 ---
 
 ## 1. Concepts
@@ -37,16 +43,19 @@ introduces no fifth source.
 ```
 include/cosmos/
 ├── cosmos.hpp      umbrella include
+├── runtime.hpp     Runtime (Seam A): Clock, Rng, Net, Storage — app-facing base
 ├── time.hpp        Time, Duration, chrono literals
 ├── random.hpp      Rng: xoshiro256**, stream splitting, coin/range/…
 ├── task.hpp        Task coroutine type + awaitables (Yield, Sleep)
-├── simulator.hpp   Simulator, SimConfig, SimResult  ← the universe
+├── simulator.hpp   Simulator (= Runtime + Universe facade + ISubstrate), SimConfig, SimResult
 ├── net.hpp         Net, Node, Endpoint, Address, Packet, Verdict
 ├── faults.hpp      FaultProfile, fault scheduling helpers
 ├── gen.hpp         deterministic data generators (property-testing style)
 ├── assert.hpp      always / sometimes / reachable / COSMOS_CHECK, reports
 ├── campaign.hpp    Campaign, CampaignConfig, CampaignReport
 └── storage.hpp     (Phase 4) simulated disk, fsync/crash semantics
+include/cosmos-real/
+└── real.hpp        RealRuntime (Seam A impl, prod): epoll, real sockets/files/time
 ```
 
 Namespace: `cosmos::`. Chrono literals in `cosmos::literals` (`1ms`, `10s`).
@@ -196,6 +205,16 @@ loop:
 All interleaving exploration concentrates in step 1's draw; all time/fault
 exploration in the seeded latencies/faults of step 3's events. One universe =
 one path through that choice space.
+
+> **Layering note.** `Simulator` is a *facade* over `Universe` (the
+> substrate-agnostic engine: seed, virtual clock, RNG streams, fault timeline,
+> assertions, event loop) and an `ISubstrate` implementation (the execution
+> unit). Today the only substrate is the cooperative coroutine scheduler (the
+> "library substrate"); a future "hypervisor substrate" (`KvmSubstrate`)
+> implements the same `ISubstrate` against a VM and reuses the whole engine.
+> See `docs/architecture.md` §5. The real backend (`RealRuntime`) implements
+> the app-facing `Runtime` (Seam A) but **not** `ISubstrate` — production is
+> not driven by a determinism engine.
 
 ---
 
@@ -428,9 +447,9 @@ Durability model (the part that finds real bugs):
 
 ---
 
-## 13. The determinism contract (user obligations)
+## 13. The determinism contract (app obligations under the sim backend)
 
-Determinism is guaranteed *if* code running inside a universe:
+Under the **sim backend**, determinism is guaranteed *if* code running inside a universe:
 
 1. Reads time only via `sim.now()` / sleeps via `co_await sim.sleep(...)`.
 2. Draws randomness only via `sim.workload_rng()`, `sim.user_rng()`, `gen::*`.
@@ -465,8 +484,8 @@ Enforcement aids: verify mode (§11), `COSMOS_STRICT` build that interposes
 
 ## 15. Non-goals (v1)
 
-- Running unmodified binaries (requires the hypervisor stage).
-- Real-time execution / production backends (`real.hpp` — Phase 6).
+- Running unmodified binaries: requires the **hypervisor substrate** (Seam B, Phase 7+); the library substrate needs the app written against `Runtime`.
+- A fully-featured **real backend** in v1: the `Runtime` interface and a minimal real backend (real clock + echo net) land in Phase 1 so the two-binary split works; full net/storage parity matures alongside sim across phases. The prod binary is normal OS execution, never a determinism target.
 - Multi-process universes, shared memory, threads inside a universe.
 - Byzantine behavior injection beyond user verdict hooks.
 - UI/notebook debugging (Antithesis territory; Phase 5 trace export is the

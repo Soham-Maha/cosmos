@@ -9,11 +9,14 @@ simulator and TigerBeetle's VOPR, packaged as a reusable library.
 
 > **Direction change (2026-07-31):** the original hypervisor-first plan
 > (Antithesis-style, Linux+KVM, Rust) is superseded by a **library-first** plan
-> in **C++**, due to time constraints. The hypervisor remains a possible later
-> stage (Phase 7+). The Antithesis study notes are preserved in
-> `docs/antithesis-study-notes.md` — the architecture below applies their ideas
-> (input tree, seeded exploration, assertions, replay, branching) at the
-> process level instead of the VM level.
+> in **C++**, due to time constraints. The hypervisor is **not** a separate
+> later project: it is a future *execution substrate* (`KvmSubstrate`) that
+> implements the same `ISubstrate` seam (Seam B) as the library substrate, so
+> it reuses the entire determinism engine. Likewise the production runtime is
+> a second *backend* (Seam A) from Phase 1, so one app source builds both a
+> testing binary and a normal prod binary. The full layering is in
+> `docs/architecture.md`; the Antithesis study notes are preserved in
+> `docs/antithesis-study-notes.md`.
 
 ---
 
@@ -40,12 +43,14 @@ Full API reference: **`docs/design.md`**. Antithesis research: **`docs/antithesi
 | Decision | Choice | Rationale |
 |---|---|---|
 | Language | **C++20** | User requirement; coroutines give ergonomic cooperative tasks with zero dependencies. |
-| Delivery form | **Embeddable library** (`libcosmos`) | Anyone can plug it into their app to get DST; no hypervisor/VM required; huge time saving. |
-| Determinism model | **In-process, single-threaded simulation** (FDB/TigerBeetle model) | One deterministic cooperative scheduler + virtual time + seeded RNG + simulated I/O = reproducible-by-seed executions. |
-| Task model | **C++20 stackless coroutines** on a deterministic scheduler | User code looks synchronous (`co_await net.recv()`), scheduler controls all interleavings. No threads inside a simulation. |
-| Exploration | **Seeded fuzzing across many runs** (1 run = 1 universe), parallel across cores; coverage guidance + fork()-based branching later | Matches available time; Antithesis-style input tree implemented at decision-log level. |
-| Hypervisor | **Deferred** (optional Phase 7) | Library validates the DST concepts first; hypervisor would later remove the determinism-contract burden for unmodified binaries. |
-| Production story | Same app code, two backends: `cosmos::sim` (testing) and `cosmos::real` (production, later phase) | FoundationDB's model: app never calls OS I/O directly, only Cosmos interfaces. |
+| Delivery form | **Two libraries**: `libcosmos` (sim) + `libcosmos-real` (prod) | One app source, two binaries: a testing binary and a normal prod binary. |
+| App runtime (Seam A) | App codes against abstract `Runtime` (`Clock`/`Rng`/`Net`/`Storage`); `Simulator` and `RealRuntime` both implement it | FoundationDB model: app never calls OS I/O directly → same source is the test binary *and* the prod binary. Structural from Phase 1. See `docs/architecture.md`. |
+| Execution substrate (Seam B) | `ISubstrate` seam *inside* the sim backend; library substrate (coroutines) now, hypervisor substrate (KVM) later | The determinism engine is written once; the hypervisor becomes "implement `ISubstrate` for KVM", not a separate project. |
+| Determinism model | **In-process, single-threaded simulation** (FDB/TigerBeetle model) for the library substrate | One deterministic cooperative scheduler + virtual time + seeded RNG + simulated I/O = reproducible-by-seed executions. |
+| Task model | **C++20 stackless coroutines** on a deterministic scheduler (library substrate) | User code looks synchronous (`co_await net.recv()`), scheduler controls all interleavings. No threads inside a simulation. |
+| Exploration | **Seeded fuzzing across many runs** (1 run = 1 universe), parallel across cores; coverage guidance + `Snapshot`-based branching later | Antithesis-style input tree implemented at decision-log level. |
+| Hypervisor | **Future substrate** (`KvmSubstrate : ISubstrate`, Phase 7+) | Removes the determinism contract for unmodified binaries by interposition; reuses the entire engine via Seam B. |
+| Production story | Same app source, two binaries: `myapp_test` (links `libcosmos`, runs `Campaign`) and `myapp` (links `libcosmos-real`, normal OS process) | The prod binary is real OS execution, never a determinism target. |
 
 ## 2. What "library-first DST" means
 
@@ -225,15 +230,17 @@ bit-compares trace hashes).
 | Phase | Content | Exit criteria |
 |---|---|---|
 | 0 | Study notes (Antithesis/FDB/TigerBeetle) — done, see `docs/antithesis-study-notes.md` | — |
-| 1 | **Core runtime**: rng streams, virtual time, coroutine scheduler, simulator loop, assertions | same seed ⇒ bit-identical trace hash (proven by example) |
-| 2 | **Simulated network + faults**: endpoints, latency/loss/reorder, partitions, node crash/reboot, verdict hooks | ping-pong example survives faults; partition scenario reproducible |
-| 3 | **Workloads + campaign**: gen combinators, swarm configs, parallel campaign runner, repro CLI, trace hash verify mode | 10k-seed campaign runs across cores; findings replay exactly |
-| 4 | **Simulated storage**: files, write/fsync durability model, crash-torn writes | KV example detects lost-write bug under crash faults |
-| 5 | **Exploration v2/v3**: sancov guidance, fork()-branching, decision-log minimization, trace export | minimized repros; visible multiverse map |
-| 6 | **Real backends + UX**: epoll/real-time implementations of net/time so apps ship unmodified; docs; packaging | example app runs in prod mode |
-| 7 | **(Optional) hypervisor stage**: run unmodified binaries deterministically (original KVM plan, see git history of this file) | separate project gate |
+| 1 | **Core runtime + two-binary split**: `Runtime` interface (Seam A), rng streams, virtual time, coroutine scheduler, `Universe`+`ISubstrate` (library substrate), simulator loop, assertions; **minimal real backend** (real clock + echo net) so the same app compiles into a prod binary | same seed ⇒ bit-identical trace hash; app builds as both `myapp_test` and `myapp` |
+| 2 | **Simulated network + faults** (+ real-backend parity: real sockets via epoll): endpoints, latency/loss/reorder, partitions, crash/reboot, verdict hooks | ping-pong survives faults; partition reproducible; prod binary pings over real sockets |
+| 3 | **Workloads + campaign**: gen combinators, swarm configs, parallel campaign runner, repro CLI, trace-hash verify mode | 10k-seed campaign across cores; findings replay exactly |
+| 4 | **Simulated storage** (+ real files/fsync parity): write/fsync durability model, crash-torn writes | KV example detects lost-write bug under crash faults |
+| 5 | **Exploration v2/v3**: sancov guidance, `Snapshot`-based branching (Seam B), decision-log minimization, trace export | minimized repros; visible multiverse map |
+| 6 | **Production hardening**: harden the real backend to full parity, packaging, docs | example app runs reliably in prod mode |
+| 7 | **(Optional) hypervisor substrate**: `KvmSubstrate : ISubstrate` — run unmodified binaries deterministically (original KVM plan) | reuses Phases 1–5 engine; gate is only the VM time/IO determinism work |
 
-Timeline: Phases 1–3 ≈ 2–3 weeks part-time (the time-crunch MVP).
+Timeline: Phases 1–3 ≈ 2–3 weeks part-time (the time-crunch MVP). The
+two-binary split costs little: the load-bearing artifact is the `Runtime`
+interface, not a complete real backend.
 
 ## 10. Risks
 
@@ -247,7 +254,14 @@ Timeline: Phases 1–3 ≈ 2–3 weeks part-time (the time-crunch MVP).
    verify mode.
 4. **Single-process ceiling**: one universe can't exceed one core's
    throughput — by design; scale by more universes, not bigger universes.
-5. **Fork-branching memory pressure** in Phase 5 → bounded branching budget.
+5. **Branching memory pressure** in Phase 5 (`Snapshot` save/restore) →
+   bounded branching budget.
+6. **Premature abstraction** — introducing the `ISubstrate` seam (Seam B) before
+   the hypervisor exists means guessing its needs. Mitigated by keeping the
+   interface minimal and deriving it from the library substrate first; expect
+   one revision when `KvmSubstrate` lands. The Antithesis study notes give a
+   strong prior on what a hypervisor substrate needs, so the guess is
+   well-grounded.
 
 ## 11. Repo layout
 
@@ -255,13 +269,20 @@ Timeline: Phases 1–3 ≈ 2–3 weeks part-time (the time-crunch MVP).
 cosmos/
 ├── PLAN.md                      ← this file
 ├── docs/
+│   ├── architecture.md          ← seams, backends, substrates (the spine)
 │   ├── design.md                ← full public API & semantics reference
 │   └── antithesis-study-notes.md← research background
-├── CMakeLists.txt
-├── include/cosmos/              ← the library (public headers)
-│   ├── cosmos.hpp  simulator.hpp  task.hpp  time.hpp  random.hpp
-│   ├── net.hpp     faults.hpp     gen.hpp   assert.hpp campaign.hpp
-│   └── (storage.hpp, real.hpp — later phases)
+├── CMakeLists.txt               ← defines libcosmos, libcosmos-real, examples
+├── include/cosmos/              ← public headers (Seam A interface + sim)
+│   ├── cosmos.hpp  runtime.hpp  task.hpp  time.hpp  random.hpp
+│   ├── simulator.hpp  net.hpp  faults.hpp  gen.hpp  assert.hpp  campaign.hpp
+│   └── (storage.hpp — Phase 4)
+├── include/cosmos-real/         ← real backend headers (Seam A impl, prod)
+│   └── real.hpp                 ← RealRuntime (epoll, real sockets/files/time)
+├── src/cosmos/                  ← libcosmos: Universe, ISubstrate, library substrate, sim backends
+├── src/cosmos-real/             ← libcosmos-real: RealRuntime + epoll executor
 └── examples/
-    └── ping_pong.cpp            ← 3-node system + faults + campaign
+    ├── ping_pong.cpp            ← shared app source (written against Runtime)
+    ├── ping_pong_test.cpp       ← links libcosmos; runs Campaign (testing binary)
+    └── ping_pong_prod.cpp       ← links libcosmos-real; normal OS process (prod binary)
 ```
