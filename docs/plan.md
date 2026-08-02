@@ -208,8 +208,10 @@ Under `libcosmos`, determinism is guaranteed **if** application code obeys these
 
 ```
 cosmos/
-├── PLAN.md                      ← this file
+├── README.md                    ← project summary & quick start
+├── CMakeLists.txt               ← defines libcosmos static library, examples
 ├── docs/
+│   ├── plan.md                  ← this file
 │   ├── architecture.md          ← build-flag layer, linker interposition, substrate seams
 │   ├── design.md                ← full POSIX API taxonomy & public header reference
 │   └── antithesis-study-notes.md← research background
@@ -220,6 +222,11 @@ cosmos/
 │   └── (storage.hpp - Phase 4)
 ├── src/cosmos/                  ← libcosmos: __wrap_* functions, Universe, ISubstrate, SimSubstrate
 └── examples/
-    ├── ping_pong.c              ← 100% standard POSIX C app source
-    ├── CMakeLists.txt           ← builds myapp_test (linked with libcosmos and -Wl,--wrap) and myapp (prod)
+    ├── CMakeLists.txt           ← builds single_node and distributed targets
+    ├── single_node/             ← single binary example: transactional WAL storage engine (crash durability & OOM faults)
+    │   ├── CMakeLists.txt
+    │   └── kv_store.c
+    └── distributed/             # distributed example: replicated consensus cluster (network partitions & reordering)
+        ├── CMakeLists.txt
+        └── replicated_kv.c
 ```
