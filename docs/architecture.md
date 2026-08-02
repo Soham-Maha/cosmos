@@ -1,182 +1,196 @@
-# Cosmos — architecture: seams, backends, substrates
+# Cosmos: Architecture - Build-Flag Swapping, Linker Interposition & Substrates
 
-This is the **structural spine** of Cosmos. It defines the layering that lets
-Cosmos be (a) a deterministic simulation library today, (b) a deterministic
-hypervisor later, and (c) the *same application source* shipped as a normal
-production binary — all from one codebase. Public API lives in
-`docs/design.md`; this file explains *how the pieces are isolated and why*.
+This document defines the structural architecture of Cosmos. It explains how Cosmos achieves **zero-code-change deterministic simulation testing** for standard POSIX C/C++ applications via **build-flag symbol interposition (`-Wl,--wrap`)** using **`libcosmos`** in testing builds, while compiling into a **zero-overhead native production binary** in production builds.
 
-## 1. Thesis
+---
 
-The simulated system has to execute *somewhere*. That "somewhere" is the only
-thing that changes between simulation, hypervisor, and production. Everything
-else — seed, virtual clock, RNG streams, fault timeline, assertions, the
-campaign/exploration engine, repro-by-seed — is shared and execution-agnostic.
-Cosmos is built around **two seams** that make that sharing explicit.
+## Table of Contents
 
-## 2. Layered model
+1. [Architectural Thesis](#1-architectural-thesis)
+2. [The Layered Model](#2-the-layered-model)
+3. [Build-Flag & Linker Interposition Layer](#3-build-flag--linker-interposition-layer)
+4. [Inside `libcosmos` (The Determinism Engine)](#4-inside-libcosmos-the-determinism-engine)
+5. [Substrate Seam B (`ISubstrate`)](#5-substrate-seam-b-isubstrate)
+6. [Snapshot Interface & Multiverse Branching](#6-snapshot-interface--multiverse-branching)
+7. [Determinism Comparison across Modes](#7-determinism-comparison-across-modes)
+8. [Component Ownership Map](#8-component-ownership-map)
 
+---
+
+## 1. Architectural Thesis
+
+Application code shouldn't need to be rewritten against custom framework runtime abstractions just to be deterministically testable. Standard C/POSIX library functions (`malloc`, `free`, `pthread_create`, `clock_gettime`, `socket`, `send`, `recv`, `read`, `write`, `getrandom`) form a clean, universal contract.
+
+Cosmos achieves "one source, two binaries" by decoupling application code from execution mechanics using **Linker Symbol Interposition (`-Wl,--wrap`)**:
+- **In Production**: The compiler/linker links standard system libraries (`libc`, OS sockets, OS time). Calls resolve directly to kernel/libc routines with **zero overhead**.
+- **In Testing**: The linker wraps POSIX function symbols (`-Wl,--wrap=malloc -Wl,--wrap=pthread_create -Wl,--wrap=clock_gettime ...`) and binds them to **`libcosmos`**'s deterministic simulation framework (virtual time, tracked heap, single-threaded scheduler, simulated network, seeded PRNG).
+
+---
+
+## 2. The Layered Model
+
+```mermaid
+graph TD
+    App["Application Source Code (100% Standard C/POSIX)<br><i>malloc(), pthread_create(), clock_gettime(), socket(), send(), recv(), fsync()</i>"]
+    
+    App --> Layer["Build-Flag & Linker Swapping Layer"]
+    
+    subgraph ProdPath ["Production Build (-DCOSMOS_PROD)"]
+        ProdBin["Native Production Binary<br>Direct glibc / kernel calls<br>• Real system clock<br>• Real TCP/IP stack<br>• Real glibc heap<br><i>(Zero overhead)</i>"]
+    end
+    
+    subgraph TestPath ["Testing Build (-DCOSMOS_SIM)"]
+        TestBin["Sim Testing Binary<br>Statically links libcosmos<br>• __wrap_malloc<br>• __wrap_pthread_create / __wrap_pthread_mutex_lock<br>• __wrap_clock_gettime<br>• __wrap_send / __wrap_recv<br>• Virtual time & single-threaded scheduler<br>• Seeded RNG & faults"]
+        
+        SubstrateSeam["Seam B: ISubstrate"]
+        
+        SimSub["SimSubstrate<br><i>(Single-threaded fiber scheduler)</i>"]
+        KvmSub["Future Substrate: KvmSubstrate (Phase 7+)<br><i>(Full KVM hypervisor VM)</i>"]
+    end
+
+    Layer -- "Standard Linker" --> ProdBin
+    Layer -- "Linker flags: -Wl,--wrap=malloc ..." --> TestBin
+    TestBin --> SubstrateSeam
+    SubstrateSeam --> SimSub
+    SubstrateSeam -. "Future extension" .-> KvmSub
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Application source (shared)                                    │
-│  actors written against cosmos::Runtime (coroutines)            │
-│  co_await rt.sleep / rt.net().send / rt.rng()  — never the OS   │
-└────────────────────────────┬────────────────────────────────────┘
-                             │  Seam A: app-facing Runtime
-┌────────────────────────────▼────────────────────────────────────┐
-│  cosmos::Runtime  (Clock, Rng, Net/Endpoint, Storage/File,       │
-│                    Task + awaitables)                            │
-└─────────┬──────────────────────────────────────────┬────────────┘
-          │                                            │
-┌─────────▼──────────────────┐         ┌──────────────▼──────────────┐
-│  Sim backend (libcosmos)   │         │  Real backend (libcosmos-real)│
-│  sim Clock/Rng/Net/Storage │         │  OS Clock/Rng/sockets/files  │
-│  + Universe + faults +     │         │  + epoll executor            │
-│    campaign                │         │  NOT deterministic — it is   │
-│  DETERMINISTIC             │         │  production                  │
-└─────────┬──────────────────┘         └──────────────┬──────────────┘
-          │  Seam B: ISubstrate                        │
-┌─────────▼──────────────────┐                        │
-│  Library substrate         │  ← future:             │  (no engine;
-│  (cooperative coroutine    │    Hypervisor substrate│   prod is not
-│   scheduler = the "guest") │    (KVM/bhyve VM)      │   driven)
-└────────────────────────────┘                        │
-          │                                            │
-┌─────────▼──────────────────┐         ┌──────────────▼──────────────┐
-│  Testing binary myapp_test │         │  Prod binary myapp           │
-│  links libcosmos; runs     │         │  links libcosmos-real;       │
-│  Campaign                  │         │  normal OS process           │
-└────────────────────────────┘         └─────────────────────────────┘
+
+---
+
+## 3. Build-Flag & Linker Interposition Layer
+
+### Production Build (`-DCOSMOS_PROD`)
+When building for production (e.g. `cmake -DCOSMOS_BUILD_MODE=PROD`), no special linker flags or Cosmos libraries are linked:
+```bash
+gcc -O3 -DCOSMOS_PROD main.c -o myapp
 ```
+Calls to `malloc`, `pthread_create`, `clock_gettime`, `send`, `recv`, etc. resolve directly to standard system libraries. There are no wrapper objects, no virtual function dispatches, and zero runtime performance penalty.
 
-## 3. The two seams
+### Testing Build (`-DCOSMOS_SIM`)
+When building for deterministic testing (e.g. `cmake -DCOSMOS_BUILD_MODE=TEST`), the build system automatically injects symbol wrapping flags and links `libcosmos` statically:
+```bash
+gcc -g -DCOSMOS_SIM \
+    -Wl,--wrap=malloc -Wl,--wrap=free \
+    -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join \
+    -Wl,--wrap=pthread_mutex_lock -Wl,--wrap=pthread_mutex_unlock \
+    -Wl,--wrap=clock_gettime -Wl,--wrap=nanosleep \
+    -Wl,--wrap=socket -Wl,--wrap=send -Wl,--wrap=recv \
+    -Wl,--wrap=write -Wl,--wrap=fsync \
+    -Wl,--wrap=getrandom \
+    main.c -lcosmos -o myapp_test
+```
+1. The linker transforms every call to `malloc(...)`, `pthread_create(...)`, etc., in application code and linked static libraries into `__wrap_malloc(...)`, `__wrap_pthread_create(...)`.
+2. `libcosmos` implements `void* __wrap_malloc(size_t sz)`, `int __wrap_pthread_create(...)`, which route execution into Cosmos's single-threaded deterministic simulation engine.
+3. If `libcosmos` needs the real system allocation function (e.g. for internal harness setup), it explicitly calls `__real_malloc(sz)`.
 
-**Seam A — Runtime backend (app-facing).** The abstractions the *application*
-codes against: `Runtime` (`Clock`/`Rng`/`Net`/`Storage` + `Task`/awaitables).
-Two implementations: the **Sim backend** (`libcosmos`: simulated time/net/disk
-+ the determinism engine, for the testing binary) and the **Real backend**
-(`libcosmos-real`: real OS time/sockets/files + an epoll executor, for the prod
-binary). Seam A makes "one source, two binaries" possible: the app never calls
-the OS directly, so the same source compiles against either backend. It is
-**structural from Phase 1**, not a Phase-6 afterthought.
+---
 
-**Seam B — Execution substrate (engine-facing, inside the sim backend only).**
-The interface the determinism engine drives to *run* a universe:
-`ISubstrate` (`create_node`/`crash`/`reboot`, `run_until(time)`,
-`deliver(node,channel,packet)`, `inject_fault`, `save`/`restore`). Two
-implementations, both *inside* the sim backend: the **library substrate**
-(cooperative coroutine scheduler; the "guest" is the app's own coroutines;
-determinism is free) and the **hypervisor substrate** (`KvmSubstrate`,
-future: a real VM running unmodified binaries; determinism by interposition;
-no determinism contract needed).
+## 4. Inside `libcosmos` (The Determinism Engine)
 
-The real backend does **not** implement Seam B — production is not driven by a
-determinism engine. (Earlier drafts loosely called the real backend a
-"substrate"; it is not. Only sim execution units are substrates.)
+`libcosmos` is a **static library embedded directly inside the testing binary (`myapp_test`)**. It is **not** an external background process or separate OS daemon.
 
-## 4. Backend (Seam A) — two binaries from one source
-
-The application writes actors against `cosmos::Runtime&`:
+When `myapp_test` executes:
+1. `libcosmos` initializes the in-process **`cosmos::Universe` engine** in the testing binary's memory space.
+2. The engine houses:
+   - **Deterministic Scheduler**: Manages green thread / fiber execution queues (`ReadyQueue`, `WaitQueue`) and draws task choices from `schedule_rng`.
+   - **Virtual Clock**: Advances linear nanosecond virtual time (`now_ns`) on quiescence.
+   - **Simulated Subsystems**: Tracked heap allocator, virtual socket network topology, page cache storage model.
+   - **Repro Engine**: Logs the master seed and computes an `FNV-1a` event trace hash for perfect replay verification.
 
 ```cpp
-cosmos::Task server(cosmos::Runtime& rt, Address me) {
-    auto& ep = rt.net().bind(me);
-    for (;;) {
-        co_await rt.sleep(rt.rng().exponential(5ms));
-        auto [from, msg] = co_await ep.recv();
-        ep.send(from, handle(msg, rt.rng()));
+// Example wrapper implementation inside libcosmos (linked inside myapp_test)
+extern "C" {
+
+void* __wrap_malloc(size_t size) {
+    auto& sim = cosmos::Universe::current();
+    if (sim.faults().should_inject_oom()) {
+        errno = ENOMEM;
+        return nullptr;
     }
+    return sim.heap().allocate(size);
+}
+
+int __wrap_clock_gettime(clockid_t clk_id, struct timespec* tp) {
+    auto& sim = cosmos::Universe::current();
+    auto ns = sim.virtual_clock().now_ns();
+    tp->tv_sec  = ns / 1'000'000'000ULL;
+    tp->tv_nsec = ns % 1'000'000'000ULL;
+    return 0;
+}
+
+ssize_t __wrap_send(int sockfd, const void* buf, size_t len, int flags) {
+    auto& sim = cosmos::Universe::current();
+    return sim.network().enqueue_send(sockfd, buf, len, flags);
+}
+
 }
 ```
 
-Two `main`s, one source:
+The engine guarantees that for a given 64-bit seed, every `__wrap_*` call returns **bit-identical data at identical virtual timestamps**.
 
-```cpp
-// myapp_test.cpp — links libcosmos
-int main() {
-    cosmos::Simulator sim{/*SimConfig*/};
-    build_cluster(sim);                              // spawn `server` actors
-    auto report = cosmos::Campaign::run(cfg, build_cluster);  // deterministic
-    // print findings + repro seeds
-}
+---
 
-// myapp_prod.cpp — links libcosmos-real
-int main() {
-    cosmos::RealRuntime rt;                          // epoll, real sockets, real time
-    build_cluster(rt);                               // SAME actors, real OS
-    rt.run();                                        // normal process
-}
-```
+## 5. Substrate Seam B (`ISubstrate`)
 
-`Simulator` *is a* `Runtime` (keeps its full ergonomic surface from
-`design.md` §6) and *also* is the `Universe` facade. `RealRuntime` is the
-other `Runtime`. The app sees only `Runtime`, so it is identical in both
-binaries.
-
-**The determinism contract becomes a structural property.** Under the sim
-backend the app must be deterministic — but it is, *because the only clock/
-rng/net it can reach are the abstract ones*. The two-binary split *enforces*
-the contract by construction: you cannot accidentally call `clock_gettime`
-when your only clock is `Runtime::now()`. The contract still has teeth for
-*third-party* code that bypasses `Runtime` (the hypervisor removes even that).
-
-## 5. Substrate (Seam B) — the hypervisor door
+Inside `libcosmos`, the determinism engine drives execution through `ISubstrate`:
 
 ```cpp
 class ISubstrate {
 public:
-    virtual NodeId create_node(std::string name) = 0;
-    virtual void   crash(NodeId)  = 0;
-    virtual void   reboot(NodeId) = 0;
+    virtual ~ISubstrate() = default;
+    virtual NodeId create_node(std::string_view name) = 0;
+    virtual void   crash(NodeId id) = 0;
+    virtual void   reboot(NodeId id) = 0;
     virtual void   run_until(Time deadline_or_quiescence) = 0;
-    virtual void   deliver(NodeId to, ChannelId, PacketView) = 0;
-    virtual void   inject_fault(NodeId, FaultEvent) = 0;
-    virtual Snapshot save() = 0;
-    virtual void   restore(Snapshot&&) = 0;
+    virtual void   deliver_packet(NodeId target, Packet packet) = 0;
+    virtual Snapshot save_snapshot() = 0;
+    virtual void     restore_snapshot(Snapshot&& snap) = 0;
 };
 ```
 
-`Universe` (seed, virtual clock, RNG streams, fault timeline, assertions,
-event loop, campaign) is written against `ISubstrate` and never knows whether
-`run_until` resumes a coroutine or enters a vCPU. The library substrate
-implements `run_until` = "drain the ready-coroutine queue"; the hypervisor
-substrate implements it = "enter the VM until self-stop / branch-budget /
-deadline". Everything above the seam — campaign, exploration, repro, triage —
-is written once.
+1. **`SimSubstrate` (Phases 1-6)**: Executes C++ fiber tasks inside the single-threaded simulation process. Determinism is maintained by single-threaded cooperation and wrapper interposition.
+2. **`KvmSubstrate` (Phase 7+)**: Executes full virtual machine guests (Linux+KVM). Intercepts hypercalls and VM exits for unmodified multi-process guest OS determinism. Reuses 100% of the campaign runner, fault timeline, and exploration engine.
 
-The library substrate is the cheap, deterministic-by-cooperation version that
-validates the entire shared engine first; the hypervisor substrate swaps in
-later and reuses all of it. *The library substrate is just the hypervisor
-substrate with a cooperative-coroutine guest instead of a VM.*
+---
 
-## 6. Snapshot interface (branching)
+## 6. Snapshot Interface & Multiverse Branching
 
-Exploration v3 forks a universe at a choice point. That primitive is abstracted
-behind `Snapshot` (`save()`/`restore()`):
-- **Library substrate**: copy the in-process universe state (deterministic and
-  bounded — no `fork()` needed; cleaner and works where `fork()` cannot).
-- **Hypervisor substrate**: VM snapshot/restore (KVM/bhyve).
+State-space exploration v3 forks a universe at critical decision points to explore alternative interleavings without restarting from time zero.
 
-The decision-log + branch machinery above the seam is shared.
+```cpp
+struct Snapshot {
+    uint64_t virtual_time_ns;
+    uint64_t rng_state[4];
+    std::vector<uint8_t> heap_state;
+    std::vector<Packet> inflight_packets;
+};
+```
 
-## 7. Determinism, per backend
+- **`SimSubstrate`**: Creates an in-process state copy of the tracked heap, virtual clock, and network queues.
+- **`KvmSubstrate`**: Performs hypervisor COW memory snapshot & vCPU register state save.
 
-| | App modified? | Time source | Threads | Determinism | Contract? |
-|---|---|---|---|---|---|
-| Sim / library substrate | yes (coroutines) | virtual, quiescence-driven | none (cooperative) | by cooperation | yes (enforced by `Runtime`) |
-| Sim / hypervisor substrate | **no** | trapped TSC/HPET → branch-count | real guest threads, pinned to 1 core | by interposition | **no** |
-| Real backend (prod) | yes (same source) | real OS clock | real OS threads | none — it is production | n/a |
+---
 
-Within a substrate, determinism = same seed ⇒ identical event order.
-Cross-substrate trace equality is *not* a goal.
+## 7. Determinism Comparison across Modes
 
-## 8. Ownership
+| Property | Native Prod (`-DCOSMOS_PROD`) | Sim Testing (`-DCOSMOS_SIM`) | Future KVM (`KvmSubstrate`) |
+|---|---|---|---|
+| **App Modification** | None (Standard POSIX) | None (Standard POSIX + `-Wl,--wrap`) | None (Unmodified ELF binary) |
+| **Heap Allocator** | System `glibc` | Tracked Sim Heap (OOM faults + leak check) | Guest OS kernel heap |
+| **Clock Source** | Kernel `CLOCK_MONOTONIC` | Virtual Deterministic Clock | Trapped Guest TSC / Branch Counter |
+| **Network Stack** | Kernel TCP/IP Sockets | In-Process Simulated Topology | Virtual VNIC / TAP Bridge |
+| **Concurrency** | Real OS Threads / epoll | Single-Threaded Fiber Scheduler | Single-Core Pinned VM Execution |
+| **Execution Speed** | Native Hardware Speed | Extremely fast (~10,000s universes/sec) | VM Guest Speed |
 
-| Concept | Lives in | Shared? |
+---
+
+## 8. Component Ownership Map
+
+| Layer / Concept | Responsible Component | Target Binary |
 |---|---|---|
-| seed, RNG streams, virtual clock, fault timeline, assertions, campaign, exploration, repro, triage | determinism engine (`Universe`) | yes (all sim) |
-| `Runtime`/`Clock`/`Rng`/`Net`/`Storage` interfaces, `Task`+awaitables | Seam A | yes (sim + real) |
-| sim Clock/Rng/Net/Storage impls, `Universe`, `Simulator` | Sim backend (`libcosmos`) | — |
-| real Clock/Rng/Net/Storage impls, `RealRuntime`, epoll executor | Real backend (`libcosmos-real`) | — |
-| coroutine scheduler | Library substrate (Seam B) | — |
-| VM, VNIC, VDisk, branch-count clock | Hypervisor substrate (Seam B, future) | — |
+| Standard POSIX function calls | Application Code | Both `myapp` & `myapp_test` |
+| Linker Wrapping (`-Wl,--wrap`) | Build System (CMake/Makefile) | `myapp_test` only |
+| `__wrap_*` Interposition Functions | `libcosmos` (Static Library) | `myapp_test` only |
+| Virtual Clock, Tracked Heap, Network Graph | `cosmos::Universe` | `libcosmos` |
+| Campaign Runner & Multi-Seed Exploration | `cosmos::Campaign` | `myapp_test` |
+| Direct OS Passthrough (POSIX calls) | Standard `libc` / OS Kernel | `myapp` (production) |

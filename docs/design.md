@@ -1,17 +1,27 @@
-# Cosmos library — design & public API reference
+# Cosmos Library: Design & Public API Reference
 
-This is the authoritative design document for `libcosmos`. It defines the
-architecture, every public interface, and the semantics that make simulation
-runs deterministic and explorable. If implementation and this document
-disagree, fix one of them — they must stay in sync.
+This is the authoritative design document for `libcosmos`. It defines the architecture, standard POSIX function wrapping taxonomy, public interfaces, and semantics that make simulation runs deterministic and explorable.
 
-Audience: (a) us, building the library; (b) application authors embedding it.
+---
 
-> **Structural spine:** the layering that makes Cosmos a simulation library
-> *and* a future hypervisor *and* a production runtime from one source is in
-> **`docs/architecture.md`** (two seams: backends for two binaries; substrates
-> for the hypervisor door). This document is the API reference; read
-> `architecture.md` first for the big picture.
+## Table of Contents
+
+1. [Concepts](#1-concepts)
+2. [Build-Flag Swapping & Linker Interposition](#2-build-flag-swapping--linker-interposition)
+3. [POSIX Standard Function Taxonomy](#3-posix-standard-function-taxonomy)
+4. [Memory Subsystem Reference](#4-memory-subsystem-reference)
+5. [Time Subsystem Reference](#5-time-subsystem-reference)
+6. [Network Subsystem Reference](#6-network-subsystem-reference)
+7. [Randomness Subsystem Reference](#7-randomness-subsystem-reference)
+8. [Storage Subsystem Reference](#8-storage-subsystem-reference)
+9. [Fault Injection Framework](#9-fault-injection-framework)
+10. [Task & Concurrency API & Deterministic Scheduling](#10-task--concurrency-api--deterministic-scheduling)
+11. [Data Generators (`gen.hpp`)](#11-data-generators-genhpp)
+12. [Assertions (`assert.hpp`)](#12-assertions-asserthpp)
+13. [Campaign Engine (`campaign.hpp`)](#13-campaign-engine-campaignhpp)
+14. [The Determinism Contract](#14-the-determinism-contract)
+15. [Error Handling & Tracing](#15-error-handling--tracing)
+16. [Non-Goals (v1)](#16-non-goals-v1)
 
 ---
 
@@ -20,473 +30,291 @@ Audience: (a) us, building the library; (b) application authors embedding it.
 | Term | Meaning |
 |---|---|
 | **Universe** | One `Simulator` instance running one seeded execution. |
-| **Seed** | 64-bit value; fully determines a universe (same binary ⇒ identical execution). |
-| **RNG stream** | Independent deterministic PRNG derived from the seed by domain: `schedule`, `fault`, `workload`, `user`. Changing one domain's consumption never perturbs the others. |
-| **Task** | A C++20 coroutine (`cosmos::Task`) cooperatively scheduled by the universe. The unit of concurrency. |
-| **Node** | A simulated machine: an ownership group for tasks + endpoints. Can crash and reboot. |
-| **Virtual time** | `Time` (int64 ns since universe start). Advances only when nothing is runnable, to the next event. |
-| **Event** | A (virtual-time, seq) scheduled occurrence: timer wakeup, packet delivery, scheduled action. |
-| **Choice point** | Any place the scheduler could do more than one thing (pick a ready task, deliver vs. delay, fault or not). Resolved by an RNG-stream draw. |
+| **Seed** | 64-bit seed value; fully determines a universe (same binary + seed ⇒ identical execution). |
+| **Linker Wrapping** | GCC/Clang `-Wl,--wrap=symbol` mechanism that intercepts standard C/POSIX function calls and routes them to `libcosmos`. |
+| **RNG Stream** | Independent deterministic PRNG stream derived from the master seed by domain: `schedule`, `fault`, `workload`, `user`. |
+| **Task** | A user-space green thread / fiber task cooperatively scheduled by the universe. |
+| **Node** | A simulated virtual machine/container: an ownership group for endpoints, memory, and tasks. |
+| **Virtual Time** | `Time` (int64 nanoseconds since universe start). Advances only when no task is runnable, to the next event. |
 | **Finding** | A violated `always` assertion (or crash) in some universe, or a `sometimes` assertion hit in **no** universe of a campaign. |
-| **Campaign** | N universes over N seeds, run in parallel, aggregating findings. |
-
-**Why determinism holds:** the only sources of variation inside a universe are
-(1) scheduler choices, (2) time advancement, (3) RNG draws, (4) simulated I/O
-outcomes — and all four are pure functions of the seed streams. Application
-code that honors the [determinism contract](#9-the-determinism-contract)
-introduces no fifth source.
+| **Campaign** | N universes over N seeds, run in parallel across CPU cores, aggregating findings and printing repro seeds. |
 
 ---
 
-## 2. Module map (public headers)
+## 2. Build-Flag Swapping & Linker Interposition
 
-```
-include/cosmos/
-├── cosmos.hpp      umbrella include
-├── runtime.hpp     Runtime (Seam A): Clock, Rng, Net, Storage — app-facing base
-├── time.hpp        Time, Duration, chrono literals
-├── random.hpp      Rng: xoshiro256**, stream splitting, coin/range/…
-├── task.hpp        Task coroutine type + awaitables (Yield, Sleep)
-├── simulator.hpp   Simulator (= Runtime + Universe facade + ISubstrate), SimConfig, SimResult
-├── net.hpp         Net, Node, Endpoint, Address, Packet, Verdict
-├── faults.hpp      FaultProfile, fault scheduling helpers
-├── gen.hpp         deterministic data generators (property-testing style)
-├── assert.hpp      always / sometimes / reachable / COSMOS_CHECK, reports
-├── campaign.hpp    Campaign, CampaignConfig, CampaignReport
-└── storage.hpp     (Phase 4) simulated disk, fsync/crash semantics
-include/cosmos-real/
-└── real.hpp        RealRuntime (Seam A impl, prod): epoll, real sockets/files/time
+Cosmos allows applications to be written using **100% standard POSIX C/C++ function calls**. Swapping between production and testing builds occurs at compile/link time:
+
+```mermaid
+graph LR
+    subgraph ProdFlow ["Production Build (-DCOSMOS_PROD)"]
+        direction LR
+        AppP["App Source Code"] --> GCCP["GCC / Clang"] --> LibcP["Standard libc / Kernel"] --> ExecP["Native OS Execution"]
+    end
+
+    subgraph TestFlow ["Testing Build (-DCOSMOS_SIM)"]
+        direction LR
+        AppT["App Source Code"] --> GCCT["GCC / Clang<br><i>(-Wl,--wrap=malloc ...)</i>"] --> SimT["libcosmos"] --> ExecT["Virtual Deterministic Universe"]
+    end
 ```
 
-Namespace: `cosmos::`. Chrono literals in `cosmos::literals` (`1ms`, `10s`).
+### Build Configuration Matrix
+
+| Build Flag | Linker Flags | Interposition Target | Runtime Backend |
+|---|---|---|---|
+| `-DCOSMOS_PROD` | None | Direct system calls | Real OS (`libc`, Linux kernel sockets) |
+| `-DCOSMOS_SIM` | `-Wl,--wrap=malloc -Wl,--wrap=free -Wl,--wrap=pthread_create -Wl,--wrap=clock_gettime -Wl,--wrap=socket -Wl,--wrap=send -Wl,--wrap=recv -Wl,--wrap=write -Wl,--wrap=fsync -Wl,--wrap=getrandom` | `__wrap_*` functions | `libcosmos` (Static Library) |
 
 ---
 
-## 3. `random.hpp` — deterministic randomness
+## 3. POSIX Standard Function Taxonomy
+
+The following table lists every standard POSIX function intercepted by `libcosmos` in testing builds:
+
+| Category | Standard POSIX Function | Wrapped Symbol | Sim Mode Behavior |
+|---|---|---|---|
+| **Memory** | `malloc(size)` | `__wrap_malloc` | Allocates from tracked sim heap; checks OOM fault injection |
+| | `free(ptr)` | `__wrap_free` | Deallocates from tracked sim heap; detects double-free bugs |
+| | `calloc(nmemb, size)` | `__wrap_calloc` | Zero-initialized sim heap allocation |
+| | `realloc(ptr, size)` | `__wrap_realloc` | Resizes tracked sim heap allocation |
+| **Time** | `clock_gettime(clk_id, tp)`| `__wrap_clock_gettime` | Writes current virtual simulation time into `timespec` |
+| | `gettimeofday(tv, tz)` | `__wrap_gettimeofday` | Writes current virtual simulation time into `timeval` |
+| | `nanosleep(req, rem)` | `__wrap_nanosleep` | Suspends caller until virtual time reaches `now + req` |
+| **Network**| `socket(domain, type, p)` | `__wrap_socket` | Returns virtual socket descriptor bound to active Node |
+| | `bind(fd, addr, len)` | `__wrap_bind` | Binds virtual socket descriptor to virtual port |
+| | `listen(fd, backlog)` | `__wrap_listen` | Marks virtual socket descriptor as passive listener |
+| | `accept(fd, addr, len)` | `__wrap_accept` | Blocks until incoming connection event arrives |
+| | `connect(fd, addr, len)` | `__wrap_connect` | Initiates virtual connection event across sim network graph |
+| | `send(fd, buf, len, flags)`| `__wrap_send` | Injects packet into sim network with latency/loss/reorder faults |
+| | `recv(fd, buf, len, flags)`| `__wrap_recv` | Suspends caller until virtual packet delivery event arrives |
+| | `close(fd)` | `__wrap_close` | Closes virtual socket descriptor / frees endpoint |
+| **Storage**| `open(path, flags, mode)` | `__wrap_open` | Opens virtual file descriptor in sim disk subsystem |
+| | `read(fd, buf, count)` | `__wrap_read` | Reads data from virtual page cache / disk image |
+| | `write(fd, buf, count)` | `__wrap_write` | Appends dirty bytes to un-synced virtual page cache |
+| | `fsync(fd)` | `__wrap_fsync` | Flushes un-synced page cache bytes to durable virtual storage |
+| **Random** | `getrandom(buf, len, fl)` | `__wrap_getrandom` | Fills buffer with bytes from seeded `xoshiro256**` stream |
+| | `random()` | `__wrap_random` | Returns uint32 draw from seeded `workload` RNG stream |
+| **Threads / Sync** | `pthread_create(thread, attr, fn, arg)` | `__wrap_pthread_create` | Spawns green thread / fiber task in sim scheduler (no OS thread) |
+| | `pthread_join(thread, retval)` | `__wrap_pthread_join` | Suspends current task until target green thread completes |
+| | `pthread_mutex_lock(mutex)` | `__wrap_pthread_mutex_lock` | Locks sim mutex; suspends task on mutex wait queue if contested |
+| | `pthread_mutex_unlock(mutex)` | `__wrap_pthread_mutex_unlock` | Unlocks sim mutex; unblocks waiting tasks to Ready Queue |
+| | `pthread_cond_wait(cond, mutex)` | `__wrap_pthread_cond_wait` | Unlocks mutex, suspends task on condvar queue, yields to scheduler |
+| | `pthread_cond_signal(cond)` | `__wrap_pthread_cond_signal` | Unblocks task waiting on condvar back to Ready Queue |
+| | `sched_yield()` | `__wrap_sched_yield` | Yields current task to sim scheduler choice draw |
+
+---
+
+## 4. Memory Subsystem Reference
+
+In testing builds (`-DCOSMOS_SIM`), `__wrap_malloc` and `__wrap_free` intercept heap operations:
+
+- **OOM Fault Injection**: Configured via `FaultProfile::oom_rate`. When triggered, `malloc` returns `nullptr` and sets `errno = ENOMEM`.
+- **Leak Detection**: When a universe completes, `Simulator` automatically verifies that `active_allocations() == 0`. Unfreed pointers are logged as findings with allocation backtraces and repro seeds.
+
+---
+
+## 5. Time Subsystem Reference
+
+In testing builds, virtual time advances deterministically:
+
+- **Virtual Clock Advancement**: Virtual time does **not** advance during CPU computation. It advances instantaneously to the next scheduled event timestamp when all tasks suspend.
+
+---
+
+## 6. Network Subsystem Reference
+
+In testing builds, network calls route through an in-process simulated topology:
+
+```cpp
+struct Address {
+    uint32_t node_id;
+    uint16_t port;
+};
+
+class Net {
+public:
+    void partition(std::vector<uint32_t> group_a, std::vector<uint32_t> group_b);
+    void heal_all();
+
+    using Verdict = std::variant<Drop, DeliverAfter>;
+    std::function<Verdict(const PacketView&)> on_send;
+};
+```
+
+### Delivery Semantics:
+1. `send()` consults partition maps → `on_send` hook → `FaultProfile` latency/loss draws.
+2. Surviving packets become delivery events scheduled at `virtual_now + sampled_latency`.
+3. Node crash closes endpoints and cancels pending `recv()` calls.
+
+---
+
+## 7. Randomness Subsystem Reference
 
 ```cpp
 class Rng {
 public:
     explicit Rng(uint64_t seed);
-    static Rng derive(const Rng& parent, uint64_t domain); // stream splitting
+    static Rng derive(const Rng& parent, uint64_t domain);
 
-    uint64_t next();                       // xoshiro256** raw
-    uint64_t range(uint64_t lo, uint64_t hi);   // inclusive
-    bool     coin(double p);               // Bernoulli
-    double   uniform();                    // [0,1)
-    template <typename C> const typename C::value_type& pick(const C& xs);
+    uint64_t next();
+    uint64_t range(uint64_t lo, uint64_t hi);
+    bool     coin(double p);
+    double   uniform();
 };
 ```
 
-Stream domains (fixed enum, part of the ABI): `Schedule=1, Fault=2, Workload=3,
-User=4`. Derivation: seed mixing via splitmix64 (deterministic, order-free).
-
-**Rules:** library internals only ever draw from `schedule`/`fault`. User
-workloads draw from `workload` (via `sim.workload()`) or their own `user`
-stream (`sim.user_rng()`). This orthogonality is what lets exploration
-dimensions vary independently across seeds.
+RNG stream domains: `Schedule=1`, `Fault=2`, `Workload=3`, `User=4`. Splitmix64 stream derivation ensures independent exploration dimensions across seeds.
 
 ---
 
-## 4. `time.hpp`
+## 8. Storage Subsystem Reference
 
-```cpp
-using Duration = std::chrono::nanoseconds;          // int64, virtual
-using Time     = std::chrono::time_point<std::chrono::steady_clock, Duration>;
-// (steady_clock used only as a tag type; never reads the OS clock.)
+Simulates page-cache buffering, `fsync` durability, and torn writes upon crash-reboot:
 
-namespace cosmos::literals {
-constexpr Duration operator""ms(unsigned long long);
-constexpr Duration operator""s (unsigned long long);
-}
-```
+- `write()` buffers dirty bytes in simulated un-synced page cache.
+- `fsync()` commits buffered pages to durable storage.
+- On `sim.crash(node)` followed by `sim.reboot(node)`: un-synced pages are discarded, and the last synced region may experience torn writes based on `FaultProfile::torn_write_rate`.
 
 ---
 
-## 5. `task.hpp` — cooperative coroutine tasks
-
-Users write plain synchronous-looking code; suspension only at `co_await`
-points, which is exactly where the scheduler may interleave.
-
-```cpp
-struct Task {
-    struct promise_type;
-    // move-only; handle owned by the spawning Node
-};
-
-// Awaitables (obtain from Simulator; see §7):
-co_await sim.yield();          // reschedule (lets others run)
-co_await sim.sleep(10ms);      // wake at virtual now+10ms
-```
-
-Promise semantics:
-- `initial_suspend = suspend_always` — `spawn()` never runs the body inline;
-  the task merely becomes *ready*. (Spawn order never leaks caller timing.)
-- `final_suspend = suspend_always` — the scheduler reaps finished tasks.
-- `unhandled_exception` — captured into `SimResult.failures` (universe ends
-  as a finding, with repro seed).
-- Each promise carries `Simulator*` (set at spawn) so awaitables can reach
-  the universe without globals.
-
-**Cancellation:** node crash destroys the node's task handles. Awaitables must
-be trivially destructible; user RAII in coroutine frames runs normally on
-destruction.
-
----
-
-## 6. `simulator.hpp` — the universe
-
-```cpp
-struct SimConfig {
-    uint64_t seed = 0;
-    Duration time_limit = 300s;      // universe ends (ok) when exceeded
-    uint64_t event_limit = 10'000'000; // livelock guard
-    std::ostream* trace = nullptr;   // optional structured trace sink
-};
-
-struct Failure {
-    std::string kind;     // "assert_always" | "exception" | "event_limit"
-    std::string id;       // assertion id / what
-    std::string detail;   // message, file:line
-    Time at;
-};
-struct SimResult {
-    bool ok() const { return failures.empty(); }
-    std::vector<Failure> failures;
-    uint64_t trace_hash = 0;   // FNV-1a over the event trace (if tracing)
-    Time final_time;
-    uint64_t events_processed;
-};
-
-class Simulator {
-public:
-    explicit Simulator(SimConfig);
-
-    // --- lifecycle ---
-    SimResult run();                 // run to quiescence / time_limit
-    // --- tasks ---
-    Node& create_node(std::string name);
-    template <typename F> void spawn(Node&, F&& coro_fn); // F: () -> Task
-    void crash(Node&);               // kill tasks + close endpoints
-    void reboot(Node&);              // mark alive; user re-spawns logic
-    // --- time ---
-    Time now() const;
-    SleepAwaitable sleep(Duration);
-    YieldAwaitable yield();
-    template <typename F> void at(Time, F&&);        // one-shot action
-    template <typename F> void every(Duration, F&&); // repeating action
-    // --- randomness ---
-    Rng& workload_rng();             // 'workload' stream
-    Rng& user_rng();                 // 'user' stream
-    // --- subsystems ---
-    Net& net();
-    // Storage& storage();  // Phase 4
-    // --- faults ---
-    void set_faults(FaultProfile);
-    // --- assertions (also free functions, §10) ---
-    void report_always(bool ok, std::string id, std::string detail);
-    void report_sometimes(bool hit, std::string id);
-};
-```
-
-**Scheduler algorithm (the deterministic core):**
-
-```
-loop:
-  1. if ready tasks non-empty:
-         i = schedule_rng.range(0, ready.size()-1)   // THE choice point
-         resume ready[i] until it suspends
-         continue
-  2. if event queue empty: stop (quiescence)
-  3. advance virtual clock to earliest event time
-     fire all events at that time (in seq order) → may enqueue ready tasks
-```
-
-All interleaving exploration concentrates in step 1's draw; all time/fault
-exploration in the seeded latencies/faults of step 3's events. One universe =
-one path through that choice space.
-
-> **Layering note.** `Simulator` is a *facade* over `Universe` (the
-> substrate-agnostic engine: seed, virtual clock, RNG streams, fault timeline,
-> assertions, event loop) and an `ISubstrate` implementation (the execution
-> unit). Today the only substrate is the cooperative coroutine scheduler (the
-> "library substrate"); a future "hypervisor substrate" (`KvmSubstrate`)
-> implements the same `ISubstrate` against a VM and reuses the whole engine.
-> See `docs/architecture.md` §5. The real backend (`RealRuntime`) implements
-> the app-facing `Runtime` (Seam A) but **not** `ISubstrate` — production is
-> not driven by a determinism engine.
-
----
-
-## 7. `net.hpp` — simulated network
-
-```cpp
-struct Address { uint32_t node; uint16_t port; };
-using Payload  = std::vector<std::byte>;
-
-class Endpoint {                        // bound to (node, port)
-public:
-    Address addr() const;
-    void send(Address to, Payload);                 // fire-and-forget
-    RecvAwaitable recv();                           // co_await → (from, Payload)
-};
-
-class Net {
-public:
-    Endpoint& bind(Node&, uint16_t port);
-
-    // faults — declarative profile is set via Simulator::set_faults;
-    // imperative control:
-    void partition(std::vector<NodeId> a, std::vector<NodeId> b); // cut a<->b
-    void heal_all();
-
-    // custom hook — full control, highest precedence:
-    using Verdict = std::variant<Drop, DeliverAfter>;
-    std::function<Verdict(const PacketView&)> on_send; // nullptr = use profile
-};
-```
-
-Delivery semantics:
-1. `send()` consults, in order: connectivity map (partitions) → `on_send`
-   hook → `FaultProfile` (loss/reorder/latency draws from the `fault` stream).
-2. Surviving packets become **delivery events** at `now + sampled_latency`.
-3. On delivery: if a task is blocked in `recv()`, it becomes ready with the
-   packet; otherwise the packet queues on the endpoint (bounded queue →
-   backpressure via send suspension is a Phase-2 refinement).
-4. Reorder is modeled by randomized per-packet latency (deterministic, via
-   fault stream) — not by explicit permutation.
-
-Node crash closes its endpoints: pending packets to it are dropped; blocked
-`recv()`s are cancelled with their tasks.
-
----
-
-## 8. `faults.hpp` — how users define faults
+## 9. Fault Injection Framework
 
 ```cpp
 struct FaultProfile {
-    double     packet_loss   = 0.0;        // Bernoulli per packet
-    double     reorder_rate  = 0.0;        // extra latency jitter probability
-    LatencyGen latency       = constant(1ms);   // base delivery latency
-    CrashGen   crash_interval{};           // optional random node crashes
-    // Phase 4: disk_error_rate, torn_write_on_crash, ...
+    double packet_loss     = 0.0;     // Bernoulli per packet
+    double reorder_rate    = 0.0;     // Jitter probability
+    double oom_rate        = 0.0;     // Heap allocation failure probability
+    double torn_write_rate = 0.0;     // Storage tearing probability on crash
+    LatencyGen latency     = constant(1ms);
 };
 ```
 
-Four ways to inject faults (compose freely):
-
-| Mechanism | API | Use for |
-|---|---|---|
-| **Declarative** | `sim.set_faults(FaultProfile)` | background hostility: loss, latency, random crashes — sampled from the `fault` stream |
-| **Imperative** | `net().partition(...)`, `net().heal_all()`, `sim.crash(node)`, `sim.reboot(node)` | scenario-specific events |
-| **Scheduled** | `sim.at(t, fn)` / `sim.every(d, fn)` wrapping the imperative calls | deterministic fault timelines ("partition at t=10s, heal at t=15s") |
-| **Custom hook** | `net().on_send = fn → Verdict` | anything computable: byzantine-ish drops, targeted delays, traffic shaping |
-
-Semantics notes:
-- Scheduled faults are deterministic (fixed virtual times). Profile/hook
-  faults draw from the `fault` stream → reproducible per seed, varied across
-  seeds.
-- `crash()` destroys the node's tasks/endpoints; `reboot()` marks it alive —
-  the app decides what state survives (in-memory state is gone; Phase-4
-  simulated disk persists per its fsync model).
-- Because faults live in the `fault` stream, a failing run's **entire fault
-  timeline replays exactly** from its seed.
+Four composable fault mechanisms:
+1. **Declarative Profile**: Rates applied automatically via the `fault` RNG stream.
+2. **Imperative Scripting**: `sim.net().partition(...)`, `sim.crash(node)`, `sim.reboot(node)`.
+3. **Scheduled Faults**: `sim.at(10s, [&]{ sim.net().partition(a, b); })`.
+4. **Custom Verdict Hooks**: Programmatic control via `sim.net().on_send`.
 
 ---
 
-## 9. `gen.hpp` — how simulation data is generated
+## 10. Task & Concurrency API & Deterministic Scheduling
 
-Property-testing-style generators over a seeded `Rng` (usually
-`sim.workload_rng()`). They are plain functions — compose your own.
+Cosmos supports standard POSIX `pthread` concurrency in application code with zero code modification (`pthread_create`, `pthread_join`, `pthread_mutex_*`, `pthread_cond_*`).
+
+### How `pthread` Interposition Works (`-Wl,--wrap=pthread_create`)
+
+In testing builds (`-DCOSMOS_SIM`), **no OS threads are created**. The entire simulation universe executes inside a single physical OS thread. Standard `pthread` calls are mapped to user-space green threads / fibers managed by Cosmos's single-threaded scheduler:
+
+- **`__wrap_pthread_create(thread, attr, start_routine, arg)`**: Allocates a user-space task frame (green thread), pushes it to the scheduler's `ReadyQueue`, and assigns a virtual thread ID.
+- **`__wrap_pthread_mutex_lock(mutex)`**: If the virtual mutex is free, acquires it immediately. If locked, moves the current task from `ReadyQueue` to the mutex's `WaitQueue` and yields execution to the scheduler.
+- **`__wrap_pthread_mutex_unlock(mutex)`**: Releases the virtual mutex, moves waiting tasks from `WaitQueue` back to `ReadyQueue`, and yields to the scheduler choice point.
+- **`__wrap_pthread_cond_wait(cond, mutex)`**: Atomically releases the mutex, moves the current task to the condition variable's `WaitQueue`, and yields control to the scheduler.
+- **`__wrap_pthread_cond_signal(cond)`**: Unblocks one or all tasks from the condition variable queue, returning them to the `ReadyQueue`.
+
+### Deterministic Scheduler Loop Algorithm
+
+Every context switch decision is driven by the seeded `schedule` RNG stream:
+
+```mermaid
+flowchart TD
+    Start(["Scheduler Loop Start"]) --> CheckReady{"Is ReadyQueue non-empty?"}
+
+    CheckReady -- "YES" --> DrawChoice["Draw Choice Index:<br>i = schedule_rng.range(0, ReadyQueue.size() - 1)"]
+    DrawChoice --> ResumeTask["Resume ReadyQueue[i]<br>Run until task suspends<br>(mutex / sleep / recv / yield)"]
+    ResumeTask --> CheckReady
+
+    CheckReady -- "NO" --> CheckEvents{"Is Virtual EventQueue non-empty?"}
+    
+    CheckEvents -- "YES (Quiescence reached for current timestamp)" --> AdvanceClock["Advance Virtual Clock to earliest Event timestamp<br>(timer wakeup / packet delivery / I/O completion)"]
+    AdvanceClock --> FireEvents["Fire Events at timestamp<br>→ Moves waiting tasks to ReadyQueue"]
+    FireEvents --> CheckReady
+
+    CheckEvents -- "NO (No pending tasks or events)" --> Terminate(["End Universe Simulation<br>(Quiescence Reached)"])
+```
+
+### Why Determinism Holds under `pthread` Wrapping:
+1. **Single-Threaded Execution**: Eliminates OS kernel thread preemption, CPU core cache line races, and hardware interrupt timing jitter.
+2. **Seeded Choice Draws**: When multiple tasks are runnable, `schedule_rng` chooses which task runs next. A specific seed reproduces the **exact same sequence of thread interleavings**.
+3. **Exploration**: Different seeds explore different valid interleavings, exposing race conditions, deadlocks, and missed condition signals.
+
+---
+
+## 11. Data Generators (`gen.hpp`)
+
+Property-testing-style generators drawing from the `workload` RNG stream:
 
 ```cpp
 namespace cosmos::gen {
-    uint64_t    range(Rng&, uint64_t lo, uint64_t hi);
-    bool        coin(Rng&, double p);
+    uint64_t range(Rng&, uint64_t lo, uint64_t hi);
+    bool     coin(Rng&, double p);
     template<typename T> T one_of(Rng&, std::initializer_list<T>);
-    template<typename T> T weighted(Rng&, std::initializer_list<std::pair<double,T>>);
-    std::string string(Rng&, size_t len, std::string_view alphabet = alnum);
-    std::string string(Rng&, size_t min_len, size_t max_len);
-    Duration    exponential(Rng&, Duration mean);      // inter-arrival times
-    Duration    lognormal(Rng&, Duration median, Duration p99);
-    template<typename F> auto many(Rng&, size_t n, F elem_gen); // vector
+    std::string string(Rng&, size_t len);
+    Duration exponential(Rng&, Duration mean);
 }
 ```
-
-**The workload pattern** (how applications get their simulation data):
-
-```cpp
-cosmos::Task client(Simulator& sim, Node& me, Address server) {
-    auto& g   = sim.workload_rng();
-    auto& ep  = sim.net().bind(me, 0);
-    for (;;) {
-        co_await sim.sleep(gen::exponential(g, 5ms));   // arrival process
-        Op op = gen::weighted(g, {{0.7, Op::Get}, {0.25, Op::Put}, {0.05, Op::Del}});
-        Key k = gen::range(g, 0, 999);                  // key space
-        ep.send(server, encode(op, k, gen::string(g, 8)));
-        // ... co_await reply, assert on it ...
-    }
-}
-```
-
-Three data channels, all reproducible:
-1. **Generators** (above) — dynamic inputs: operations, payloads, timings.
-2. **Fixtures** — initial state handed to the universe at build time
-   (preloaded DB contents, topology descriptors); plain values in the run
-   config, i.e. effectively part of the seed.
-3. **Swarm config** — the campaign derives per-universe knobs (fault rates,
-   key-space size, client counts) from the seed before construction, so
-   different universes explore different *regimes*, not just different
-   interleavings. (This is FDB's "swarm testing" and it is disproportionately
-   effective per CPU-second.)
 
 ---
 
-## 10. `assert.hpp` — properties
+## 12. Assertions (`assert.hpp`)
 
 ```cpp
 namespace cosmos {
-    // evaluated per universe; violation = finding (with seed, time, detail)
     void always(bool cond, std::string id, std::string detail = "");
-    // evaluated per campaign: id must be hit in ≥1 universe, else finding
     void sometimes(bool cond, std::string id);
     inline void reachable(std::string id) { sometimes(true, id); }
 }
+
 #define COSMOS_CHECK(cond, id) ::cosmos::always((cond), (id), \
         std::string(__FILE__) + ":" + std::to_string(__LINE__))
 ```
 
-Design rules:
-- `always` = safety ("never bad"): serializability violation, divergence,
-  crash, lost acknowledged write.
-- `sometimes` = liveness/coverage ("eventually good"): leader got elected,
-  partition healed, retried request succeeded. Campaign-wide semantics are
-  what make liveness testable (Antithesis's key insight — a liveness property
-  is falsified only by a *set* of runs).
-- Assertions are context-free: they may live in app code, client actors, or
-  dedicated **checker actors** (`sim.every(1s, check_cluster_invariants)`).
-- Every finding records `(seed, virtual time, id, detail)` → repro is
-  `cosmos-example --seed S`.
+- `always`: Invariant property evaluated per universe. Violation = immediate finding.
+- `sometimes`: Liveness/coverage property evaluated across all universes in a campaign. Must be hit at least once.
 
 ---
 
-## 11. `campaign.hpp` — state-space exploration
+## 13. Campaign Engine (`campaign.hpp`)
 
 ```cpp
 struct CampaignConfig {
-    uint64_t trials     = 1000;
-    uint64_t base_seed  = 0;
-    unsigned parallel   = std::thread::hardware_concurrency();
-    bool     verify     = false;   // double-run % of trials, compare trace_hash
-    SimConfig sim;                 // time_limit, trace sink, etc.
+    uint64_t trials    = 1000;
+    uint64_t base_seed = 0;
+    unsigned parallel  = std::thread::hardware_concurrency();
+    bool     verify    = false;   // double-run verification mode
 };
 
 struct CampaignReport {
     uint64_t runs, failed_runs;
-    std::vector<Failure> findings;            // deduped by (kind,id)
-    std::vector<std::string> never_hit;       // sometimes-ids hit 0 times
-    uint64_t universes_per_second;
+    std::vector<Failure> findings;
+    std::vector<std::string> never_hit;
 };
 
 class Campaign {
 public:
-    // build_fn runs in the trial's thread; must construct the whole system
-    // inside sim and return. Fully self-contained per universe.
-    using BuildFn = std::function<void(Simulator&, uint64_t seed)>; // swarm hook
-    static CampaignReport run(CampaignConfig, BuildFn);
+    static CampaignReport run(CampaignConfig, std::function<void(Simulator&, uint64_t)> build_fn);
 };
 ```
 
-Execution model:
-- Trials are sharded across `parallel` worker threads; each trial constructs a
-  fresh `Simulator` with seed = `mix(base_seed, trial_index)` and runs it to
-  completion. No shared mutable state between universes (except the results
-  sink, under mutex).
-- **Exploration dimensions per seed:** scheduler interleavings (schedule
-  stream), fault timeline (fault stream), workload data (workload stream),
-  swarm config (pre-construction draws). One seed ⇒ a fully determined point
-  in that product space.
-- **Output:** for each finding, a repro command; for each `sometimes` id never
-  hit, a coverage warning; aggregate stats.
-- **Verify mode:** re-runs a sample (e.g. 1 in 64) of seeds twice and compares
-  `trace_hash` — catches contract violations (your "is it still
-  deterministic?" regression test).
+---
 
-### Exploration roadmap (later phases)
+## 14. The Determinism Contract
 
-| Version | Mechanism |
-|---|---|
-| v1 (MVP) | seeded fuzzing campaign (above) |
-| v2 | **coverage guidance**: build the SUT with `-fsanitize-coverage=trace-pc-guard`; edge counts per run feed a seed corpus (keep seeds that find new edges, mutate them — AFL-style, per Antithesis's coverage-guided exploration) |
-| v3 | **fork()-branching**: at deep/interesting choice points, `fork()` the universe (COW snapshot), explore the sibling branch in the child — the Antithesis multiverse at process level; **decision-log minimization**: record schedule/fault decisions, delta-debug failing runs to minimal repros; **trace export** (JSON / chrome-trace) for debugging UX |
-| v4 (optional) | systematic strategies à la Coyote/dBug (PCT: prioritize few context-switch points) instead of uniform random interleavings |
+Under `libcosmos`, determinism holds provided that application code:
+1. Accesses time only via POSIX time functions (`clock_gettime`) or `sim.now()`.
+2. Draws randomness only via POSIX random functions (`getrandom`) or `sim.rng()`.
+3. Performs I/O only via POSIX socket/file calls.
+4. Avoids iteration dependencies on raw pointer addresses (ASLR leaks).
 
 ---
 
-## 12. `storage.hpp` (Phase 4 — defined now so the model is fixed)
+## 15. Error Handling & Tracing
 
-```cpp
-class Storage {                         // one per Node
-public:
-    File& open(std::string path);
-};
-class File {
-public:
-    WriteAwaitable write(uint64_t offset, std::span<const std::byte>);
-    ReadAwaitable  read (uint64_t offset, size_t len);
-    FsyncAwaitable fsync();
-};
-```
-
-Durability model (the part that finds real bugs):
-- `write` → page-cache only. `fsync` → durable.
-- On `crash` + `reboot`: un-fsynced data is gone; the *last* fsynced region
-  may be **torn** (partially applied), decided by the fault stream.
-- Latency/errors from `FaultProfile` (`disk_error_rate`, …).
-- Deterministic content and timing, seeded per universe.
+- Findings output a clear repro command: `myapp_test --seed 12345`.
+- Tracing sink records FNV-1a event hash (`trace_hash`) used by `--verify` double-run validation.
 
 ---
 
-## 13. The determinism contract (app obligations under the sim backend)
+## 16. Non-Goals (v1)
 
-Under the **sim backend**, determinism is guaranteed *if* code running inside a universe:
-
-1. Reads time only via `sim.now()` / sleeps via `co_await sim.sleep(...)`.
-2. Draws randomness only via `sim.workload_rng()`, `sim.user_rng()`, `gen::*`.
-3. Creates no threads; performs no blocking OS I/O; uses only cosmos net/
-   storage for I/O. (Pure CPU work is always fine.)
-4. Does not let pointer values / addresses influence behavior (no ordering by
-   `T*`, no `std::unordered_map<T*>` iteration affecting outcomes — ASLR is a
-   nondeterminism source).
-5. Avoids `long double`/x87 and `-ffast-math` in behavior-relevant paths.
-6. Treats logging as effect-only (logging must not feed back into decisions).
-
-Enforcement aids: verify mode (§11), `COSMOS_STRICT` build that interposes
-`clock_gettime`/`getrandom` (later), and code review. The hypervisor stage
-(much later) removes this contract entirely — that's precisely its value.
-
----
-
-## 14. Error handling & debugging
-
-- Exceptions escaping a task ⇒ `Failure{kind:"exception"}`; universe stops;
-  campaign reports it with its seed.
-- Assertions carry `detail` strings; failures include virtual time.
-- Optional trace sink (`SimConfig::trace`): one line per event
-  (`t=<ns> deliver n0->n1 seq=…`, `t=<ns> schedule task=…`); `trace_hash`
-  (FNV-1a-64) is the universe fingerprint used by verify mode and by users to
-  assert sameness in their own CI.
-- Repro workflow: campaign prints `--seed S` ⇒ single-run mode re-executes
-  exactly; attach gdb (single-threaded ⇒ pleasant); Phase-5 trace export for
-  message-sequence visualization.
-
----
-
-## 15. Non-goals (v1)
-
-- Running unmodified binaries: requires the **hypervisor substrate** (Seam B, Phase 7+); the library substrate needs the app written against `Runtime`.
-- A fully-featured **real backend** in v1: the `Runtime` interface and a minimal real backend (real clock + echo net) land in Phase 1 so the two-binary split works; full net/storage parity matures alongside sim across phases. The prod binary is normal OS execution, never a determinism target.
-- Multi-process universes, shared memory, threads inside a universe.
-- Byzantine behavior injection beyond user verdict hooks.
-- UI/notebook debugging (Antithesis territory; Phase 5 trace export is the
-  pragmatic substitute).
+- Multi-process universes inside a single simulation trial (handled in Phase 7 via `KvmSubstrate`).
+- Real OS thread preemption inside a simulation universe (simulations run single-threaded and cooperative for perfect reproducibility).

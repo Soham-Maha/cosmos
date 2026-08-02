@@ -1,113 +1,92 @@
-# Antithesis — study notes (verified from primary sources)
+# Antithesis - Study Notes & Interposition Comparison
 
-Background research for Cosmos. Sources: Antithesis engineering blog, product
-page, and docs (July 2026). Although Cosmos is now a library (not a
-hypervisor), these notes capture the ideas we reuse: input tree, seeded
-exploration, assertions, snapshots/branching, replay, time travel.
+Background research for Cosmos. Sources: Antithesis engineering blog, product pages, and technical documentation (July 2026).
 
-## The Determinator (their deterministic hypervisor)
+Although Cosmos is a library-first deterministic simulation testing platform (using linker symbol interposition `-Wl,--wrap`), these notes capture the foundational research on deterministic execution: input trees, seeded exploration, property assertions, snapshot branching, time travel, and interposition models.
 
-- Fork of FreeBSD **bhyve**, Intel VMX. First move: **remove** functionality —
-  start from a small deterministic core, grow incrementally. Minimal device
-  surface is their #1 design lesson.
-- Work = categorizing every micro CPU behavior as *deterministic* (keep in
-  guest) or *nondeterministic* (avoid/contain/reverse). Only whole-system
-  testing reveals which is which — assumptions are dangerous.
+---
 
-## Topology
+## Table of Contents
 
-- The **entire system under test** (all containers, Docker Compose / K8s) runs
-  inside **one VM**, pinned to **one physical core**. Parallelism = many VMs
-  exploring different branches; never multi-vCPU within a VM (inter-core
-  interleaving kills instruction-level determinism).
-- The unit of reproducibility is the **whole interconnected system state**, not
-  a single process → no domain-specific mocks; client and server share one
-  deterministic bubble.
-- Guests still experience concurrency (thread preemption) via the guest OS
-  scheduler — which the platform controls and uses for fault injection
-  (thread starvation).
+1. [Interposition Models: Hypervisor vs. Linker Wrapping](#1-interposition-models-hypervisor-vs-linker-wrapping)
+2. [The Determinator (Antithesis Deterministic Hypervisor)](#2-the-determinator-antithesis-deterministic-hypervisor)
+3. [Topology & Isolation](#3-topology--isolation)
+4. [Time Determinism (The Crux)](#4-time-determinism-the-crux)
+5. [Deterministic I/O Boundary](#5-deterministic-io-boundary)
+6. [Snapshots & The Multiverse](#6-snapshots--the-multiverse)
+7. [Exploration & Fault Injection](#7-exploration--fault-injection)
+8. [dhyve (Open-Source Proof of Concept)](#8-dhyve-open-source-proof-of-concept)
+9. [Prior Art Summary](#9-prior-art-summary)
 
-## Time determinism (the crux)
+---
 
-- Rule: **the guest clock must be a function of only the deterministic state
-  and execution history of the guest.**
-- All time sources (TSC/RDTSC, HPET, …) intercepted; virtual time returned.
-- They tried instructions-retired PMC: (1) ~1-in-a-trillion miscounts even in
-  precise mode; (2) PMC threshold interrupts arrive via APIC with variable
-  latency. The open-source **dhyve** instead uses a **retired branch
-  instruction count** (same trick as rr).
-- Time nondeterminism becomes data nondeterminism (races, event interleaving,
-  clock reads) — hence time is the heart of the problem.
+## 1. Interposition Models: Hypervisor vs. Linker Wrapping
 
-## Deterministic I/O boundary
+Deterministic Simulation Testing (DST) requires trapping and controlling all sources of nondeterminism (time, randomness, concurrency, I/O). There are three primary levels of interposition:
 
-- One controlled channel (custom `VMCALL` hypercall): logs/assertions out,
-  commands + RNG seeds in.
-- **Every point where the guest consumes external input is a possible branch
-  point.** A run is an **input tree**; exploration walks/forks that tree.
-  (Cosmos equivalent: the seed-derived decision streams.)
-- Later: interrupt injection to "push" events preemptively.
+| Mechanism | Interposition Level | App Changes | C++ Header Safety | Overhead | Best Suited For |
+|---|---|---|---|---|---|
+| **Linker Wrapping (`-Wl,--wrap`)** | Linker / Symbol level | **Zero** (Standard POSIX C/C++) | ✅ **100% Safe** | Zero in Prod | In-process C/C++ libraries & systems (Cosmos library substrate) |
+| **Hypervisor VMCALL / Intercept** | Hardware / VM level | **Zero** (Unmodified OS VM image) | ✅ **100% Safe** | Microsecond VM traps | Unmodified guest OS binaries, multi-process clusters (Antithesis / Cosmos Phase 7) |
+| **Dynamic `LD_PRELOAD`** | Dynamic Loader level | **Zero** | ✅ **100% Safe** | Minimal | Dynamic library override (has bootstrap/init ordering traps) |
 
-## Snapshots & the multiverse
+Cosmos adopts **Linker Symbol Wrapping (`-Wl,--wrap`)** as its primary substrate seam, enabling zero-code-change DST for C/POSIX applications without VM overhead.
 
-- Fast full-guest snapshots → never replay from the beginning.
-- Enables: branch-the-past exploration; rewind-inspect ("`sleep -5`");
-  retroactive debugger attach / packet capture / profiling; time compression
-  of idle periods; "change the past" experiments; causality analysis (rewind N
-  seconds, resample bug probability across branches).
-- Cosmos analogue: `fork()` COW snapshots + decision logs (Phase 5).
+---
 
-## Exploration & fault injection
+## 2. The Determinator (Antithesis Deterministic Hypervisor)
 
-- Extreme chaos engineering inside the deterministic bubble; fuzzed inputs +
-  **feedback-guided** exploration (coverage + RL) seeking novel states.
-- Faults: network partitions/loss/delay, storage faults, machine kill/pause,
-  scheduling starvation, clock manipulation — zero-config.
-- Detection = **user-defined properties** via SDK: `always`, `sometimes`,
-  `reachable`, plus coverage instrumentation. `sometimes` assertions are
-  evaluated **campaign-wide** (must fire at least once across all universes).
+- Fork of FreeBSD **bhyve**, Intel VMX. First move: **remove** functionality: start from a small deterministic core and grow incrementally. Minimal device surface is their #1 design lesson.
+- Work = categorizing every micro CPU behavior as *deterministic* (keep in guest) or *nondeterministic* (avoid/contain/reverse).
 
-## Engineering practices
+---
 
-- **Hyperactive logging** (~50 GiB / 20-min run) was the only way to pin down
-  subtle nondeterminisms; they wrote a custom lossless kernel logger.
-- Hardware betrays: a chased "software bug" was a RAM bit flip → ECC
-  workstations. On consumer hardware, re-run before believing a divergence.
-- The hypervisor is only one building block: exploration engine, snapshot/
-  branch machinery, SDK, triage reports, debugging UX are separate layers.
+## 3. Topology & Isolation
 
-## dhyve (open-source proof)
+- The **entire system under test** (all containers, Docker Compose / K8s) runs inside **one VM**, pinned to **one physical core**. Parallelism = many VMs exploring different branches; never multi-vCPU within a VM (inter-core interleaving kills instruction-level determinism).
+- The unit of reproducibility is the **whole interconnected system state**, not a single process.
 
-- [github.com/pgraug/dhyve-src](https://github.com/pgraug/dhyve-src): DTU
-  bachelor project (2 students, one semester): bhyve fork with branch-count
-  virtual time; intercepted randomness/timers/I/O; **Director** snapshot/
-  branch/mutation harness; Alpine guest + kernel patches; `dhv` CLI/daemon.
-- Repos: `dhyve/` (hypervisor diff), `guest/`, `dhv/`. Proof a minimal DST
-  platform is achievable with student-scale effort.
+---
 
-## Key links
+## 4. Time Determinism (The Crux)
 
-- [So you think you want to write a deterministic hypervisor?](https://antithesis.com/blog/deterministic_hypervisor/)
-- [Debugging in the Multiverse](https://antithesis.com/blog/multiverse_debugging/)
-- [How Antithesis works](https://antithesis.com/docs/introduction/how_antithesis_works/)
-- [Is something bugging you?](https://antithesis.com/blog/is_something_bugging_you/)
-- [The worst bug we faced at Antithesis](https://antithesis.com/blog/worst_bug/)
-- [Did you get lucky or unlucky? (findability)](https://antithesis.com/blog/2025/findability/)
-- [When did the bug start? (causality analysis)](https://antithesis.com/blog/2026/causality_analysis/)
-- [Fault injection docs](https://antithesis.com/docs/concepts/fault_injection/)
-- Alex Pshenichkin's FreeBSD Dev Summit talk: `youtube.com/watch?v=0E6GBg13P60`
+- Rule: **the guest clock must be a function of only the deterministic state and execution history of the guest.**
+- All time sources (TSC/RDTSC, HPET, etc.) are intercepted, and virtual time is returned.
+- Open-source **dhyve** uses a **retired branch instruction count** to track execution progress deterministically.
 
-## Other prior art (library-level, closest to Cosmos)
+---
 
-- **FoundationDB simulation** — the original in-process DST: single-threaded
-  deterministic runtime (Flow), simulated network/disk/time, swarm testing,
-  "bugs found in simulation never seen in production". Will Wilson's
-  StrangeLoop talk "Testing a Distributed System".
-- **TigerBeetle VOPR** — deterministic simulator + strict state-machine
-  design + heavy assertions; excellent talks/docs by Joran Dirk Greef.
-- **rr** — process-level record/replay; retired-conditional-branches counter;
-  chaos scheduling. Vocabulary for determinism engineering.
-- **Microsoft Coyote / dBug / PCT** — systematic interleaving exploration
-  strategies (candidate for Cosmos exploration v2+).
-- **Jepsen** — the catalog of distributed-systems bug shapes; informs our
-  fault taxonomy and property catalogs.
+## 5. Deterministic I/O Boundary
+
+- One controlled channel (custom `VMCALL` hypercall): logs/assertions out, commands + RNG seeds in.
+- **Every point where the guest consumes external input is a possible branch point.** A run is an **input tree**; exploration walks/forks that tree. (Cosmos equivalent: the seed-derived decision streams).
+
+---
+
+## 6. Snapshots & The Multiverse
+
+- Fast full-guest snapshots: never replay from the beginning.
+- Enables: branch-the-past exploration; rewind-inspect; retroactive debugger attach; time compression of idle periods.
+- Cosmos analogue: `Snapshot` save/restore with in-process COW memory copies (Phase 5).
+
+---
+
+## 7. Exploration & Fault Injection
+
+- Extreme chaos engineering inside the deterministic bubble; fuzzed inputs + feedback-guided exploration seeking novel states.
+- Detection = **user-defined properties** via SDK: `always` (invariant per run), `sometimes` (evaluated campaign-wide across all runs).
+
+---
+
+## 8. dhyve (Open-Source Proof of Concept)
+
+- DTU bachelor project (2 students, one semester): bhyve fork with branch-count virtual time; intercepted randomness/timers/I/O; snapshot/branch/mutation harness. Proof that a minimal DST platform is achievable with student-scale effort.
+
+---
+
+## 9. Prior Art Summary
+
+- **FoundationDB Simulation**: The original in-process DST (Flow language), single-threaded deterministic simulator, simulated network/disk/time, swarm testing.
+- **TigerBeetle VOPR**: Deterministic simulator + strict state-machine design + heavy assertions.
+- **rr**: Process-level record/replay via retired-conditional-branches counter and chaos scheduling.
+- **Jepsen**: Catalog of distributed-systems bug shapes that informs fault taxonomies and property verification.
