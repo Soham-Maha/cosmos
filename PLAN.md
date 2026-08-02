@@ -31,7 +31,7 @@ Full API reference: **`docs/design.md`**. Architecture & Seams: **`docs/architec
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Language | **C++20** | User requirement; coroutines/fibers give ergonomic cooperative tasks with zero dependencies. |
+| Language | **C++23** | User requirement; C++23 std::expected, std::flat_map, std::print, and modern type safety; fibers for wrapped pthread execution. |
 | Interface Surface | **POSIX Standard Library Mimicry** (`malloc`, `pthread_create`, `clock_gettime`, `socket`, `send`, `recv`, `getrandom`, etc.) | App code stays 100% standard POSIX C/C++. No proprietary framework wrappers required in user codebase. |
 | Build Swapping | **Linker Symbol Wrapping** (`-Wl,--wrap=malloc ...`) | Zero code modification. Testing build links `libcosmos` statically with linker flags; Production build links native OS `libc`/sockets with zero overhead. |
 | Delivery Form | **`libcosmos` (Static Library)** | Single static library linked into the testing binary for deterministic simulation runs. |
