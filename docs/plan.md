@@ -92,7 +92,7 @@ Determinism comes from controlling six key subsystems via standard function wrap
 1. **Memory**: `malloc`, `free`, `calloc`, `realloc` are wrapped (`__wrap_malloc`). The sim allocator uses a seeded layout, tracks active allocations for leak detection, and injects OOM faults on configured probabilities.
 2. **Scheduling**: `pthread_create`, `pthread_join`, `pthread_mutex_lock`, `pthread_mutex_unlock`, `pthread_cond_wait`, `pthread_cond_signal`, `sched_yield` are wrapped (`__wrap_pthread_create`). A single-threaded scheduler runs all tasks on one OS thread. Choice points (task selection) draw from the seeded `schedule` RNG stream.
 3. **Time**: `clock_gettime`, `gettimeofday`, `nanosleep` are wrapped (`__wrap_clock_gettime`). Virtual time advances only when no task is runnable, to the next scheduled event.
-4. **Randomness**: `random`, `rand_r`, `getrandom`, `arc4random` are wrapped (`__wrap_getrandom`). Drawn from domain-isolated PRNG streams (`schedule`, `fault`, `workload`, `user`).
+4. **Randomness**: `random`, `getrandom` are wrapped (`__wrap_getrandom`). Drawn from domain-isolated PRNG streams (`schedule`, `fault`, `workload`, `user`).
 5. **Network & I/O**: `socket`, `bind`, `connect`, `send`, `recv`, `close` are wrapped (`__wrap_send`/`recv`). Every network call is delivered through an in-process simulated topology with seeded fault injection (loss, delay, reorder, partition).
 6. **Storage**: `open`, `read`, `write`, `fsync` are wrapped (`__wrap_write`). Writes update virtual page caches; `fsync` commits durable state; crash-reboot discards un-synced pages and simulates torn writes.
 
@@ -215,7 +215,6 @@ cosmos/
 │   ├── architecture.md          ← build-flag layer, linker interposition, substrate seams
 │   ├── design.md                ← full POSIX API taxonomy & public header reference
 │   └── antithesis-study-notes.md← research background
-├── CMakeLists.txt               ← defines libcosmos static library, examples
 ├── include/cosmos/              ← public headers (sim engine & campaign harness)
 │   ├── cosmos.hpp  task.hpp  time.hpp  random.hpp
 │   ├── simulator.hpp  net.hpp  faults.hpp  gen.hpp  assert.hpp  campaign.hpp

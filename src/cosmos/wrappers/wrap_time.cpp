@@ -2,24 +2,26 @@
 #include <time.h>
 #include <sys/time.h>
 
+// Linker-wrapping passthrough stubs for the POSIX time surface
+// (see docs/design.md §3 "Time"). Virtual deterministic time is layered on
+// later; for now they return the real host clock via __real_*.
+
 extern "C" {
 
+int __real_clock_gettime(clockid_t clock_id, struct timespec* tp);
+int __real_gettimeofday(struct timeval* tv, void* tz);
+int __real_nanosleep(const struct timespec* req, struct timespec* rem);
+
 int __wrap_clock_gettime(clockid_t clock_id, struct timespec* tp) {
-    (void)clock_id;
-    (void)tp;
-    return 0;
+    return __real_clock_gettime(clock_id, tp);
 }
 
 int __wrap_gettimeofday(struct timeval* tv, void* tz) {
-    (void)tv;
-    (void)tz;
-    return 0;
+    return __real_gettimeofday(tv, tz);
 }
 
 int __wrap_nanosleep(const struct timespec* req, struct timespec* rem) {
-    (void)req;
-    (void)rem;
-    return 0;
+    return __real_nanosleep(req, rem);
 }
 
 } // extern "C"

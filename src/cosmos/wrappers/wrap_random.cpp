@@ -2,17 +2,22 @@
 #include <sys/random.h>
 #include <stdlib.h>
 
+// Linker-wrapping passthrough stubs for the POSIX randomness surface
+// (see docs/design.md §3 "Random"). The seeded xoshiro256** / domain-isolated
+// PRNG streams are layered on later; for now they pass through to the real
+// host entropy via __real_*.
+
 extern "C" {
 
+ssize_t  __real_getrandom(void* buf, size_t buflen, unsigned int flags);
+long int __real_random(void);
+
 ssize_t __wrap_getrandom(void* buf, size_t buflen, unsigned int flags) {
-    (void)buf;
-    (void)buflen;
-    (void)flags;
-    return (ssize_t)buflen;
+    return __real_getrandom(buf, buflen, flags);
 }
 
 long int __wrap_random(void) {
-    return 0;
+    return __real_random();
 }
 
 } // extern "C"
