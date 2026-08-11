@@ -1,4 +1,4 @@
-.PHONY: default build test all format format-check clean
+.PHONY: default build test all format format-check lint clean
 
 default:
 	@echo "Cosmos build tasks:"
@@ -7,6 +7,7 @@ default:
 	@echo "  make all           - Build production binaries, examples, and tests"
 	@echo "  make format        - Format code with clang-format"
 	@echo "  make format-check  - Verify code formatting without modifying files"
+	@echo "  make lint          - Lint and verify code formatting"
 	@echo "  make clean         - Remove build directory"
 
 build:
@@ -28,5 +29,8 @@ format:
 format-check:
 	find include src tests examples -type f \( -name "*.cpp" -o -name "*.hpp" -o -name "*.c" -o -name "*.h" \) -exec clang-format --dry-run --Werror {} +
 
+lint: format-check
+
 clean:
 	rm -rf build
+

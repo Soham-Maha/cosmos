@@ -31,6 +31,8 @@ just all         # or make all
 # Format codebase & check formatting
 just format      # or make format
 just format-check # or make format-check
+just lint        # or make lint
+
 
 # Clean build artifacts
 just clean       # or make clean

@@ -29,6 +29,9 @@ format:
 format-check:
     find include src tests examples -type f \( -name "*.cpp" -o -name "*.hpp" -o -name "*.c" -o -name "*.h" \) -exec clang-format --dry-run --Werror {} +
 
+# Lint codebase (alias for format-check)
+lint: format-check
+
 # Remove build directory
 clean:
     rm -rf build
@@ -36,4 +39,6 @@ clean:
 alias b := build
 alias t := test
 alias fmt := format
+alias l := lint
 alias c := clean
+
