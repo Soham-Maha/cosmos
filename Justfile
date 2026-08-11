@@ -1,5 +1,4 @@
 # Justfile for Cosmos
-
 set shell := ["bash", "-uc"]
 
 default:
@@ -9,6 +8,11 @@ default:
 build:
     cmake -B build -DCMAKE_BUILD_TYPE=Release
     cmake --build build --parallel --target kv_store_prod replicated_kv_prod
+
+# Build simulation binaries only
+sim:
+    cmake -B build -DCOSMOS_BUILD_TESTS=OFF
+    cmake --build build --parallel --target kv_store_sim replicated_kv_sim
 
 # Build and run unit tests
 test:
@@ -37,8 +41,8 @@ clean:
     rm -rf build
 
 alias b := build
+alias s := sim
 alias t := test
 alias fmt := format
 alias l := lint
 alias c := clean
-

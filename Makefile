@@ -1,8 +1,9 @@
-.PHONY: default build test all format format-check lint clean
+.PHONY: default build sim test all format format-check lint clean
 
 default:
 	@echo "Cosmos build tasks:"
 	@echo "  make build         - Build production binaries (Release)"
+	@echo "  make sim           - Build simulation binaries only"
 	@echo "  make test          - Build and run unit tests"
 	@echo "  make all           - Build production binaries, examples, and tests"
 	@echo "  make format        - Format code with clang-format"
@@ -13,6 +14,10 @@ default:
 build:
 	cmake -B build -DCMAKE_BUILD_TYPE=Release
 	cmake --build build --parallel --target kv_store_prod replicated_kv_prod
+
+sim:
+	cmake -B build -DCOSMOS_BUILD_TESTS=OFF
+	cmake --build build --parallel --target kv_store_sim replicated_kv_sim
 
 test:
 	cmake -B build -DCOSMOS_BUILD_TESTS=ON
@@ -33,4 +38,3 @@ lint: format-check
 
 clean:
 	rm -rf build
-

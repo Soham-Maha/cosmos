@@ -22,8 +22,12 @@ Using `just` or `make`:
 # Production build
 just build       # or make build
 
+# Simulation build (builds simulation binaries only)
+just sim         # or make sim (or just s)
+
 # Build and run tests
-just test        # or make test
+just test        # or make test (or just t)
+
 
 # Build all targets (production binaries, simulation examples, and tests)
 just all         # or make all
