@@ -1,5 +1,7 @@
 #pragma once
 
-namespace cosmos {
+#include "cosmos/faults.hpp"
+#include "cosmos/memory.hpp"
+#include "cosmos/simulator.hpp"
 
-} // namespace cosmos
+namespace cosmos {} // namespace cosmos

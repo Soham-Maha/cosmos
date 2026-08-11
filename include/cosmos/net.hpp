@@ -1,5 +1,3 @@
 #pragma once
 
-namespace cosmos {
-
-} // namespace cosmos
+namespace cosmos {} // namespace cosmos

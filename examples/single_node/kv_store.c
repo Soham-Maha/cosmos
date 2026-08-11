@@ -14,9 +14,9 @@
 #include <time.h>
 
 int main(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  printf("Single-Node Transactional KV Store Example\n");
-  printf("actual time: %ld.%09ld\n", (long)ts.tv_sec, (long)ts.tv_nsec);
-  return 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    printf("Single-Node Transactional KV Store Example\n");
+    printf("actual time: %ld.%09ld\n", (long)ts.tv_sec, (long)ts.tv_nsec);
+    return 0;
 }

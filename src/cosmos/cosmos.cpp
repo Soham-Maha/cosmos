@@ -1,5 +1,3 @@
 #include "cosmos/cosmos.hpp"
 
-namespace cosmos {
-
-} // namespace cosmos
+namespace cosmos {} // namespace cosmos
