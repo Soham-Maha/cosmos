@@ -1,6 +1,6 @@
 #include "cosmos/cosmos.hpp"
-#include <cerrno>
 #include <cstddef>
+#include <cerrno>
 
 namespace {
 thread_local bool in_wrap_malloc = false;
@@ -13,12 +13,12 @@ struct ReentrancyGuard {
 
 extern "C" {
 
-void *__real_malloc(size_t size);
-void __real_free(void *ptr);
-void *__real_calloc(size_t nmemb, size_t size);
-void *__real_realloc(void *ptr, size_t size);
+void* __real_malloc(size_t size);
+void  __real_free(void* ptr);
+void* __real_calloc(size_t nmemb, size_t size);
+void* __real_realloc(void* ptr, size_t size);
 
-void *__wrap_malloc(size_t size) {
+void* __wrap_malloc(size_t size) {
     if (in_wrap_malloc) {
         return __real_malloc(size);
     }
@@ -27,7 +27,7 @@ void *__wrap_malloc(size_t size) {
         return __real_malloc(size);
     }
 
-    auto *sim = cosmos::Simulator::current();
+    auto* sim = cosmos::Simulator::current();
     if (sim->faults().should_inject_oom()) {
         errno = ENOMEM;
         sim->heap().record_oom();
@@ -38,9 +38,8 @@ void *__wrap_malloc(size_t size) {
     return sim->heap().allocate(size);
 }
 
-void __wrap_free(void *ptr) {
-    if (!ptr)
-        return;
+void __wrap_free(void* ptr) {
+    if (!ptr) return;
 
     if (in_wrap_malloc) {
         __real_free(ptr);
@@ -48,27 +47,23 @@ void __wrap_free(void *ptr) {
     }
 
     if (cosmos::Simulator::has_current()) {
-        auto *sim = cosmos::Simulator::current();
+        auto* sim = cosmos::Simulator::current();
         ReentrancyGuard guard;
         if (sim->heap().deallocate(ptr)) {
             return;
         }
     }
 
-    constexpr size_t header_size = sizeof(cosmos::AllocationHeader);
-    auto *header =
-        reinterpret_cast<cosmos::AllocationHeader *>(static_cast<char *>(ptr) - header_size);
-    if (header->magic == cosmos::COSMOS_CANARY_MAGIC) {
-        header->magic = cosmos::COSMOS_FREED_MAGIC;
-        __real_free(header);
-        return;
-    }
-
+    // Passthrough allocation (allocated via __real_malloc outside simulation context)
     __real_free(ptr);
 }
 
-void *__wrap_calloc(size_t nmemb, size_t size) { return __real_calloc(nmemb, size); }
+void* __wrap_calloc(size_t nmemb, size_t size) {
+    return __real_calloc(nmemb, size);
+}
 
-void *__wrap_realloc(void *ptr, size_t size) { return __real_realloc(ptr, size); }
+void* __wrap_realloc(void* ptr, size_t size) {
+    return __real_realloc(ptr, size);
+}
 
 } // extern "C"
