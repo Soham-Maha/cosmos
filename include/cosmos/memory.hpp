@@ -7,13 +7,13 @@
 
 extern "C" {
 void* __real_malloc(size_t size);
-void  __real_free(void* ptr);
+void __real_free(void* ptr);
 }
 
 namespace cosmos {
 
 constexpr uint32_t COSMOS_CANARY_MAGIC = 0x434F534D; // 'COSM'
-constexpr uint32_t COSMOS_FREED_MAGIC  = 0xDEADBEEF;
+constexpr uint32_t COSMOS_FREED_MAGIC = 0xDEADBEEF;
 
 /**
  * @brief AllocationHeader prepended to every memory allocation in TrackedHeap.
@@ -23,11 +23,11 @@ constexpr uint32_t COSMOS_FREED_MAGIC  = 0xDEADBEEF;
  * (char*)header + sizeof(AllocationHeader) preserves strict 16-byte alignment.
  */
 struct alignas(std::max_align_t) AllocationHeader {
-    uint32_t magic;          // Canary magic value (COSMOS_CANARY_MAGIC or COSMOS_FREED_MAGIC)
-    uint32_t flags;          // Metadata flags
-    size_t requested_size;   // User payload size requested by caller
-    uint64_t alloc_id;       // Sequential allocation ID
-    uint64_t padding;        // Padding ensuring sizeof(AllocationHeader) == 32 (multiple of 16)
+    uint32_t magic;        // Canary magic value (COSMOS_CANARY_MAGIC or COSMOS_FREED_MAGIC)
+    uint32_t flags;        // Metadata flags
+    size_t requested_size; // User payload size requested by caller
+    uint64_t alloc_id;     // Sequential allocation ID
+    uint64_t padding;      // Padding ensuring sizeof(AllocationHeader) == 32 (multiple of 16)
 };
 
 static_assert(sizeof(AllocationHeader) % alignof(std::max_align_t) == 0,
@@ -37,21 +37,21 @@ static_assert(sizeof(AllocationHeader) % alignof(std::max_align_t) == 0,
  * @brief Custom C++ allocator for TrackedHeap internal containers (e.g. std::unordered_map).
  *
  * WHAT IT IS:
- * An allocator implementation that routes memory allocations directly to `__real_malloc` and `__real_free`.
+ * An allocator implementation that routes memory allocations directly to `__real_malloc` and
+ * `__real_free`.
  *
  * WHY & WHEN IT IS USED:
- * Under `-Wl,--wrap=malloc`, standard container allocations (using default std::allocator) call `malloc()`,
- * which resolves back to `__wrap_malloc()`. If `TrackedHeap`'s internal hash map used default allocators,
- * allocating map nodes inside `TrackedHeap::allocate` would trigger an infinite recursive stack overflow.
- * `RawRealAllocator` explicitly bypasses symbol wrapping for internal metadata storage.
+ * Under `-Wl,--wrap=malloc`, standard container allocations (using default std::allocator) call
+ * `malloc()`, which resolves back to `__wrap_malloc()`. If `TrackedHeap`'s internal hash map used
+ * default allocators, allocating map nodes inside `TrackedHeap::allocate` would trigger an infinite
+ * recursive stack overflow. `RawRealAllocator` explicitly bypasses symbol wrapping for internal
+ * metadata storage.
  */
-template <typename T>
-struct RawRealAllocator {
+template <typename T> struct RawRealAllocator {
     using value_type = T;
 
     RawRealAllocator() noexcept = default;
-    template <typename U>
-    constexpr RawRealAllocator(const RawRealAllocator<U>&) noexcept {}
+    template <typename U> constexpr RawRealAllocator(const RawRealAllocator<U>&) noexcept {}
 
     T* allocate(std::size_t n) {
         if (n > std::size_t(-1) / sizeof(T)) {
@@ -64,9 +64,7 @@ struct RawRealAllocator {
         return static_cast<T*>(ptr);
     }
 
-    void deallocate(T* p, std::size_t) noexcept {
-        __real_free(static_cast<void*>(p));
-    }
+    void deallocate(T* p, std::size_t) noexcept { __real_free(static_cast<void*>(p)); }
 };
 
 template <typename T, typename U>
@@ -92,20 +90,23 @@ struct HeapStats {
  * @brief Internal simulation engine memory tracker.
  *
  * WHAT IT IS:
- * The deterministic heap tracking manager owned by `Simulator`. It maintains memory allocation headers,
- * active allocation maps, and cumulative heap statistics (`HeapStats`).
+ * The deterministic heap tracking manager owned by `Simulator`. It maintains memory allocation
+ * headers, active allocation maps, and cumulative heap statistics (`HeapStats`).
  *
  * WHY & WHEN IT IS USED:
- * Used by `__wrap_malloc` and `__wrap_free` whenever an active `Simulator` context (`Simulator::has_current()`)
- * is running:
- * - On `allocate(size)`: Allocates `sizeof(AllocationHeader) + size` via `__real_malloc`, initializes the header
- *   with canary magic and metadata, records the allocation in `active_map_`, and returns the 16-byte aligned user pointer.
- * - On `deallocate(user_ptr)`: Inspects the header, verifies canary magic, marks the header as freed (`COSMOS_FREED_MAGIC`),
- *   erases from `active_map_`, updates active allocation counts, and frees the raw header via `__real_free`.
- * - Enables post-simulation memory leak detection (verifying `active_count() == 0`) and canary corruption validation.
+ * Used by `__wrap_malloc` and `__wrap_free` whenever an active `Simulator` context
+ * (`Simulator::has_current()`) is running:
+ * - On `allocate(size)`: Allocates `sizeof(AllocationHeader) + size` via `__real_malloc`,
+ * initializes the header with canary magic and metadata, records the allocation in `active_map_`,
+ * and returns the 16-byte aligned user pointer.
+ * - On `deallocate(user_ptr)`: Inspects the header, verifies canary magic, marks the header as
+ * freed (`COSMOS_FREED_MAGIC`), erases from `active_map_`, updates active allocation counts, and
+ * frees the raw header via `__real_free`.
+ * - Enables post-simulation memory leak detection (verifying `active_count() == 0`) and canary
+ * corruption validation.
  */
 class TrackedHeap {
-public:
+  public:
     TrackedHeap() = default;
 
     void* allocate(size_t size) {
@@ -137,8 +138,8 @@ public:
         if (!user_ptr) return false;
 
         constexpr size_t header_size = sizeof(AllocationHeader);
-        auto* header = reinterpret_cast<AllocationHeader*>(
-            static_cast<char*>(user_ptr) - header_size);
+        auto* header =
+            reinterpret_cast<AllocationHeader*>(static_cast<char*>(user_ptr) - header_size);
 
         if (header->magic != COSMOS_CANARY_MAGIC) {
             return false;
@@ -160,7 +161,7 @@ public:
     const HeapStats& stats() const { return stats_; }
     size_t active_count() const { return stats_.active_allocations; }
 
-private:
+  private:
     uint64_t next_alloc_id_{0};
     HeapStats stats_{};
     using MapType =
