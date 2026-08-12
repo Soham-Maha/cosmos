@@ -9,10 +9,10 @@
 
 extern "C" {
 
-ssize_t __real_getrandom(void *buf, size_t buflen, unsigned int flags);
+ssize_t __real_getrandom(void* buf, size_t buflen, unsigned int flags);
 long int __real_random(void);
 
-ssize_t __wrap_getrandom(void *buf, size_t buflen, unsigned int flags) {
+ssize_t __wrap_getrandom(void* buf, size_t buflen, unsigned int flags) {
     return __real_getrandom(buf, buflen, flags);
 }
 
