@@ -48,18 +48,34 @@ StateSpace = ThreadInterleavings × FaultSequences × WorkloadValues × TimeAdva
 | **Workload Values** | Keys, values, message rates, request patterns | `workload_rng` |
 | **User Randomness** | Any `getrandom()` calls made by application code | `user_rng` |
 
-All four dimensions are derived from a **single 64-bit master seed** via splitmix64 stream derivation:
+All five streams are derived from a **single 64-bit master seed** via splitmix64 stream derivation:
 
 ```
 master_seed
     │
     ├─── splitmix64(domain=1) ──► schedule_rng   (thread scheduler choices)
-    ├─── splitmix64(domain=2) ──► fault_rng      (fault injection decisions)
+    ├─── splitmix64(domain=2) ──► fault_rng      (fault injection decisions at runtime)
     ├─── splitmix64(domain=3) ──► workload_rng   (data/workload generation)
-    └─── splitmix64(domain=4) ──► user_rng       (application getrandom() calls)
+    ├─── splitmix64(domain=4) ──► user_rng       (application getrandom() calls)
+    └─── splitmix64(domain=5) ──► swarm_rng      (per-universe fault config sampling)
 ```
 
 This means **every execution is a pure function of its seed**. The same binary + the same seed = the same exact execution, down to individual bytes written to virtual storage.
+
+### The Swarm Stream and Fault Configuration
+
+The `FaultSequences` dimension has two levels of variation per universe, not one. The `swarm_rng` (domain=5) is drawn **once, before the run starts**, to configure the `FaultInjector` for that universe:
+
+- **Which fault classes are active** — universe A might only inject memory faults; universe B only network faults
+- **What rate each class fires at** — sampled log-uniformly, not hardcoded (e.g. `oom_rate` between `1e-5` and `1e-2`)
+- **Which specific injection sites are activated** — the two-level BUGGIFY model from `docs/fault-injection.md §6`
+- **What knob values are set** — extreme-but-legal tuning parameters (e.g. a 60s timeout becomes 0.1s)
+
+The `fault_rng` (domain=2) is then drawn **per event at runtime** — every time `__wrap_malloc` or `__wrap_send` is called, the injector draws from its per-class sub-streams to decide whether to fire.
+
+These two streams are kept separate because config sampling must not disturb runtime fault draws. See `docs/fault-injection.md §7` (RNG Stream Discipline) for the full rules.
+
+The practical consequence for state exploration is that two universes with different seeds explore the state space in two independent ways: **different fault shapes** (swarm config) *and* **different fault timings** (runtime `fault_rng` draws). A campaign of 10,000 seeds gets 10,000 different storms, not the same light drizzle repeated 10,000 times.
 
 ---
 
@@ -378,34 +394,76 @@ struct Snapshot {
     // 1. Virtual time
     uint64_t virtual_time_ns;
 
-    // 2. Full RNG state for all four streams
+    // 2. Top-level RNG state for schedule, workload, and user streams
     struct RngState {
         uint64_t s[4];   // xoshiro256** state
     };
     RngState schedule_rng;
-    RngState fault_rng;
     RngState workload_rng;
     RngState user_rng;
+    // Note: swarm_rng is NOT snapshotted — it is drawn once before the run
+    // and its result is baked into fault_injector_state.config below. It does
+    // not advance during execution and does not need to be restored.
 
-    // 3. Heap state: full copy of every live allocation
+    // 3. FaultInjector internal state
+    // Restoring only the top-level fault_rng is not sufficient. The injector
+    // holds five independent per-class sub-streams (Memory, Network, Storage,
+    // Clock, Process), each at a different position. Budget counters, active
+    // episodes, and quiet depth must also be captured.
+    // See docs/fault-injection.md §7 (Rule 2) for why sub-stream isolation
+    // makes this a correctness requirement, not just a convenience.
+    struct FaultInjectorState {
+        // Per-class RNG sub-streams (all five must be snapshotted)
+        RngState memory_sub_stream;
+        RngState network_sub_stream;
+        RngState storage_sub_stream;
+        RngState clock_sub_stream;
+        RngState process_sub_stream;
+
+        // Budget counters (from FaultConfig::oom_skip_first / oom_max_count)
+        uint64_t allocs_seen;
+        uint64_t oom_injected;
+
+        // Active episode registry: which partitions / crashes are currently
+        // live and what their scheduled heal virtual timestamps are.
+        std::vector<ActiveEpisodeRecord> active_episodes;
+
+        // Quiet window nesting depth (push_quiet / pop_quiet balance)
+        int quiet_depth;
+
+        // FaultLedger up to the snapshot point.
+        // Needed so minimization replay can continue appending entries
+        // after a restore without losing the decision trace from before
+        // the fork point.
+        FaultLedger ledger_snapshot;
+
+        // The FaultConfig sampled for this universe (knob values, rates,
+        // active classes). Does not change during the run but is included
+        // so a restored branch inherits the same configuration.
+        FaultConfig config;
+    };
+    FaultInjectorState fault_injector_state;
+
+    // 4. Heap state: full copy of every live allocation
     // (possible because TrackedHeap::active_map_ tracks every allocation)
     std::vector<uint8_t> heap_image;
     std::vector<HeapAllocationRecord> allocation_table;
 
-    // 4. In-flight network packets (not yet delivered)
+    // 5. In-flight network packets (not yet delivered)
     std::vector<Packet> inflight_packets;
 
-    // 5. Virtual event queue (pending timer wakeups, I/O completions)
+    // 6. Virtual event queue (pending timer wakeups, I/O completions)
     std::vector<Event> event_queue;
 
-    // 6. Fiber scheduler state (all task stacks + program counters)
+    // 7. Fiber scheduler state (all task stacks + program counters)
     std::vector<FiberSnapshot> task_states;
 
-    // 7. Virtual storage state (page cache + durable image)
+    // 8. Virtual storage state (page cache + durable image)
     std::vector<PageCacheEntry> page_cache;
     std::vector<uint8_t>        durable_storage;
 };
 ```
+
 
 ### Save and Restore
 
@@ -476,19 +534,34 @@ flowchart TD
 
 ### Decision Log and Minimization
 
-Every branch taken is recorded in a **decision log**:
+Every branch taken — both scheduler choices and fault decisions — is recorded in the **FaultLedger** (defined fully in `docs/fault-injection.md §11`). The ledger is the authoritative replay input for minimization.
+
+Each entry captures:
 
 ```cpp
-struct Decision {
-    uint64_t virtual_time_ns;    // when this choice was made
-    ChoiceType type;             // SCHEDULER | FAULT_INJECT | PACKET_DELIVER
-    uint64_t chosen_value;       // which branch was taken
+// From fault-injection.md §11.1
+struct LedgerEntry {
+    uint64_t  virtual_time_ns;  // virtual timestamp of this decision
+    FaultClass cls;             // SCHEDULER | MEMORY | NETWORK | STORAGE | ...
+    SiteId    site;             // stable ID of the injection site
+    Status    status;           // Fired | Skipped | Suppressed
+    bool      drew;             // whether an RNG draw was consumed
 };
-
-std::vector<Decision> decision_log;
 ```
 
-When a finding is discovered, **delta-debug minimization** replays the log and removes decisions that are not necessary to reproduce the failure, yielding the **minimal failing trace**: the shortest sequence of events that triggers the bug.
+The `drew` flag is essential. A `Skipped` entry that returned early before the RNG and a `Skipped` entry that drew and lost the coin flip look identical in terms of outcome but leave the RNG sub-stream in different states. Without this flag, a replay cannot realign the sub-stream correctly after a suppression.
+
+**Why fault identity uses `site_id`, not an occurrence counter:**
+
+Minimization works by suppressing entries one-at-a-time and re-running to check if the failure still occurs. If fault identity were `(class, occurrence_index)` — e.g. "the 7th memory fault" — then suppressing fault #3 changes the application's control flow: it retries differently, allocates a different number of times, and what was the 7th allocation is now the 6th. The index scheme collapses.
+
+Instead, identity comes from the **recorded decision trace**: a replay reads the ledger rather than recomputing indices. At each decision point, it consumes the next ledger entry for that site and honours it — including consuming the same RNG draw when `drew = yes`, so the per-class sub-stream stays aligned. Suppression rewrites one entry's outcome to `Suppressed` and leaves every other entry untouched. This is why the `Snapshot` above captures `ledger_snapshot` — after a restore, the replay must continue appending to the pre-fork portion of the ledger, not start fresh.
+
+**What minimization produces:**
+
+One-at-a-time reduction yields a **1-minimal** set: no single remaining entry can be removed without losing the failure. This is not necessarily the globally smallest set (`ddmin` would find that at higher cost). The report states which guarantee it offers.
+
+The minimal failing trace — the shortest sequence of scheduler choices and fault injections that triggers the bug — is printed alongside the `--seed S` repro command.
 
 ### The Fiber Snapshot Problem
 
