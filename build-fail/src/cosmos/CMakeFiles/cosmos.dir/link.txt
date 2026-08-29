@@ -1,2 +1,0 @@
-/usr/bin/ar qc libcosmos.a CMakeFiles/cosmos.dir/cosmos.cpp.o CMakeFiles/cosmos.dir/wrappers/wrap_memory.cpp.o CMakeFiles/cosmos.dir/wrappers/wrap_threads.cpp.o CMakeFiles/cosmos.dir/wrappers/wrap_time.cpp.o CMakeFiles/cosmos.dir/wrappers/wrap_net.cpp.o CMakeFiles/cosmos.dir/wrappers/wrap_storage.cpp.o CMakeFiles/cosmos.dir/wrappers/wrap_random.cpp.o
-/usr/bin/ranlib libcosmos.a

@@ -1,1 +1,0 @@
-/usr/bin/c++ -O0 -Wl,--dependency-file=CMakeFiles/test_seed_derivation.dir/link.d CMakeFiles/test_seed_derivation.dir/test_seed_derivation.cpp.o -o test_seed_derivation  ../src/cosmos/libcosmos.a
