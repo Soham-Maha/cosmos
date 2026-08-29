@@ -1,0 +1,1 @@
+/usr/bin/cc -Wl,--dependency-file=CMakeFiles/kv_store_prod.dir/link.d CMakeFiles/kv_store_prod.dir/kv_store.c.o -o kv_store_prod

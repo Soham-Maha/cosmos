@@ -19,7 +19,7 @@ Research background: **`docs/antithesis-study-notes.md`**. Full API reference: *
 5. [Block-Level Architecture](#5-block-level-architecture)
 6. [Two-Level Probability & Swarm Configuration](#6-two-level-probability--swarm-configuration)
 7. [RNG Stream Discipline](#7-rng-stream-discipline)
-8. [Injection Sites: Wrappers vs `COSMOS_BUGGIFY`](#8-injection-sites-wrappers-vs-cosmos_buggify)
+8. [Injection Sites: Reaching the Operating System Boundary](#8-injection-sites-reaching-the-operating-system-boundary)
 9. [Run Lifecycle & Quiet Windows](#9-run-lifecycle--quiet-windows)
 10. [The Decision Gate Chain](#10-the-decision-gate-chain)
 11. [The Fault Ledger & Minimization](#11-the-fault-ledger--minimization)
@@ -28,6 +28,7 @@ Research background: **`docs/antithesis-study-notes.md`**. Full API reference: *
 14. [Testing the Injector Itself](#14-testing-the-injector-itself)
 15. [Implementation Roadmap](#15-implementation-roadmap)
 16. [References](#16-references)
+17. [Worked Example: Specifying, Injecting, and Diagnosing](#17-worked-example-specifying-injecting-and-diagnosing)
 
 ---
 
@@ -42,7 +43,7 @@ Research background: **`docs/antithesis-study-notes.md`**. Full API reference: *
 | **Episode Fault** | A fault with a duration that must later heal (a network partition from t=30ms to t=45ms). |
 | **Knob Fault** | Nothing breaks; a normal tuning value is set to an extreme-but-legal value (a 60s timeout becomes 0.1s). |
 | **Swarm** | Choosing a *different* subset of fault classes and intensities for every universe, instead of one uniform setting for all. |
-| **Injection Site** | A specific place a fault can be decided: a `__wrap_*` function, or a `COSMOS_BUGGIFY` marker in application code. |
+| **Injection Site** | A specific place a fault can be decided: one particular `__wrap_*` function, e.g. `malloc` or `send`. |
 | **Fault Ledger** | The timestamped record of every fault that fired in a universe. Used for reports, replay, and minimization. |
 | **Quiet Window** | A span of the run during which no faults may fire (engine setup, app warmup, final settle-down). |
 
@@ -180,10 +181,8 @@ graph TD
     ClockS --> Injector
 
     Injector --> Wrappers["__wrap_* POSIX wrappers<br><i>malloc, send, write, clock_gettime</i>"]
-    Injector --> Buggify["COSMOS_BUGGIFY sites<br><i>inside application code</i>"]
 
     Wrappers --> Ledger["<b>FaultLedger</b><br>timestamped record of every fault"]
-    Buggify --> Ledger
 
     Ledger --> Report["Failure report + repro seed"]
     Ledger --> Minimize["Minimization<br><i>replay with faults suppressed</i>"]
@@ -217,29 +216,9 @@ The effect: run A has sites `{3, 17, 42}` enabled and hammers them relentlessly;
 
 **This requires site identity, not just class identity.** A fault *class* (`Memory`) is far too coarse to express "sites 3, 17 and 42 are active" — enabling the class would activate every memory site at once, collapsing the two levels back into one. So Cosmos gives every injection site a **stable `SiteId`**:
 
-- **Wrapper sites** get a compile-time-assigned ID per wrapped function (`site::malloc`, `site::send`, …). These are stable across edits, since they are named, not positional.
-- **`COSMOS_BUGGIFY` sites** default to a hash of `(file, line)`, which is what FoundationDB's `BUGGIFY` uses.
+- **Every injection site is a wrapper site** (§8): a compile-time-assigned ID per wrapped function (`site::malloc`, `site::send`, …). These are stable across edits, since they are named, not positional, and there is no second, position-based kind of site to reason about.
 
-#### How stable a `(file, line)` site ID really is
-
-**It is stable within a build, and not across edits.** Inserting or deleting a line *anywhere above* a site shifts its `__LINE__`, which changes its ID — even if the site itself was untouched. It is worth being precise about this rather than implying more durability than the scheme has.
-
-That is acceptable for the default, because **the entire simulation is already build-dependent**. Any source change alters the compiled code, the allocation sequence, and therefore the execution — so a seed was never portable across builds in the first place. TigerBeetle makes this explicit by pairing every reproduction with a **git commit hash** alongside the seed, and Cosmos follows the same rule: a reproduction is identified by **`(build, seed)`**, not by a seed alone. Within one build, `(file, line)` is perfectly stable, which is all activation and replay need.
-
-For the cases where an ID genuinely must outlive edits — a long-lived regression repro, or a minimized fault set you want to keep referring to after refactoring — the macro takes an optional explicit tag:
-
-```c
-if (COSMOS_BUGGIFY)                    return TRY_AGAIN_LATER;  // id = hash(file, line)
-if (COSMOS_BUGGIFY_TAGGED("wal-retry")) return TRY_AGAIN_LATER; // id = hash(file, "wal-retry")
-```
-
-A tagged site keeps its identity as long as the tag string does, so it survives arbitrary line movement and even moving between functions in the same file. Tags must be unique within a file; a duplicate is a compile-time error.
-
-| Site kind | ID derived from | Survives edits above it? |
-|---|---|---|
-| Wrapper | Assigned constant | Yes |
-| `COSMOS_BUGGIFY` | `hash(file, line)` | No — build-scoped, which is the norm |
-| `COSMOS_BUGGIFY_TAGGED` | `hash(file, tag)` | Yes |
+Because a reproduction is identified by **`(build, seed)`**, not by a seed alone — any source change alters the compiled code and therefore the execution, so a seed was never portable across builds in the first place, and TigerBeetle makes this explicit by pairing every reproduction with a **git commit hash** — a compile-time-assigned wrapper ID is all activation and replay ever need.
 
 The gate then has three levels, coarse to fine:
 
@@ -269,9 +248,9 @@ Three layers, all derived from the seed:
 Level 0  (per campaign)  campaign_seed + universe_index  →  universe_seed
 Level 1  (per universe)  which fault classes are enabled       ← swarm
                          which sites are activated             ← swarm
-                         each class's RATE                     ← sampled, not hardcoded
+                         each site's rule rate                 ← sampled, not hardcoded
                          knob values                           ← sampled
-Level 2  (per event)     Bernoulli draw at that sampled rate
+Level 2  (per event)     one draw selects pass-through or one FaultKind
 ```
 
 #### Universe seed derivation
@@ -282,7 +261,7 @@ A campaign must not simply hand out `campaign_seed + 1`, `+ 2`, … — adjacent
 universe_seed = splitmix64(campaign_seed ^ splitmix64(universe_index))
 ```
 
-This makes universe *N* reproducible from `(campaign_seed, N)` for a **given build**, which is what the `--seed` repro command depends on. Seeds are not portable across builds — any source change alters the execution — so a reproduction is properly identified by `(build, seed)`, exactly as TigerBeetle pairs a seed with a git commit hash. See §6.2 for why this also bounds how stable a `COSMOS_BUGGIFY` site ID needs to be.
+This makes universe *N* reproducible from `(campaign_seed, N)` for a **given build**, which is what the `--seed` repro command depends on. Seeds are not portable across builds — any source change alters the execution — so a reproduction is properly identified by `(build, seed)`, exactly as TigerBeetle pairs a seed with a git commit hash.
 
 #### The swarm stream needs its own domain
 
@@ -300,7 +279,43 @@ The cleanest implementation is to give each class its own sampling sub-stream, s
 
 > **Rule 3 and this rule are not in conflict — they govern different phases.** Config sampling happens **once, before the run**, where a fixed draw schedule keeps the dimensions independent. Runtime fault decisions happen **per event**, where skipping draws is what keeps a disabled fault from disturbing the others. Fixed schedule when sampling; skip-when-impossible when firing.
 
-**Do not hardcode the rate.** Writing `oom_rate = 0.001` and leaving it explores exactly one point in the space. Let the seed *sample* it per universe — log-uniform between `1e-5` and `1e-2`, say. "Vanishingly rare failures" and "the allocator is basically broken" expose completely different bugs, and a fixed constant only ever tests one of them.
+**Do not hardcode a rule's rate.** Writing `rules[site::malloc].rate = 0.001` and leaving it explores exactly one point in the space. Let the seed *sample* a rate per universe — log-uniform between `1e-5` and `1e-2`, say. The same applies to storage, network, clock, and process outcomes: rare and frequent versions of a legal API failure expose different behavior, while a fixed constant explores only one point.
+
+### 6.5 Multiple Fault Kinds at One Site — Mutually Exclusive Selection (v1)
+
+Some sites can fail in more than one way. `send()` can drop the packet, delay it, reorder it, or corrupt it — one site, several possible outcomes. §6.2 only decided *whether* a site fires; it did not say what happens when a firing site has a menu of outcomes to choose from.
+
+**v1 rule: at most one outcome per call, chosen categorically.** The site's final decision is not "roll a separate Bernoulli trial per outcome and possibly stack several." One draw first decides whether the site's configured rate fires; if it does, that same draw is rescaled and used for a small categorical outcome table:
+
+```cpp
+struct SiteOutcome {
+    FaultKind kind;    // e.g. PacketDrop, PacketDelay, PacketCorrupt
+    double    weight;  // relative weight; normalized to sum to 1 at validate()
+};
+using OutcomeTable = std::vector<SiteOutcome>;   // one table per multi-outcome site
+```
+
+The draw is a single number from the site's own sub-stream, walked against the cumulative weights until it lands:
+
+```text
+draw = class_stream.uniform()   // one draw, same as any other site
+if draw >= rule.rate: return None
+cumulative = 0
+for outcome in table:
+    cumulative += outcome.weight
+    if draw / rule.rate < cumulative: return outcome.kind  // exactly one outcome
+```
+
+This is still exactly one RNG draw — it just returns a category instead of a boolean, so Rule 2/Rule 3 (§7) hold unchanged.
+
+**Why mutually exclusive, and why now:** a single call producing one clean, nameable outcome keeps the ledger easy to reason about (`site=send → outcome=PacketDrop`, never "drop *and* corrupt, in some order") and keeps minimization simple — suppressing one ledger line always means "this call behaved normally," never "this call partially misbehaved." Independent-per-kind Bernoulli trials (each kind rolling its own coin, so several can stack on the same call) is a real technique too — it models compounding real-world failures more faithfully — but it is deliberately **deferred to a later version**. Ship the simpler mutually-exclusive model first, validate it against real bugs, then upgrade individual fault classes to independent stacked trials once there's evidence the extra compounding is worth the added complexity in the ledger and in minimization.
+
+| Model | Outcomes per call | Ledger entry | Status |
+|---|---|---|---|
+| Mutually exclusive (categorical draw) | 0 or 1 | Always a single named outcome | **v1, current** |
+| Independent Bernoulli per kind (stacking) | 0, 1, or more | Multiple outcomes on one call | Future upgrade, per fault class |
+
+Single-outcome sites (`malloc` only ever has one failure mode: OOM) are unaffected — they stay a plain Bernoulli compare as already specified in §10's gate chain. The categorical draw only applies where a site's outcome table has more than one non-`None` entry.
 
 ---
 
@@ -348,70 +363,60 @@ Iterating a container in raw pointer/address order and drawing per element reint
 
 ---
 
-## 8. Injection Sites: Wrappers vs `COSMOS_BUGGIFY`
+## 8. Injection Sites: Reaching the Operating System Boundary
+
+Cosmos keeps application source untouched. A simulation build links a selected
+set of operating-system boundary calls through `__wrap_*` functions, and each
+wrapper asks the same `FaultInjector` for a decision. The first adapters are
+memory allocation; storage, network, and clock adapters reuse the same decision
+engine as they are added.
 
 ### 8.1 What linker wrapping can reach
 
-`-Wl,--wrap` intercepts the application's conversations with the **outside world** — memory, network, disk, clock. Think of it as a microphone at every **door** of the house. This is free: the application changes nothing.
+`-Wl,--wrap=<symbol>` rewrites calls that resolve through `<symbol>` in the
+final test link. For example, `--wrap=malloc` routes such calls to
+`__wrap_malloc`, which may return `nullptr`/`ENOMEM` or delegate to
+`__real_malloc`. No application source file is edited.
 
-### 8.2 What it cannot reach
+The scope is precise: wrapping reaches only calls that resolve through symbols
+Cosmos explicitly wraps. It does not promise to intercept direct syscalls,
+custom allocators, all C++ allocation implementations, or separately loaded
+code that bypasses those symbols.
 
-FoundationDB's most productive faults happen **inside the rooms**, not at the doors:
+### 8.2 The generic adapter contract
 
-- *"this transaction, which normally succeeds, fails this time"*
-- *"this operation, which is normally instant, takes a while"*
-- *"this tuning parameter takes an unusual value"*
+Every wrapper follows the same three steps:
 
-None of those touch `malloc`, `send`, or `write`. They are pure internal logic, and **no amount of door-listening will ever reach them.**
-
-### 8.3 The second mechanism
-
-Cosmos therefore provides an opt-in marker the application author places in their own code:
-
-```c
-if (COSMOS_BUGGIFY) return TRY_AGAIN_LATER;
+```text
+1. Name its FaultClass and stable SiteId.
+2. Ask FaultInjector to decide the one permitted fault outcome for this call.
+3. Either translate that outcome into the real API's documented failure result,
+   or call the original function unchanged.
 ```
 
-`COSMOS_BUGGIFY` must be an **expression**, not an empty macro — an empty expansion would make the `if` above a syntax error. It expands differently per build mode:
+For example, the memory adapter translates `OutOfMemory` to `nullptr` plus
+`errno = ENOMEM`; a storage adapter can translate `WriteEio` to `-1` plus
+`errno = EIO`; a network adapter can translate `ConnectionReset` to `-1` plus
+`errno = ECONNRESET`. Cosmos never invents an application-specific return
+value—it only produces results already valid for the wrapped API.
 
-```c
-/* include/cosmos/buggify.h */
-#if defined(COSMOS_SIM)
-    /* Per-call-site ID from (file, line). Stable within a build, which is all
-       activation and replay require — see §6.2. The injector then applies the
-       activated-then-fired gate chain. */
-#   define COSMOS_BUGGIFY \
-        cosmos_buggify_site(COSMOS_SITE_ID_LINE(__FILE__, __LINE__))
+| Adapter | Class / site | Example injected outcome | What the caller sees |
+|---|---|---|---|
+| `__wrap_malloc` | `Memory` / `site::malloc` | `OutOfMemory` | `nullptr`, `errno = ENOMEM` |
+| `__wrap_write` | `Storage` / `site::write` | `WriteEio` | `-1`, `errno = EIO` |
+| `__wrap_send` | `Network` / `site::send` | `ConnectionReset` | `-1`, `errno = ECONNRESET` |
+| `__wrap_clock_gettime` | `Clock` / `site::clock_gettime` | `ClockStep` | A configured, valid clock result |
 
-    /* Tagged variant: identity follows the tag, so it survives line movement
-       and refactoring. Use for long-lived regression repros. */
-#   define COSMOS_BUGGIFY_TAGGED(tag) \
-        cosmos_buggify_site(COSMOS_SITE_ID_TAG(__FILE__, tag))
-#else
-    /* PROD: compile-time constants. The branch is folded away and the arm is
-       discarded, while the expression stays syntactically valid. */
-#   define COSMOS_BUGGIFY              0
-#   define COSMOS_BUGGIFY_TAGGED(tag)  0
-#endif
-```
+### 8.3 What this guarantees
 
-Two things worth stating precisely, because "compiles to nothing" is easy to over-claim:
-
-1. **It is syntactically valid in both modes.** `if (0)` is legal C and C++; an empty macro would not be.
-2. **The erasure is a compiler guarantee only at `-O1` and above.** `if (0) { … }` is dead-code-eliminated by any optimising build, so a production binary contains no branch and no call. At `-O0` a compiler may still emit the dead test. Production builds are optimised, so this is a non-issue in practice — but the claim is "no overhead in an optimised `-DCOSMOS_PROD` build", not "no overhead unconditionally".
-
-The `COSMOS_PROD` build therefore needs a build-level check in CI that the emitted binary contains no reference to `cosmos_buggify_site`, which is a cheap `nm` assertion.
-
-### 8.4 Stated architectural position
-
-This does bend the "zero code modification" thesis, so the docs state the trade-off plainly rather than hiding it:
+- **The application's source is never touched.** Simulation changes linking for selected test targets only.
+- **Each injected result is legal for its wrapped API.** The application observes an ordinary operating-system failure and follows its own existing error path.
+- **The decision mechanism is generic.** Classes, sites, rates, budgets, deterministic triggers, ledger entries, and replay all use one shared model; wrappers only perform API-specific translation.
+- **The reach is intentionally bounded.** Cosmos tests the error handling exposed at supported operating-system boundaries; it does not guess whether an arbitrary internal application branch is safe to force.
 
 | Mechanism | App changes | Reach | Who uses it |
 |---|---|---|---|
-| `__wrap_*` faults | **None** | POSIX boundaries only | Everyone, by default |
-| `COSMOS_BUGGIFY` | A one-line marker | Any internal code path | Opt-in, for deeper testing |
-
-The zero-code-change promise holds for the baseline. `COSMOS_BUGGIFY` is a deliberate upgrade for teams who want to reach further, and it is entirely optional.
+| `__wrap_*` adapters | None | Calls resolving through explicitly wrapped OS/API symbols | Every supported simulation build |
 
 ---
 
@@ -457,7 +462,7 @@ Every point-fault decision runs the same ordered chain. All cheap gates first; *
 
 ```mermaid
 flowchart TD
-    Start(["should_inject(Memory, site)"]) --> G1{"Quiet window?<br><i>engine work, or quiescing</i>"}
+    Start(["decide(class, site)"]) --> G1{"Quiet window?<br><i>engine work, or quiescing</i>"}
     G1 -- yes --> Skip["<b>Skipped</b><br>drew = no"]
     G1 -- no --> G2{"Is the Memory class<br>enabled this run?"}
     G2 -- no --> Skip
@@ -465,25 +470,79 @@ flowchart TD
     G2b -- no --> Skip
     G2b -- yes --> G3{"Still inside the<br>warmup window?"}
     G3 -- yes --> Skip
-    G3 -- no --> G4{"Within the first<br>N skipped allocations?"}
+    G3 -- no --> G4{"Within this site's first<br>N skipped calls?"}
     G4 -- yes --> Skip
     G4 -- no --> G5{"Injection budget<br>already spent?"}
     G5 -- yes --> Skip
-    G5 -- no --> Draw["<b>Draw once</b> from the<br>Memory sub-stream"]
-    Draw --> Cmp{"draw &lt; oom_rate ?"}
+    G5 -- no --> Draw["<b>Draw once</b> from this<br>class's sub-stream"]
+    Draw --> Cmp{"select a FaultKind<br>from this site's rule"}
     Cmp -- no --> Lost["<b>Not fired</b><br>drew = yes"]
     Cmp -- yes --> Fired["<b>Fired</b><br>drew = yes"]
 
     Skip --> Rec["Write ledger record<br><i>status + reason + drew</i>"]
     Lost --> Rec
     Fired --> Rec
-    Rec --> Out(["return the outcome<br><i>fired ⇒ malloc returns nullptr,<br>errno = ENOMEM</i>"])
+    Rec --> Out(["return FaultKind<br><i>wrapper maps it to a legal API result</i>"])
 ```
 
 Two things this diagram encodes:
 
 - **The ordering is not stylistic.** Every gate that exits *before* the draw is what makes Rule 3 hold, and Rule 3 is what lets you change one setting without disturbing everything else.
 - **Every path writes a ledger record**, including the ones that never touched the RNG. That is what makes the `drew` flag meaningful (§11.1) and what lets replay realign the stream without guessing.
+
+### 10.1 Deterministic Pattern Triggers (Tier 1)
+
+The gate chain above always ends the same way: a random draw decides whether a fault fires. That is exactly right for broad, undirected exploration — but it is the wrong tool for reproducing one *specific* scenario on demand, such as a regression test that says "crash the node on exactly its 3rd retry, every time, regardless of seed." Waiting for the swarm to stumble into that exact situation is unreliable and slow.
+
+**A deterministic trigger is a fact, not a coin flip.** It replaces the draw with a direct check, so it never touches the RNG at all:
+
+```text
+quiet? → class on? → site on? → warmup? → budget?
+                                              │
+                              (all gates passed — site is "eligible")
+                                              │
+                          occurrence count matches a configured trigger?
+                                     │                        │
+                                    yes                       no
+                                     │                        │
+                            FIRE, drew = no          [Draw once, as before]
+```
+
+This is the same idea the Linux kernel's fault-injection framework already uses for `space`/`times` (§16 ref. 5), narrowed from *a window* of eligible calls down to *one exact occurrence*.
+
+**Tier 1 scope: occurrence-count triggers only.** Each generic `FaultRule` names
+its site through the `rules` map and may specify the exact eligible-call number
+that should fire:
+
+```cpp
+FaultRule rule;
+rule.fire_on_eligible_call = 3; // 1-based: fire on this site's 3rd eligible reach
+cfg.rules.emplace(site::crash_node, std::move(rule));
+```
+
+The counter it checks is the **eligible-call count** — incremented only for
+calls that already passed quiet/class/site/warmup/budget — not the raw,
+unfiltered call count. This applies uniformly to allocation, I/O, network,
+clock, and process sites.
+
+**Ledger entry:** identical shape to any other decision, with a distinct reason so it's never confused with a probabilistic fire:
+
+```text
+t=61ms   Process   site=crash_node   FIRED   drew=no   reason=pattern_matched(occurrence=1)
+```
+
+Because `drew=no`, this follows the same rule that already governs every other zero-draw path (§7 Rule 3): firing deterministically must never shift the RNG stream, or a scenario that's supposed to be scripted and exact would start perturbing unrelated probabilistic faults in the same run.
+
+**Why this is worth having on its own, independent of the swarm:** it turns the workflow into "declare the exact scenario, then assert the expected recovery" instead of "hope chaos eventually produces it":
+
+```cpp
+FaultConfig cfg;
+cfg.rules[site::crash_node].fire_on_eligible_call = 1;
+
+scenario.check("recovers-from-single-crash", replicas_agree_after_recovery());
+```
+
+**Deferred to a later version — Tier 2 and beyond.** Tier 1 only asks "has this site been reached N times?" A more expressive version — worth designing later, once Tier 1 has proven useful — would let a trigger track a short *sequence* of events (a small per-trigger state machine, e.g. "fire on `site B` only if `site A` fired within the last 20ms and no heal has happened since"), and a further tier beyond that could match arbitrary predicates over live simulation state (which node is currently leader, whether a write is in flight). Both add real state and cost to the injector — a state machine to advance per trigger, or read access to node/clock state it doesn't currently need — so they are intentionally out of scope until Tier 1's simpler, cheaper mechanism is shown to be insufficient in practice.
 
 ---
 
@@ -559,7 +618,7 @@ Records are hashed in ledger order, each field appended in that fixed encoding.
 
 ### 11.4 As proof the faults actually fired
 
-If `oom_rate` is `0.001` and a run makes 200 allocations, most runs inject nothing at all and the test is silently vacuous. A `sometimes(oom_was_injected, "OOM path exercised")` assertion across the campaign proves the fault configuration is genuinely doing work. This is Antithesis's primary recommended use for `sometimes`.
+If a configured fault rate is `0.001` and a run reaches only 200 eligible sites, most runs inject nothing at all and the test is silently vacuous. A campaign-level coverage check such as `sometimes(fault_was_injected(FaultClass::Storage), "storage fault path exercised")` proves the configuration is genuinely doing work. This is Antithesis's primary recommended use for `sometimes`.
 
 ---
 
@@ -570,6 +629,16 @@ namespace cosmos {
 
 enum class FaultClass : uint8_t { Memory, Network, Storage, Clock, Process, _Count };
 enum class FaultMode  : uint8_t { Safety, Liveness };
+
+/// Rules are generic: the injector chooses a FaultKind and the wrapper maps it
+/// to a legal result for its API (ENOMEM, EIO, ECONNRESET, a short write, ...).
+struct FaultRule {
+    double rate = 0.0;                       // finite and in [0, 1]
+    uint64_t skip_first = 0;                 // first N eligible reaches do not fire
+    uint64_t max_injections = UINT64_MAX;    // cap for non-None outcomes
+    OutcomeTable outcomes;                   // one or more mutually exclusive outcomes
+    std::optional<uint64_t> fire_on_eligible_call;
+};
 
 /// Pure data. Sampled once per universe from the seed. Copyable and printable,
 /// so a failing run can report the exact configuration that produced it.
@@ -583,10 +652,9 @@ struct FaultConfig {
     // means "not activated". Populated only for classes that are enabled.
     SiteActivationSet activated_sites;
 
-    // Memory class. Rates are sampled per universe, never hardcoded.
-    double   oom_rate       = 0.0;              // must be finite and in [0, 1]
-    uint64_t oom_skip_first = 0;                // warmup skip (kernel's `space`)
-    uint64_t oom_max_count  = UINT64_MAX;       // injection budget (kernel's `times`)
+    // Generic per-site rules. A simple site has one non-None outcome; a
+    // multi-outcome site has several. Every wrapper uses this same mechanism.
+    std::unordered_map<SiteId, FaultRule> rules;
 
     // Fault-model limits: never exceed what the application promises to survive.
     uint32_t max_crashed_nodes  = 0;
@@ -603,11 +671,10 @@ struct FaultConfig {
     static FaultConfig sample(Rng& swarm_rng);
 
     /// Rejects configs that would silently misbehave:
-    ///   - oom_rate must be finite and within [0, 1].
-    ///     NaN and negatives would quietly disable injection; values above 1
-    ///     would inject on every eligible event. Both look like "no bug found"
-    ///     or "everything is broken" rather than a bad config.
-    ///   - min_healthy_quorum must not exceed the node count.
+    ///   - every rule rate and outcome weight must be finite and in range;
+    ///   - outcome tables must have deterministic order and total weight == 1
+    ///     whenever their rule rate is nonzero;
+    ///   - min_healthy_quorum must not exceed the node count;
     ///   - warmup_until must be <= quiesce_after.
     /// Enforced in sample() and again in the FaultInjector constructor.
     [[nodiscard]] std::expected<void, ConfigError> validate() const;
@@ -629,8 +696,9 @@ class FaultInjector {
                   const NodeRegistry& nodes);  // query live/crashed state for limits
 
     // ---- Point faults: one gate chain, one draw. Non-const: drawing mutates. ----
-    bool should_inject(FaultClass cls, SiteId site);
-    bool should_inject_oom() { return should_inject(FaultClass::Memory, site::malloc); }
+    // FaultKind::None means pass the original call through unchanged. Otherwise
+    // the caller's wrapper translates the result to its API-specific failure.
+    FaultKind decide(FaultClass cls, SiteId site);
 
     // ---- Episode faults ----
     // Checks the fault-model limits against live node state, starts the episode,
@@ -671,8 +739,8 @@ class FaultInjector {
     ActiveEpisodeMap active_;        // what is currently broken
     int              quiet_depth_{0};
     bool             quiescing_{false};
-    uint64_t         allocs_seen_{0};
-    uint64_t         oom_injected_{0};
+    SiteCounterMap   eligible_calls_;    // reaches after all pre-eligibility gates
+    SiteCounterMap   injections_;        // non-None outcomes per site
     FaultLedger      ledger_{};
 };
 
@@ -699,7 +767,7 @@ class QuietGuard {
 **Why `FaultConfig` and `FaultInjector` are separate types:**
 
 1. `FaultConfig` is what the *user* writes and reads.
-2. `FaultConfig` is what gets *printed* in a failure report (`seed=8421, mode=Safety, oom_rate=0.003`), which makes findings self-describing.
+2. `FaultConfig` is what gets *printed* in a failure report (`seed=8421, mode=Safety, site=write, rate=0.003`), which makes findings self-describing.
 3. `FaultInjector` holds mutable engine state (RNG position, counters, quiet depth, active episodes) that must never appear in the user's mental model.
 
 A single fused struct forces the decision method to be `const` while it needs to mutate an RNG — the tension visible in the current scaffolded `FaultProfile`.
@@ -722,6 +790,7 @@ A single fused struct forces the decision method to be `const` while it needs to
 | 8 | **Config sampling** uses a fixed class-indexed draw schedule, including disabled classes | Swarm dimensions become correlated; toggling one class shifts another's rate |
 | 9 | The ledger is recorded for every decision, with status and `drew` flag | Replay cannot distinguish "returned early" from "drew and lost" |
 | 10 | The trace hash covers a canonical encoding, never in-memory layout | `--verify` fails across compilers and platforms for non-determinism reasons |
+| 11 | A deterministic pattern trigger (§10.1) firing never consumes a draw | A scripted, exact-occurrence scenario would perturb unrelated probabilistic faults sharing the same run |
 
 ---
 
@@ -745,17 +814,21 @@ The stream-isolation and replay-with-suppression tests are the non-obvious ones,
 
 ## 15. Implementation Roadmap
 
+The order below is deliberately MVP-first: prove that one real fault, injected deterministically, can be caught by one real check, before spending any effort on breadth (more fault classes) or depth (swarm sampling, minimization, distributed faults). Each later sprint only starts once the sprint before it is genuinely solid — none of them are worth doing early against a shaky foundation.
+
 | Sprint | Content | Exit criteria |
 |---|---|---|
 | **F0** | **Seeded RNG** (`random.hpp`): `xoshiro256**` + `splitmix64` derivation, the five domain streams, per-class sub-streams, universe-seed derivation from `(campaign_seed, index)` | Known-answer tests pass against published reference vectors. **Hard blocker for everything below.** |
-| **F1** | `FaultConfig` / `FaultInjector` split; `validate()`; stable `SiteId`; **Memory class only**, full gate chain, quiet windows, budgets; ledger with status + `drew` flag | `oom_rate = 0.003` genuinely fires; invalid rates rejected; same seed ⇒ identical ledger |
-| **F2** | Swarm sampler (`FaultConfig::sample`) with fixed class-indexed draws + per-site activation + knob faults | Stream-isolation and swarm-coverage tests pass |
-| **F3** | Decision trace; replay with suppression; canonical ledger encoding + FNV-1a trace hash | Suppressing one fault leaves every other trace entry honoured identically; `--verify` stable across compilers |
-| **F4** | Episode lifecycle (clock / event queue / node registry deps), persistent faults, fault-model limits, `Liveness` mode transition | Every episode heals or is explicitly persistent; liveness assertions expressible on the distributed example |
-| **F5** | `COSMOS_BUGGIFY` macro + CI check that `PROD` binaries contain no `cosmos_buggify_site` symbol | Internal code-path faults reachable in SIM, provably absent in PROD |
-| **F6+** | Extend class by class as subsystems land: Network (Phase 2), Storage (Phase 4), Clock, Process | Each new class reuses the F1 skeleton unchanged |
+| **F1** | Generic `FaultRule` / `FaultInjector::decide` split; `validate()`; stable `SiteId`; gate chain, quiet windows, budgets, and deterministic occurrence triggers; a fired-fault diagnostic log | A configured rule fires on its exact eligible occurrence with `drew=no`, and invalid rates/outcome tables are rejected |
+| **F2** | First adapter plus correctness-oracle surface (§17): `__wrap_malloc` → `OutOfMemory`; a minimal `Scenario`/`FaultPlan` harness with `quiesce()` and `check()` | A single seed reproducibly fails a deliberately broken example app, and passes once the break is fixed — proves one fault, one adapter, and one oracle end to end |
+| **F3** | Generic wrapper-surface expansion, one call at a time: `calloc`/`realloc`; `open`/`read`/`write`/`fsync` (`EIO`, short write, `ENOSPC`); `send`/`recv`/`connect` (`ECONNRESET`, 0-byte close, delayed delivery); clock reads — each reusing F1's decision engine unchanged | Every newly wrapped call maps a named `FaultKind` to a documented legal API result and is independently tested |
+| **F4** | Campaign runner (many seeds, `never_hit` tracking); swarm sampler (`FaultConfig::sample`) with fixed class-indexed draws + per-site activation; mutually-exclusive categorical draw for multi-outcome sites (§6.5) | Stream-isolation and swarm-coverage tests pass; a multi-outcome site never produces more than one outcome per call |
+| **F5** | Decision trace; replay with suppression; minimization; canonical ledger encoding + FNV-1a trace hash | Suppressing one fault leaves every other trace entry honoured identically; `--verify` stable across compilers |
+| **F6** | Distributed faults: virtual clock, event queue, node registry, episode lifecycle, persistent faults, fault-model limits, `Liveness` mode transition | Every episode heals or is explicitly persistent; liveness assertions expressible on the distributed example |
 
-F0 and F1 are deliberately small. One fault class implemented properly — with its gate chain, ledger, and isolation tests solid — makes every later class nearly free. Adding classes before that skeleton is right multiplies the rework.
+**Not planned:** automatically inserting faults into application logic without the application author writing anything (§8.3) — this isn't a later sprint, it's a capability this design deliberately doesn't claim.
+
+F0 and F1 are deliberately small. One fault class implemented properly — with its gate chain, ledger, and isolation tests solid — makes every later class nearly free. Adding classes before that skeleton is right multiplies the rework. Everything from F4 onward (breadth via swarm, minimization, distributed faults) is real value, but none of it is needed to prove the architecture works — F0 through F3 alone already deliver a usable tool.
 
 ---
 
@@ -783,8 +856,174 @@ Sources studied to derive this design.
 
 ### 5. Linux Kernel — Fault Injection Framework
 * **Docs**: [Fault injection capabilities infrastructure](https://www.kernel.org/doc/html/latest/fault-injection/fault-injection.html)
-* **Taken from it**: the battle-tested parameter set — `probability`, `interval`, `times` (maximum injections), `space` (skip the first N). Adopted directly as `oom_max_count` and `oom_skip_first`.
+* **Taken from it**: the battle-tested parameter set — `probability`, `interval`, `times` (maximum injections), `space` (skip the first N). Adopted generically in each `FaultRule` as `rate`, `max_injections`, and `skip_first`.
 
 ### 6. Jepsen
 * **Site**: [jepsen.io](https://jepsen.io/analyses)
 * **Taken from it**: the catalogue of real distributed-systems failure shapes that informs which faults are worth injecting at all.
+
+---
+
+## 17. Worked Example: Specifying, Injecting, and Diagnosing
+
+The sections above define the machinery in isolation: the fault model, the probability engine, the injection sites, the ledger. This section walks the same 3-node replicated KV store used as the running example in §2 through the **full loop**, end to end — because the individual pieces only make sense once you see how a user actually touches them.
+
+**The loop, in one picture:**
+
+```mermaid
+flowchart LR
+    A["1. Write the promise<br><i>FaultConfig limits</i>"] --> B["2. Write the oracle<br><i>Scenario check in harness</i>"]
+    B --> C["3. Run the campaign<br><i>many seeds, faults ON</i>"]
+    C --> D{"Any harness check<br>failed?"}
+    D -- no --> E["Pass — but check<br>coverage wasn't vacuous"]
+    D -- yes --> F["Failure report:<br>seed + ledger + timestamp"]
+    F --> G["4. Read the ledger<br>backward from the failure"]
+    G --> H["5. Minimize:<br>replay, suppress one fault at a time"]
+    H --> I["Minimal fault set:<br>the actual repro"]
+```
+
+Before the full walkthrough, here's the same loop at its smallest — one exact fault, one check, nothing else:
+
+```cpp
+cosmos::run(
+    {.seed = 8421, .oom = {.fail_on_call = 443}},   // the promise: fail exactly the 443rd allocation
+    [&] { app.run_workload(); },                     // the workload
+    [&] { CHECK(app.is_consistent()); });             // the oracle
+```
+
+This alone is already the whole point proven end to end: a seed reliably reproduces one specific failure, and one check says whether the app survived it. Everything else in this section — more faults, more seeds, richer oracles — is the same shape scaled up.
+
+There is no separate step for "define the expected state" versus "define the fault state" — steps 1 and 2 below together **are** that definition, expressed as code rather than as a template. And critically, **none of that code lives inside the application.** The application's own source stays exactly what its author wrote (§8) — every piece below lives in a separate test harness that starts the real application and talks to it only the way any other client would: through its public API, and by reading whatever state it actually persists.
+
+Three things the harness needs to say, matching the three concerns from §2 and §12:
+
+| Concern | Who states it | Where |
+|---|---|---|
+| What can break | The fault model limits (§2) | A `FaultPlan`, built from `FaultConfig` |
+| What the test actually does | Ordinary calls into the app's public client | A workload function |
+| What must still be true afterward | A check against public state, persisted state, or a small reference model | An oracle |
+
+### 17.1 Step 1 — Declare the promise
+
+This is the fault model from §2, written as data, and packaged as a `FaultPlan` — the harness-facing name for a `FaultConfig` built for one scenario:
+
+```cpp
+FaultPlan plan;
+plan.enabled.set(FaultClass::Network);
+plan.enabled.set(FaultClass::Process);
+
+plan.max_crashed_nodes  = 1;   // the promise: survive losing any 1 of 3 nodes
+plan.min_healthy_quorum = 2;
+
+plan.mode = FaultMode::Safety; // unbounded chaos within the limits above (§3)
+```
+
+This *is* the "template" for the fault side of the question. It is not free-form — `max_crashed_nodes` and `min_healthy_quorum` are the only two numbers the injector checks before starting an episode fault (§2), so the promise is exactly as expressive as those two fields and no more. That is intentional: a promise that's harder to state than "N nodes, M quorum" usually means the fault model itself needs to be re-thought, not that the config needs more knobs.
+
+### 17.2 Step 2 — Drive the app, then check what it left behind
+
+This is the "expected state," and it's checked from **outside** the application, against things any real client or operator could also see. There are three practical ways to write a check, in increasing strength:
+
+| Style | What it checks | Good for |
+|---|---|---|
+| **A. Public API** | The app's own client-facing answers, e.g. "is this write still marked complete?" | Fast, simple, close to what a real caller sees |
+| **B. Persisted state** | What's actually on disk/replicated after the run, read independently of the app's own code | Storage and consistency properties |
+| **C. Reference model** | A small model the harness keeps itself ("I told it to transfer 100 from a to b"), compared against the app's state at the end | The strongest check, for properties an API answer alone can't confirm |
+
+```cpp
+Scenario scenario{.faults = plan};
+
+Cluster cluster = start_replicated_kv_under_test();   // the real app, unmodified, running for real
+
+scenario.run([&] {
+    client.put("user:42", "value");                    // workload — ordinary client calls
+    client.retry_until_acknowledged("user:42");
+});
+
+scenario.quiesce();   // stop injecting, heal everything, let the app finish recovering (§9.3)
+
+// Oracle, style B — read persisted state directly, not through app-internal hooks.
+scenario.check("no-committed-data-loss", [&] {
+    return read_committed_value(cluster, "user:42") == "value";
+});
+scenario.note_covered("node-crash-path-exercised", a_process_fault_fired_this_run);
+```
+
+`scenario.quiesce()` is doing exactly the work described in §9.3 — checking "did every replica keep the write" is only a fair question once the network has actually had a chance to heal, so the harness calls it explicitly before checking anything.
+
+### 17.3 Step 3 — Run the campaign
+
+The scenario from §17.2 runs once per seed, unchanged — a campaign is just this same harness repeated:
+
+```cpp
+CampaignConfig ccfg;
+ccfg.trials    = 5000;
+ccfg.base_seed = 1;
+
+CampaignReport report = Campaign::run(ccfg, [&](Simulator& sim, uint64_t universe_index) {
+    Scenario scenario{.faults = FaultConfig::sample(sim.swarm_rng())};
+    run_replicated_kv_scenario(scenario);   // the exact harness from §17.2, one seed at a time
+});
+```
+
+Each of the 5000 universes gets its own seed (§6.4), its own swarm-sampled rates (§6), and runs the full lifecycle from §9. The user does not watch any of this run — they read `report` afterward:
+
+```text
+report.runs        = 5000
+report.failed_runs = 3
+report.never_hit    = []   // sometimes("node-crash-path-exercised") did fire — not vacuous
+```
+
+3 failures out of 5000 is the signal. Everything else was a clean pass under real chaos.
+
+### 17.4 Step 4 — Read the failure
+
+One of the three failures prints:
+
+```text
+FAILED: "no-committed-data-loss"
+  seed    = 8421
+  detail  = "node=n1 key=user:42"
+  t       = 87ms
+
+Fault ledger:
+  t=12ms   Memory   site=malloc      FIRED    alloc #443 → ENOMEM
+  t=30ms   Network  site=send        FIRED    partition {n0} | {n1,n2}
+  t=45ms   Network  site=send        FIRED    partition healed (scheduled)
+  t=61ms   Process  site=crash_node  FIRED    node n2 crashed
+  t=87ms   ← always("no-committed-data-loss") FAILED here
+```
+
+The user does not manually diff two states. The failing harness check **is** the detection: after quiesce it compared the independently observed state with the promised result. Diagnosis is reading the ledger *backward from `t=87ms`*: the network partition at `t=30ms` isolated `n1` right before `n2` crashed at `t=61ms`, which is the obvious suspect — `n1` likely committed a write it believed was replicated to `n2`, but `n2` never actually received it before crashing, and nothing else held a durable copy.
+
+That is a hypothesis, not proof. With only 4 faults in this short ledger it is easy to eyeball, but a long run can have dozens, and eyeballing stops working. That's what step 5 automates.
+
+### 17.5 Step 5 — Minimize to the actual cause
+
+```text
+cosmos --seed 8421 --minimize
+```
+
+This replays seed 8421 repeatedly, each time suppressing one ledger entry (§11.2) and checking whether `"no-committed-data-loss"` still fails:
+
+```text
+suppress t=12ms (malloc OOM)         → still FAILS → OOM was irrelevant, drop it
+suppress t=30ms (partition start)    → PASSES      → this fault was essential, keep it
+suppress t=61ms (n2 crash)           → PASSES      → this fault was essential, keep it
+```
+
+Result — a 1-minimal reproduction (§11.2):
+
+```text
+Minimal fault set for "no-committed-data-loss":
+  t=30ms   Network   partition {n1} isolated from {n0,n2}
+  t=61ms   Process   n2 crashed while still isolated
+
+Repro: cosmos --seed 8421 --only-faults=2   (the two entries above, nothing else)
+```
+
+This is the actual bug report a developer acts on: *"if `n1` is partitioned away from the cluster right when `n2`, the only other holder of a given write, crashes, the write is lost — even though only 1 of 3 nodes ever died, which the fault model says should be survivable."* That is a genuine violation of the promise from §2, not a false positive — the injector never exceeded `max_crashed_nodes = 1`, so this finding is real.
+
+### 17.6 What this example does and does not show
+
+This walkthrough uses only mechanisms already specified earlier in this document — §2's limits, §9's phases, §11's ledger and minimization, and the `Scenario`/`Campaign` harness. It does not introduce a new "template" format, because the existing mechanism already covers the need: **the promise is data (`FaultConfig`), the check is harness code (`Scenario::check`), and the two meet in the scenario result.** A declarative template would only be worth adding later if real usage shows the same small oracle patterns being copy-pasted across many applications; it would be a helper library on top of this mechanism, not a change to it.

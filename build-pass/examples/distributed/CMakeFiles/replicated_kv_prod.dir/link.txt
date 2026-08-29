@@ -1,0 +1,1 @@
+/usr/bin/cc -Wl,--dependency-file=CMakeFiles/replicated_kv_prod.dir/link.d CMakeFiles/replicated_kv_prod.dir/replicated_kv.c.o -o replicated_kv_prod

@@ -1,0 +1,4 @@
+test_wrap_malloc 1 0.0103473
+test_random 1 0.0202424
+test_seed_derivation 1 0.0974139
+---

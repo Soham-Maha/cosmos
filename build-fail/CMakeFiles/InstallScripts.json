@@ -1,0 +1,12 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/shion/Documents/cosmos/build-fail/cmake_install.cmake",
+		"/home/shion/Documents/cosmos/build-fail/src/cosmos/cmake_install.cmake",
+		"/home/shion/Documents/cosmos/build-fail/examples/cmake_install.cmake",
+		"/home/shion/Documents/cosmos/build-fail/examples/single_node/cmake_install.cmake",
+		"/home/shion/Documents/cosmos/build-fail/examples/distributed/cmake_install.cmake",
+		"/home/shion/Documents/cosmos/build-fail/tests/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
