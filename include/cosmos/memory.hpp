@@ -35,6 +35,13 @@ struct alignas(std::max_align_t) AllocationHeader {
 static_assert(sizeof(AllocationHeader) % alignof(std::max_align_t) == 0,
               "AllocationHeader size must be a multiple of max_align_t");
 
+// Every tracked payload is preceded by its header, so a tracked pointer must never be handed to
+// __real_free directly: the real allocation starts sizeof(AllocationHeader) bytes earlier.
+inline AllocationHeader* header_for(void* user_ptr) {
+    return reinterpret_cast<AllocationHeader*>(static_cast<char*>(user_ptr) -
+                                               sizeof(AllocationHeader));
+}
+
 /**
  * @brief Custom C++ allocator for TrackedHeap internal containers (e.g. std::unordered_map).
  *
@@ -146,9 +153,7 @@ class TrackedHeap {
             return false;
         }
 
-        constexpr size_t header_size = sizeof(AllocationHeader);
-        auto* header =
-            reinterpret_cast<AllocationHeader*>(static_cast<char*>(user_ptr) - header_size);
+        auto* header = header_for(user_ptr);
 
         if (header->magic != COSMOS_CANARY_MAGIC) {
             return false;

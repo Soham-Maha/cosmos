@@ -80,6 +80,9 @@ void* __wrap_malloc(size_t size) {
  *   Delegates to `sim->heap().deallocate(ptr)`. If `deallocate` recognizes the pointer's header
  * canary magic, it updates active heap statistics, marks the header as freed, and frees the raw
  * header via `__real_free`.
+ * - If no current Simulator owns the pointer (the owning Simulator may no longer be current), the
+ * canary is checked directly: handing a tracked payload to `__real_free` would free an address one
+ * header past the real allocation, so the tracked block is freed via its header instead.
  * - For passthrough allocations (allocated via `__real_malloc` outside a simulation context) or
  * during re-entrancy, falls back directly to native OS `__real_free(ptr)`.
  */
@@ -98,6 +101,15 @@ void __wrap_free(void* ptr) {
         if (sim->heap().deallocate(ptr)) {
             return;
         }
+    }
+
+    // The owning Simulator may no longer be current, so the canary is checked here too: handing a
+    // tracked payload to __real_free would free an address one header past the real allocation.
+    auto* header = cosmos::header_for(ptr);
+    if (header->magic == cosmos::COSMOS_CANARY_MAGIC) {
+        header->magic = cosmos::COSMOS_FREED_MAGIC;
+        __real_free(header);
+        return;
     }
 
     // Passthrough allocation (allocated via __real_malloc outside simulation context)
