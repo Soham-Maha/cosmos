@@ -32,3 +32,7 @@ add_test(NAME test_random COMMAND test_random)
 add_executable(test_seed_derivation test_seed_derivation.cpp)
 target_link_libraries(test_seed_derivation PRIVATE cosmos)
 add_test(NAME test_seed_derivation COMMAND test_seed_derivation)
+
+add_executable(test_time test_time.cpp)
+target_link_libraries(test_time PRIVATE cosmos)
+add_test(NAME test_time COMMAND test_time)
