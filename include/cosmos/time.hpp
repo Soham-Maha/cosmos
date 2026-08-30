@@ -1,6 +1,7 @@
 #pragma once
 
 #include <compare>
+#include <concepts>
 #include <cstdint>
 
 namespace cosmos {
@@ -49,11 +50,41 @@ struct DurationTag {};
 using Time = Nanos<TimeTag>;
 using Duration = Nanos<DurationTag>;
 
+// Excludes floating point and bool: `d * 0.5` would convert to 0 and silently zero the duration,
+// and `d * (x > 0)` is never what anyone meant. Use scale() for fractional factors.
+template <typename K>
+concept ScaleFactor = std::integral<K> && !std::same_as<K, bool>;
+
+template <ScaleFactor K> constexpr int64_t to_factor(K k) {
+    if constexpr (std::unsigned_integral<K>) {
+        return static_cast<uintmax_t>(k) > static_cast<uintmax_t>(INT64_MAX)
+                   ? INT64_MAX
+                   : static_cast<int64_t>(k);
+    } else {
+        return static_cast<int64_t>(k);
+    }
+}
+
 constexpr Duration operator+(Duration a, Duration b) { return Duration{add_sat(a.ns, b.ns)}; }
 constexpr Duration operator-(Duration a, Duration b) { return Duration{sub_sat(a.ns, b.ns)}; }
 constexpr Duration operator-(Duration d) { return Duration{sub_sat(0, d.ns)}; }
-constexpr Duration operator*(Duration d, int64_t k) { return Duration{mul_sat(d.ns, k)}; }
-constexpr Duration operator*(int64_t k, Duration d) { return Duration{mul_sat(d.ns, k)}; }
+
+template <ScaleFactor K> constexpr Duration operator*(Duration d, K k) {
+    return Duration{mul_sat(d.ns, to_factor(k))};
+}
+template <ScaleFactor K> constexpr Duration operator*(K k, Duration d) {
+    return Duration{mul_sat(d.ns, to_factor(k))};
+}
+
+// Fractional scaling is a named call rather than an operator so the truncation is deliberate and
+// visible at the call site. NaN yields zero; anything past the int64 range saturates.
+constexpr Duration scale(Duration d, double factor) {
+    const double result = static_cast<double>(d.ns) * factor;
+    if (result != result) return Duration::zero();
+    if (result <= static_cast<double>(INT64_MIN)) return Duration::min();
+    if (result >= static_cast<double>(INT64_MAX)) return Duration::max();
+    return Duration{static_cast<int64_t>(result)};
+}
 
 constexpr Time operator+(Time t, Duration d) { return Time{add_sat(t.ns, d.ns)}; }
 constexpr Time operator+(Duration d, Time t) { return Time{add_sat(t.ns, d.ns)}; }
@@ -62,7 +93,7 @@ constexpr Duration operator-(Time a, Time b) { return Duration{sub_sat(a.ns, b.n
 
 constexpr Duration& operator+=(Duration& a, Duration b) { return a = a + b; }
 constexpr Duration& operator-=(Duration& a, Duration b) { return a = a - b; }
-constexpr Duration& operator*=(Duration& d, int64_t k) { return d = d * k; }
+template <ScaleFactor K> constexpr Duration& operator*=(Duration& d, K k) { return d = d * k; }
 constexpr Time& operator+=(Time& t, Duration d) { return t = t + d; }
 constexpr Time& operator-=(Time& t, Duration d) { return t = t - d; }
 

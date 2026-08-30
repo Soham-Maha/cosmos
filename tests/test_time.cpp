@@ -1,7 +1,9 @@
 #include "cosmos/time.hpp"
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <type_traits>
 
 using namespace cosmos::literals;
@@ -27,6 +29,8 @@ template <typename A, typename B>
 concept can_compare = requires(A a, B b) { a == b; };
 template <typename A>
 concept can_scale = requires(A a) { a * 2; };
+template <typename D, typename K>
+concept can_scale_by = requires(D d, K k) { d * k; };
 
 // The tag parameter is what rejects meaningless arithmetic; these must never start compiling.
 static_assert(!can_add<Time, Time>);
@@ -43,6 +47,16 @@ static_assert(can_subtract<Time, Duration>);
 static_assert(can_scale<Duration>);
 static_assert(can_compare<Time, Time>);
 static_assert(can_compare<Duration, Duration>);
+
+// A floating factor used to convert silently: 2_s * 0.5 became 0. Fractional scaling now has to
+// go through scale(), and bool is rejected so `d * (x > 0)` cannot compile by accident.
+static_assert(!can_scale_by<Duration, double>);
+static_assert(!can_scale_by<Duration, float>);
+static_assert(!can_scale_by<Duration, bool>);
+static_assert(can_scale_by<Duration, int>);
+static_assert(can_scale_by<Duration, int64_t>);
+static_assert(can_scale_by<Duration, unsigned>);
+static_assert(can_scale_by<Duration, std::size_t>);
 
 void test_duration_arithmetic() {
     assert(1_s + 500_ms == 1500_ms);
@@ -135,6 +149,40 @@ void test_overflow_saturates() {
     std::cout << "[PASS] test_overflow_saturates" << std::endl;
 }
 
+void test_fractional_scaling() {
+    assert(cosmos::scale(2_s, 0.5) == 1_s);
+    assert(cosmos::scale(1_s, 1.5) == 1500_ms);
+    assert(cosmos::scale(1_s, 1.0) == 1_s);
+    assert(cosmos::scale(1_s, 0.0) == Duration::zero());
+    assert(cosmos::scale(1_s, -0.5) == -(500_ms));
+    assert(cosmos::scale(Duration::zero(), 100.0) == Duration::zero());
+
+    // Truncates toward zero rather than rounding, so a sub-nanosecond factor lands on 0.
+    assert(cosmos::scale(1_ns, 0.4) == Duration::zero());
+
+    assert(cosmos::scale(Duration::max(), 2.0) == Duration::max());
+    assert(cosmos::scale(Duration::max(), -2.0) == Duration::min());
+    assert(cosmos::scale(1_s, std::numeric_limits<double>::infinity()) == Duration::max());
+    assert(cosmos::scale(1_s, -std::numeric_limits<double>::infinity()) == Duration::min());
+    assert(cosmos::scale(1_s, std::numeric_limits<double>::quiet_NaN()) == Duration::zero());
+
+    std::cout << "[PASS] test_fractional_scaling" << std::endl;
+}
+
+void test_integer_scale_factors() {
+    assert(2_s * 3 == 6_s);
+    assert(2_s * 3u == 6_s);
+    assert(2_s * static_cast<std::size_t>(3) == 6_s);
+    assert(2_s * static_cast<short>(3) == 6_s);
+    assert(2_s * -3 == -(6_s));
+
+    // An unsigned factor past the signed range clamps instead of wrapping negative.
+    assert(1_ns * std::numeric_limits<uint64_t>::max() == Duration::max());
+    assert(1_ns * std::numeric_limits<uint32_t>::max() == Duration{4294967295});
+
+    std::cout << "[PASS] test_integer_scale_factors" << std::endl;
+}
+
 // P1's validate() rejects warmup_until > quiesce_after; this proves the comparison is expressible
 // on the types themselves, with Time::max() as the "no quiesce configured" default.
 void test_run_windows_are_orderable() {
@@ -159,6 +207,8 @@ int main() {
     test_ordering_and_bounds();
     test_time_and_duration_mix();
     test_overflow_saturates();
+    test_fractional_scaling();
+    test_integer_scale_factors();
     test_run_windows_are_orderable();
     std::cout << "All time tests passed successfully!" << std::endl;
     return 0;

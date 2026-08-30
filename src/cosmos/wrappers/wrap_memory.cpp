@@ -98,6 +98,15 @@ void __wrap_free(void* ptr) {
         }
     }
 
+    // The owning Simulator may no longer be current, so the canary is checked here too: handing a
+    // tracked payload to __real_free would free an address one header past the real allocation.
+    auto* header = cosmos::header_for(ptr);
+    if (header->magic == cosmos::COSMOS_CANARY_MAGIC) {
+        header->magic = cosmos::COSMOS_FREED_MAGIC;
+        __real_free(header);
+        return;
+    }
+
     // Passthrough allocation (allocated via __real_malloc outside simulation context)
     __real_free(ptr);
 }

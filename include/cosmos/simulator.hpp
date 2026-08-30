@@ -2,7 +2,6 @@
 
 #include "cosmos/faults.hpp"
 #include "cosmos/memory.hpp"
-#include <cassert>
 #include <optional>
 #include <utility>
 
@@ -11,9 +10,11 @@ namespace cosmos {
 // Placeholder injector: the slot exists and stays empty until P1 delivers the real engine.
 struct NoInjector {};
 
-// The injector is a template parameter, not a fixed type, so this header does not depend on the
-// fault engine and tests can plug in a stub. A forward declaration would not work: std::optional
-// instantiates traits on its element, so the type must be complete where the member is declared.
+// The injector is a template parameter because std::optional instantiates traits on its element,
+// so the slot needs a complete type and the real FaultInjector does not exist until P1. Only the
+// Simulator alias below is wired to the __wrap_* functions: every instantiation gets its own
+// current_sim_, so another one is reachable through direct calls but never through a wrapped
+// syscall.
 template <typename Injector> class BasicSimulator {
   public:
     BasicSimulator() = default;
@@ -44,16 +45,11 @@ template <typename Injector> class BasicSimulator {
 
     bool has_injector() const { return injector_.has_value(); }
 
-    // Callers check has_injector() first: this runs inside __wrap_malloc, where throwing is not an
-    // option.
-    Injector& injector() {
-        assert(injector_.has_value());
-        return *injector_;
-    }
-    const Injector& injector() const {
-        assert(injector_.has_value());
-        return *injector_;
-    }
+    // Returns nullptr when the slot is empty. A pointer rather than a checked reference because
+    // this header compiles into the caller: an assert would vanish under NDEBUG and leave a
+    // disengaged optional being dereferenced, and throwing inside __wrap_malloc is not an option.
+    Injector* injector_or_null() { return injector_ ? &*injector_ : nullptr; }
+    const Injector* injector_or_null() const { return injector_ ? &*injector_ : nullptr; }
 
     template <typename... Args> Injector& emplace_injector(Args&&... args) {
         return injector_.emplace(std::forward<Args>(args)...);
