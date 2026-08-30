@@ -15,11 +15,15 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(test_wrap_malloc PRIVATE
         "-fno-builtin-malloc"
         "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
     )
     target_link_options(test_wrap_malloc PRIVATE
         "-Wl,--gc-sections"
         "-Wl,--wrap=malloc"
         "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
     )
 endif()
 
