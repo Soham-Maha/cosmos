@@ -71,10 +71,11 @@ void* __real_realloc(void* ptr, size_t size);
  * `heap().record_oom()`, and `heap().allocate(size)`) are fully protected from recursive
  * re-entrancy loops if any internal operation calls `malloc`.
  * - When an active `Simulator` context (`Simulator::has_current()`) is running:
- *   1. Checks deterministic OOM fault injection (`sim->faults().should_inject_oom()`). If
- * triggered, sets `errno = ENOMEM` and returns `nullptr`.
+ *   1. Checks deterministic OOM fault injection
+ * (`sim->faults().should_inject_oom(sim->fault_rng())`, drawing from the Memory fault sub-stream).
+ * If triggered, sets `errno = ENOMEM` and returns `nullptr`.
  *   2. Delegates to `sim->heap().allocate(size)` to attach allocation metadata headers and record
- * stats.
+ *      stats.
  * - Outside an active simulation context or during internal re-entrant allocations
  * (`in_wrap_memory == true`), falls back directly to native OS `__real_malloc(size)`.
  */
@@ -90,7 +91,7 @@ void* __wrap_malloc(size_t size) {
     }
 
     auto* sim = cosmos::Simulator::current();
-    if (sim->faults().should_inject_oom()) {
+    if (sim->faults().should_inject_oom(sim->fault_rng())) {
         errno = ENOMEM;
         sim->heap().record_oom();
         return nullptr;
@@ -185,7 +186,7 @@ void* __wrap_calloc(size_t nmemb, size_t size) {
         return nullptr;
     }
 
-    if (sim->faults().should_inject_oom()) {
+    if (sim->faults().should_inject_oom(sim->fault_rng())) {
         errno = ENOMEM;
         sim->heap().record_oom();
         return nullptr;
@@ -254,7 +255,7 @@ void* __wrap_realloc(void* ptr, size_t size) {
             return __real_malloc(size);
         }
         auto* sim = cosmos::Simulator::current();
-        if (sim->faults().should_inject_oom()) {
+        if (sim->faults().should_inject_oom(sim->fault_rng())) {
             errno = ENOMEM;
             sim->heap().record_oom();
             return nullptr;
@@ -265,7 +266,7 @@ void* __wrap_realloc(void* ptr, size_t size) {
     if (ownership.kind == cosmos::detail::OwnerKind::Owned) {
         if (cosmos::Simulator::has_current()) {
             auto* sim = cosmos::Simulator::current();
-            if (sim->heap().owns(ptr) && sim->faults().should_inject_oom()) {
+            if (sim->heap().owns(ptr) && sim->faults().should_inject_oom(sim->fault_rng())) {
                 errno = ENOMEM;
                 sim->heap().record_oom();
                 return nullptr;
