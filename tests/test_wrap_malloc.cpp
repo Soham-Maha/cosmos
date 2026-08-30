@@ -342,6 +342,208 @@ void test_free_passthrough_pointer_inside_sim() {
     std::cout << "[PASS] test_free_passthrough_pointer_inside_sim" << std::endl;
 }
 
+// A pointer allocated under sim A but freed while no simulator is current must still update A's
+// stats. Ownership routing via the registry, not the "currently active" heap, decides.
+void test_free_after_sim_deactivation_routes_to_owner() {
+    cosmos::Simulator sim;
+    cosmos::Simulator::set_current(&sim);
+
+    void* ptr = malloc(128);
+    assert(ptr != nullptr);
+    assert(sim.heap().stats().active_allocations == 1);
+
+    cosmos::Simulator::set_current(nullptr);
+    assert(!cosmos::Simulator::has_current());
+
+    free(ptr);
+    assert(sim.heap().stats().active_allocations == 0);
+
+    std::cout << "[PASS] test_free_after_sim_deactivation_routes_to_owner" << std::endl;
+}
+
+// Freeing A's pointer while B is current must update A's stats and leave B untouched; the old
+// behavior routed to B's heap, missed, and orphaned the accounting.
+void test_free_under_foreign_sim_updates_original_owner() {
+    cosmos::Simulator sim_a;
+    cosmos::Simulator::set_current(&sim_a);
+    void* a_ptr = malloc(64);
+    assert(sim_a.heap().stats().active_allocations == 1);
+
+    cosmos::Simulator sim_b;
+    cosmos::Simulator::set_current(&sim_b);
+    void* b_ptr = malloc(32);
+    assert(sim_b.heap().stats().active_allocations == 1);
+
+    free(a_ptr);
+    assert(sim_a.heap().stats().active_allocations == 0);
+    assert(sim_b.heap().stats().active_allocations == 1);
+
+    free(b_ptr);
+    assert(sim_b.heap().stats().active_allocations == 0);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_free_under_foreign_sim_updates_original_owner" << std::endl;
+}
+
+// realloc with no simulator current must resize through the owning heap, not corrupt by handing
+// a header-offset payload to __real_realloc.
+void test_realloc_after_sim_deactivation_routes_to_owner() {
+    cosmos::Simulator sim;
+    cosmos::Simulator::set_current(&sim);
+
+    auto* ptr = static_cast<char*>(malloc(8));
+    assert(ptr != nullptr);
+    strcpy(ptr, "cosmos");
+
+    cosmos::Simulator::set_current(nullptr);
+
+    auto* grown = static_cast<char*>(realloc(ptr, 64));
+    assert(grown != nullptr);
+    assert(strcmp(grown, "cosmos") == 0);
+    assert(sim.heap().stats().active_allocations == 1); // old freed, fresh block tracked
+    assert(sim.heap().stats().total_allocation_count == 2);
+
+    free(grown);
+    assert(sim.heap().stats().active_allocations == 0);
+
+    std::cout << "[PASS] test_realloc_after_sim_deactivation_routes_to_owner" << std::endl;
+}
+
+// Same routing under a foreign active simulator: the owning heap performs the resize and keeps
+// the accounting; the foreign heap is untouched.
+void test_realloc_under_foreign_sim_routes_to_owner() {
+    cosmos::Simulator sim_a;
+    cosmos::Simulator::set_current(&sim_a);
+    void* ptr = malloc(16);
+    assert(ptr != nullptr);
+
+    cosmos::Simulator sim_b;
+    cosmos::Simulator::set_current(&sim_b);
+
+    void* grown = realloc(ptr, 128);
+    assert(grown != nullptr);
+    assert(sim_a.heap().stats().active_allocations == 1);
+    assert(sim_a.heap().stats().total_allocation_count == 2);
+    assert(sim_b.heap().stats().active_allocations == 0);
+    assert(sim_b.heap().stats().total_allocation_count == 0);
+
+    free(grown);
+    assert(sim_a.heap().stats().active_allocations == 0);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_realloc_under_foreign_sim_routes_to_owner" << std::endl;
+}
+
+// A block still allocated when its heap is destroyed is orphaned: a later free must release it
+// via its header instead of dereferencing the dead heap.
+void test_free_after_sim_destruction_orphans_block() {
+    void* tracked = nullptr;
+    {
+        cosmos::Simulator sim;
+        cosmos::Simulator::set_current(&sim);
+        tracked = malloc(48);
+        assert(tracked != nullptr);
+        assert(sim.heap().stats().active_allocations == 1);
+        // Deliberately no cleanup: stats freeze at 1, the block is orphaned on destruction.
+    }
+
+    free(tracked);
+
+    // The host allocator must be intact afterwards.
+    void* after = malloc(64);
+    assert(after != nullptr);
+    free(after);
+
+    std::cout << "[PASS] test_free_after_sim_destruction_orphans_block" << std::endl;
+}
+
+// realloc of an orphaned block is emulated (fresh allocation + copy + header-verified release).
+// With a fresh simulator active, the new block joins that sim's heap.
+void test_realloc_after_sim_destruction_with_new_sim() {
+    void* tracked = nullptr;
+    {
+        cosmos::Simulator old_sim;
+        cosmos::Simulator::set_current(&old_sim);
+        tracked = malloc(8);
+        assert(tracked != nullptr);
+        strcpy(static_cast<char*>(tracked), "cosmos");
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    cosmos::Simulator fresh_sim;
+    cosmos::Simulator::set_current(&fresh_sim);
+
+    auto* grown = static_cast<char*>(realloc(tracked, 256));
+    assert(grown != nullptr);
+    assert(strcmp(grown, "cosmos") == 0);
+    assert(fresh_sim.heap().stats().active_allocations == 1);
+
+    free(grown);
+    assert(fresh_sim.heap().stats().active_allocations == 0);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_realloc_after_sim_destruction_with_new_sim" << std::endl;
+}
+
+// Same emulation with no simulator active at all: the fresh block comes from the host allocator
+// and the old orphaned block is released without touching any dead heap.
+void test_realloc_after_sim_destruction_without_sim() {
+    void* tracked = nullptr;
+    {
+        cosmos::Simulator sim;
+        cosmos::Simulator::set_current(&sim);
+        tracked = malloc(16);
+        assert(tracked != nullptr);
+        strcpy(static_cast<char*>(tracked), "sim");
+        cosmos::Simulator::set_current(nullptr);
+    }
+    assert(!cosmos::Simulator::has_current());
+
+    auto* grown = static_cast<char*>(realloc(tracked, 512));
+    assert(grown != nullptr);
+    assert(strcmp(grown, "sim") == 0);
+
+    free(grown);
+
+    std::cout << "[PASS] test_realloc_after_sim_destruction_without_sim" << std::endl;
+}
+
+// An intermediate oom_rate draws one decision per sim-heap allocation from the Memory fault
+// sub-stream: same seed => identical inject/skip pattern, and the pattern actually contains both
+// outcomes.
+void test_intermediate_oom_rate_injects_deterministically() {
+    constexpr int kAllocations = 100;
+
+    auto run = [](uint64_t seed) {
+        cosmos::Simulator sim(seed);
+        cosmos::FaultProfile fp;
+        fp.oom_rate = 0.5;
+        sim.set_faults(fp);
+        cosmos::Simulator::set_current(&sim);
+
+        size_t failures = 0;
+        for (int i = 0; i < kAllocations; ++i) {
+            void* p = malloc(16);
+            if (p) {
+                free(p);
+            } else {
+                ++failures;
+            }
+        }
+
+        cosmos::Simulator::set_current(nullptr);
+        return failures;
+    };
+
+    const size_t first = run(1234);
+    const size_t second = run(1234);
+    assert(first == second);
+    assert(first > 0);            // intermediate rate does inject
+    assert(first < kAllocations); // and does not inject everything
+
+    std::cout << "[PASS] test_intermediate_oom_rate_injects_deterministically" << std::endl;
+}
+
 int main() {
     test_passthrough_malloc();
     test_active_sim_malloc_and_alignment();
@@ -357,6 +559,14 @@ int main() {
     test_realloc_oom_leaves_original_intact();
     test_realloc_passthrough_pointer();
     test_free_passthrough_pointer_inside_sim();
+    test_free_after_sim_deactivation_routes_to_owner();
+    test_free_under_foreign_sim_updates_original_owner();
+    test_realloc_after_sim_deactivation_routes_to_owner();
+    test_realloc_under_foreign_sim_routes_to_owner();
+    test_free_after_sim_destruction_orphans_block();
+    test_realloc_after_sim_destruction_with_new_sim();
+    test_realloc_after_sim_destruction_without_sim();
+    test_intermediate_oom_rate_injects_deterministically();
     std::cout << "All malloc wrapper tests passed successfully!" << std::endl;
     return 0;
 }
