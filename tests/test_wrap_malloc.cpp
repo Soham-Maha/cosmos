@@ -508,6 +508,93 @@ void test_realloc_after_sim_destruction_without_sim() {
     std::cout << "[PASS] test_realloc_after_sim_destruction_without_sim" << std::endl;
 }
 
+// Regression: releasing an orphaned block must also drop its registry entry. A stale Orphaned
+// entry would outlive the freed block and misroute a later passthrough allocation that reuses
+// the payload address, turning that block's free into a header read of a live host allocation.
+void test_freed_orphan_leaves_no_registry_entry() {
+    void* tracked = nullptr;
+    {
+        cosmos::Simulator sim;
+        cosmos::Simulator::set_current(&sim);
+        tracked = malloc(48);
+        assert(tracked != nullptr);
+        cosmos::Simulator::set_current(nullptr);
+    }
+    assert(!cosmos::Simulator::has_current());
+
+    auto& registry = cosmos::detail::AllocRegistry::instance();
+    assert(registry.ownership_of(tracked).kind == cosmos::detail::OwnerKind::Orphaned);
+
+    free(tracked);
+    assert(registry.ownership_of(tracked).kind == cosmos::detail::OwnerKind::None);
+
+    std::cout << "[PASS] test_freed_orphan_leaves_no_registry_entry" << std::endl;
+}
+
+// After an orphaned block is released, the host allocator may hand out any address from the
+// freed chunk, including split fragments. None of those passthrough blocks may ever be
+// classified as Orphaned, and each must free cleanly.
+void test_passthrough_blocks_survive_after_orphan_release() {
+    void* tracked = nullptr;
+    {
+        cosmos::Simulator sim;
+        cosmos::Simulator::set_current(&sim);
+        tracked = malloc(48);
+        assert(tracked != nullptr);
+        cosmos::Simulator::set_current(nullptr);
+    }
+    free(tracked);
+
+    auto& registry = cosmos::detail::AllocRegistry::instance();
+    assert(registry.ownership_of(tracked).kind == cosmos::detail::OwnerKind::None);
+
+    // The first size matches the orphan's raw block so the allocator reuses its chunk; the
+    // small sizes then force split fragments at offsets inside the old layout.
+    const std::size_t sizes[] = {80, 1, 8, 24, 40, 48, 80, 96, 128};
+    for (std::size_t size : sizes) {
+        void* q = malloc(size);
+        assert(q != nullptr);
+        assert(registry.ownership_of(q).kind != cosmos::detail::OwnerKind::Orphaned);
+        memset(q, 0x5A, size);
+        free(q);
+    }
+
+    std::cout << "[PASS] test_passthrough_blocks_survive_after_orphan_release" << std::endl;
+}
+
+// realloc of an orphaned block releases the old block through free_orphaned_block, so the old
+// pointer's registry entry must be gone afterwards; the fresh block is tracked by the active heap.
+void test_orphan_realloc_releases_registry_entry() {
+    void* tracked = nullptr;
+    {
+        cosmos::Simulator old_sim;
+        cosmos::Simulator::set_current(&old_sim);
+        tracked = malloc(24);
+        assert(tracked != nullptr);
+        strcpy(static_cast<char*>(tracked), "orphan");
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    auto& registry = cosmos::detail::AllocRegistry::instance();
+    assert(registry.ownership_of(tracked).kind == cosmos::detail::OwnerKind::Orphaned);
+
+    cosmos::Simulator fresh_sim;
+    cosmos::Simulator::set_current(&fresh_sim);
+
+    auto* grown = static_cast<char*>(realloc(tracked, 256));
+    assert(grown != nullptr);
+    assert(strcmp(grown, "orphan") == 0);
+    assert(registry.ownership_of(tracked).kind == cosmos::detail::OwnerKind::None);
+    assert(registry.ownership_of(grown).kind == cosmos::detail::OwnerKind::Owned);
+    assert(fresh_sim.heap().owns(grown));
+
+    free(grown);
+    assert(fresh_sim.heap().stats().active_allocations == 0);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_orphan_realloc_releases_registry_entry" << std::endl;
+}
+
 // An intermediate oom_rate draws one decision per sim-heap allocation from the Memory fault
 // sub-stream: same seed => identical inject/skip pattern, and the pattern actually contains both
 // outcomes.
@@ -566,6 +653,9 @@ int main() {
     test_free_after_sim_destruction_orphans_block();
     test_realloc_after_sim_destruction_with_new_sim();
     test_realloc_after_sim_destruction_without_sim();
+    test_freed_orphan_leaves_no_registry_entry();
+    test_passthrough_blocks_survive_after_orphan_release();
+    test_orphan_realloc_releases_registry_entry();
     test_intermediate_oom_rate_injects_deterministically();
     std::cout << "All malloc wrapper tests passed successfully!" << std::endl;
     return 0;
