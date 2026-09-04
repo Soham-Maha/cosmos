@@ -39,6 +39,23 @@ add_test(NAME test_seed_derivation COMMAND test_seed_derivation)
 
 add_executable(test_time test_time.cpp)
 target_link_libraries(test_time PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_time PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+    )
+    target_link_options(test_time PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=clock_gettime"
+        "-Wl,--wrap=gettimeofday"
+        "-Wl,--wrap=nanosleep"
+        "-Wl,--wrap=clock_nanosleep"
+    )
+endif()
+
 add_test(NAME test_time COMMAND test_time)
 
 add_executable(test_simulator test_simulator.cpp)

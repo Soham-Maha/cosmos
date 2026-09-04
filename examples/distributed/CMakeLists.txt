@@ -29,6 +29,7 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=sched_yield"
         "-Wl,--wrap=clock_gettime"
         "-Wl,--wrap=nanosleep"
+        "-Wl,--wrap=clock_nanosleep"
         "-Wl,--wrap=socket"
         "-Wl,--wrap=bind"
         "-Wl,--wrap=listen"
