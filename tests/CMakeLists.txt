@@ -126,3 +126,35 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 add_test(NAME test_wrap_random COMMAND test_wrap_random)
+
+add_executable(test_wrap_storage test_wrap_storage.cpp)
+target_link_libraries(test_wrap_storage PRIVATE cosmos)
+# White-box test: pins the internal storage eligibility policy from wrapper_fault.hpp.
+target_include_directories(test_wrap_storage PRIVATE ${CMAKE_SOURCE_DIR}/src/cosmos/wrappers)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # Wrapped symbols must stay opaque calls so the linker substitution reaches them.
+    target_compile_options(test_wrap_storage PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+        "-fno-builtin-open"
+        "-fno-builtin-read"
+        "-fno-builtin-write"
+        "-fno-builtin-fsync"
+    )
+    target_link_options(test_wrap_storage PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=open"
+        "-Wl,--wrap=read"
+        "-Wl,--wrap=write"
+        "-Wl,--wrap=fsync"
+    )
+endif()
+
+add_test(NAME test_wrap_storage COMMAND test_wrap_storage)
