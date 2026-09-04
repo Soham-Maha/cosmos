@@ -3,6 +3,7 @@
 #include "cosmos/faults.hpp"
 #include "cosmos/memory.hpp"
 #include "cosmos/random.hpp"
+#include "cosmos/time.hpp"
 #include <optional>
 #include <utility>
 
@@ -46,6 +47,12 @@ template <typename Injector> class BasicSimulator {
     TrackedHeap& heap() { return heap_; }
     const TrackedHeap& heap() const { return heap_; }
 
+    VirtualClock& clock() { return clock_; }
+    const VirtualClock& clock() const { return clock_; }
+
+    Time now() const { return clock_.now(); }
+    void advance_time(Duration d) { clock_.advance(d); }
+
     FaultProfile& faults() { return faults_; }
     const FaultProfile& faults() const { return faults_; }
 
@@ -70,10 +77,16 @@ template <typename Injector> class BasicSimulator {
     void clear_injector() { injector_.reset(); }
 
   private:
+    // thread_local on purpose: a universe belongs to one OS thread. Caveat until the fiber
+    // scheduler lands and pthread_create is genuinely wrapped: threads spawned through the
+    // current passthrough get their own empty slot on their own OS thread, so wrapped calls
+    // made there fall through to the real host clock/heap instead of this universe. Keep
+    // simulation workloads single-threaded until then, or real and virtual state will mix.
     inline static thread_local BasicSimulator* current_sim_{nullptr};
     TrackedHeap heap_{};
     FaultProfile faults_{};
     Rng fault_rng_;
+    VirtualClock clock_{};
     std::optional<Injector> injector_{};
 };
 
