@@ -1,4 +1,7 @@
 #include "cosmos/cosmos.hpp"
+
+#include "wrapper_fault.hpp"
+
 #include <cerrno>
 #include <climits>
 #include <cstddef>
@@ -9,21 +12,6 @@
 #include <sys/types.h>
 
 namespace {
-
-// Fault hook that compiles against both the current NoInjector placeholder and the future real
-// injector: with NoInjector it folds to None, once Simulator carries a BasicFaultInjector it
-// forwards decide(Random, getrandom) without any wrapper change.
-template <typename Sim> cosmos::FaultKind decide_getrandom(Sim* sim) {
-    if constexpr (requires {
-                      sim->injector_or_null()->decide(cosmos::FaultClass::Random,
-                                                      cosmos::SiteId::getrandom);
-                  }) {
-        if (auto* injector = sim->injector_or_null()) {
-            return injector->decide(cosmos::FaultClass::Random, cosmos::SiteId::getrandom);
-        }
-    }
-    return cosmos::FaultKind::None;
-}
 
 unsigned allowed_getrandom_flags() {
     unsigned allowed = 0;
@@ -85,7 +73,8 @@ ssize_t __wrap_getrandom(void* buf, size_t buflen, unsigned int flags) {
 
     auto* sim = cosmos::Simulator::current();
     // Decision first, values second: a failed call must not consume the User stream (Rule 1).
-    if (decide_getrandom(sim) == cosmos::FaultKind::RandomEagain) {
+    if (cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Random, cosmos::SiteId::getrandom) ==
+        cosmos::FaultKind::RandomEagain) {
         errno = EAGAIN;
         return -1;
     }
