@@ -172,6 +172,19 @@ RNG stream domains: `Schedule=1`, `Fault=2`, `Workload=3`, `User=4`. Splitmix64 
 
 ## 8. Storage Subsystem Reference
 
+**Today (point faults only).** `__wrap_open/read/write/fsync` ask the fault injector for one
+decision per eligible call and translate it to a legal result — `EIO`/`ENOSPC` failures, or a
+`ShortWrite` that performs a *real* partial transfer of `count / 2` bytes (write() reporting k
+bytes must mean k bytes were transferred; claiming a short count without transferring would be
+an impossible world). Decisions happen before the real call, so a faulted call has no side
+effects. Eligibility: standard stream fds (0/1/2) and zero-length transfers never reach the
+injector — logging must not consume Storage-stream draws, and no outcome is observable on an
+empty transfer — so `fire_on_eligible_call` on `SiteId::write` counts only writes of
+`count >= 1` to fds `>= 3`. 1-byte writes stay eligible: they can legally fail with
+`EIO`/`ENOSPC` (a single-byte WAL commit marker is a real shape); the one degenerate case is a
+fired `ShortWrite` on a 1-byte write, which has no legal short observable and observably
+degrades to a complete write. The page-cache/durability model below is layered on later.
+
 Simulates page-cache buffering, `fsync` durability, and torn writes upon crash-reboot:
 
 - `write()` buffers dirty bytes in simulated un-synced page cache.
