@@ -38,7 +38,7 @@ Research background: **`docs/antithesis-study-notes.md`**. Full API reference: *
 |---|---|
 | **Fault** | A bad-but-legal thing the simulator makes happen (memory failure, dropped packet, crashed node). |
 | **Fault Model** | The written promise of which failures the application claims to survive. Faults outside it produce false bug reports. |
-| **Fault Class** | A family of faults owned by one subsystem: `Memory`, `Network`, `Storage`, `Clock`, `Process`. |
+| **Fault Class** | A family of faults owned by one subsystem: `Memory`, `Network`, `Storage`, `Clock`, `Process`, `Random`. |
 | **Point Fault** | An instant, one-off fault (`malloc` fails). Decided by one dice roll at the call. |
 | **Episode Fault** | A fault with a duration that must later heal (a network partition from t=30ms to t=45ms). |
 | **Knob Fault** | Nothing breaks; a normal tuning value is set to an extreme-but-legal value (a 60s timeout becomes 0.1s). |
@@ -301,7 +301,7 @@ Some sites can fail in more than one way. `send()` can drop the packet, delay it
 ```cpp
 struct SiteOutcome {
     FaultKind kind;    // e.g. PacketDrop, PacketDelay, PacketCorrupt
-    double    weight;  // relative weight; normalized to sum to 1 at validate()
+    double    weight;  // relative weight; any positive scale, normalized by normalize()
 };
 using OutcomeTable = std::vector<SiteOutcome>;   // one table per multi-outcome site
 ```
@@ -350,7 +350,9 @@ Never share with `schedule`. Stream domains extend the four fixed in `docs/desig
 
 ### Rule 2 — Every fault class gets its own sub-stream
 
-Derive `fault` into one sub-stream per class: `Memory`, `Network`, `Storage`, `Clock`, `Process`.
+Derive `fault` into one sub-stream per class: `Memory`, `Network`, `Storage`, `Clock`, `Process`, `Random`.
+
+`Random` covers `getrandom`, whose *values* come from the `User` stream (domain 4) so the application sees a reproducible sequence. Whether the call *fails* is a separate decision and belongs to the `Fault` stream like any other site, so the two never share draws.
 
 **Why:** with a single shared stream, enabling network faults adds extra draws, which shifts every later draw, which means memory faults suddenly happen in completely different places. You could never change one setting at a time.
 
@@ -512,9 +514,11 @@ The gate chain above always ends the same way: a random draw decides whether a f
 **A deterministic trigger is a fact, not a coin flip.** It replaces the draw with a direct check, so it never touches the RNG at all:
 
 ```text
-quiet? → class on? → site on? → warmup? → skip_first passed?
+quiet? → class on? → site on? → warmup?
                                               │
                      (all gates passed — eligible_calls[site] += 1)
+                                              │
+                                     skip_first passed?
                                               │
                      eligible_calls[site] == fire_on_eligible_call?
                                      │                        │
@@ -540,9 +544,23 @@ cfg.rules.emplace(SiteId::malloc, std::move(rule));
 
 The counter it checks is the **eligible-call count** as defined in §10 — incremented for calls that passed quiet/class/site/warmup, *before* `skip_first` and budget are checked — not the raw, unfiltered call count. This applies uniformly to every wrapper site: allocation, I/O, network, and clock.
 
+**Which outcome a trigger fires.** A triggered fire consumes no draw, so it cannot use §6.5's categorical walk to choose between a site's outcomes. It fires the **first** outcome in the rule's table. This is not a second convention bolted on beside the walk: `validate()` requires every weight to be strictly positive, so the walk selects entry 0 for any draw approaching zero, and a trigger is simply that same selection function evaluated at its floor. The weights therefore play no part in a triggered fire — they continue to govern every probabilistic fire on the same rule, including the other eligible calls of a rule carrying both a rate and a trigger.
+
+For a multi-outcome site, list the outcome the scenario is about first. Table order is already part of the reproduction contract (§12), and pinning the scripted kind to it is deliberate: weights are the kind of dimension a swarm may sample per universe (§6.4), and "fail exactly the 443rd write" has to mean the same failure in every universe rather than a different one per seed — a trigger is a fact, not a coin flip.
+
+```cpp
+FaultRule rule;
+rule.outcomes = {{FaultKind::ShortWrite, 1.0}, {FaultKind::WriteEio, 3.0}};
+rule.rate = 0.01;                  // other eligible calls stay probabilistic, 1:3 between the two
+rule.fire_on_eligible_call = 443;  // this one is scripted: ShortWrite, drew = no
+cfg.rules.emplace(SiteId::write, std::move(rule));
+```
+
 It does **not** apply to process/topology faults. There is no `crash()` symbol in the application's binary for the linker to wrap, so there is no "eligible call" to count — an occurrence trigger on `site::crash_node` is a category error, and `validate()` rejects it (§12). Episode faults get their own deterministic trigger form in §10.2.
 
-**Ledger entry:** identical shape to any other decision, with a distinct reason so it's never confused with a probabilistic fire:
+A trigger refused because its budget is spent is **not** a ledger entry. `max_injections` is one of §11.1's routine gate rejections, which are counted and never recorded; the `Skipped` status is for episode starts refused by a §2 fault-model limit or by the quiesce window. The diagram's `Skipped` box therefore means "did not fire, and the per-site counters say so" — not "wrote a skip entry."
+
+**Ledger entry (for a fire):** identical shape to any other decision, with a distinct reason so it's never confused with a probabilistic fire:
 
 ```text
 t=61ms   Memory   site=malloc   FIRED   drew=no   reason=trigger_matched(eligible_call=443)
@@ -672,7 +690,7 @@ If a configured fault rate is `0.001` and a run reaches only 200 eligible sites,
 ```cpp
 namespace cosmos {
 
-enum class FaultClass : uint8_t { Memory, Network, Storage, Clock, Process, _Count };
+enum class FaultClass : uint8_t { Memory, Network, Storage, Clock, Process, Random, _Count };
 enum class FaultMode  : uint8_t { Safety, Liveness };
 
 /// Stable identity for every injection site (§6.2). APPEND-ONLY: never renumber
@@ -700,13 +718,29 @@ enum class FaultKind : uint8_t {
     ConnRefused, ConnReset, PeerClose, ShortSend,
     PacketDrop, PacketDelay, PacketReorder, PacketCorrupt,
     ClockStep, SleepInterrupted,
+    RandomEagain,
+    _Count,          // sentinel; new kinds append before it
 };
+
+/// Rule 15, enforced at config time: an outcome must be one the site's own API
+/// could really produce, so `send -> ENOMEM` is rejected by validate() rather
+/// than discovered as a false-positive finding later.
+constexpr bool is_legal_outcome(SiteId, FaultKind);
 
 struct SiteOutcome {
     FaultKind kind;
-    double    weight;    // relative weight; > 0; table normalized to sum 1 at validate()
+    double    weight;    // relative weight; > 0; any scale ({5,3,2} == {0.5,0.3,0.2})
 };
-using OutcomeTable = std::vector<SiteOutcome>;   // >= 1 entry when the rule can fire
+// Inline fixed-capacity storage, not a vector: a config copy must not allocate, because the
+// engine is reached from inside __wrap_malloc. Four is the widest menu any site has (send).
+// The widest menu is send(): reset, short send, drop, delay, reorder, corrupt.
+// A static_assert ties this to is_legal_outcome(), so the cap can never silently
+// be smaller than the outcomes a site is allowed to name.
+constexpr size_t kMaxOutcomes = 6;
+struct OutcomeTable {
+    std::array<SiteOutcome, kMaxOutcomes> entries;
+    size_t count;                                // >= 1 when the rule can fire
+};
 
 /// Rules are generic: the injector chooses a FaultKind and the wrapper maps it
 /// to a legal result for its API (ENOMEM, EIO, ECONNRESET, a short write, ...).
@@ -725,8 +759,17 @@ using NodeId            = uint32_t;
 using NodeSet           = std::vector<NodeId>;
 using EpisodeId         = uint64_t;
 using KnobId            = uint64_t;   // named per app tunable; append-only, like SiteId
-using SiteActivationSet = std::unordered_set<SiteId>;
-using SiteCounterMap    = std::unordered_map<SiteId, uint64_t>;
+/// Every site occupies a pinned slot: wrapper sites fill [0, kWrapperSiteCount), event sites
+/// follow. site_slot() is written out rather than derived from the enum value, so retiring a site
+/// never shifts the slots after it (Rule 13). Slot order — not hash order — is what the swarm
+/// sampler iterates and draws against.
+constexpr size_t kWrapperSiteCount = 14;
+constexpr size_t kEventSiteCount   = 3;
+constexpr size_t kSiteCount        = kWrapperSiteCount + kEventSiteCount;
+constexpr size_t site_slot(SiteId);              // total; kNoSite for an unknown value
+
+using SiteActivationSet = std::bitset<kSiteCount>;
+using SiteCounterMap    = std::array<uint64_t, kSiteCount>;
 
 /// An episode's identity: what breaks, and on whom (§4.2).
 struct CrashNode { NodeId id; };
@@ -742,10 +785,15 @@ struct ScheduledEpisode {
 };
 
 enum class ConfigError : uint8_t {
-    BadRate, BadWeight, EmptyOutcomes, TriggerLeSkipFirst,
-    TriggerOnEventSite, RuleOnDisabledClass, EpisodeOutsideWindows,
-    QuorumExceedsNodes, BadWindowOrder,
+    BadRate, BadWeight, BadOutcomeKind, IllegalOutcome, EmptyOutcomes,
+    TriggerLeSkipFirst, TriggerOnEventSite, RuleOnEventSite,
+    RuleOnDisabledClass, EpisodeOutsideWindows, BadEpisodeDuration,
+    UnknownNode, BadKnobOrder, QuorumExceedsNodes, LimitsExceedNodes,
+    BadWindowOrder,
 };
+
+/// Which site the config was wrong about, not just what was wrong with it.
+struct ConfigProblem { ConfigError error; std::optional<SiteId> site; };
 
 /// Pure data. Sampled once per universe from the seed. Copyable and printable,
 /// so a failing run can report the exact configuration that produced it.
@@ -759,9 +807,22 @@ struct FaultConfig {
     // means "not activated". Populated only for classes that are enabled.
     SiteActivationSet activated_sites;
 
-    // Generic per-site rules. A simple site has one non-None outcome; a
-    // multi-outcome site has several. Every wrapper uses this same mechanism.
-    std::unordered_map<SiteId, FaultRule> rules;
+    // Generic per-site rules, indexed by site_slot(). A simple site has one
+    // non-None outcome; a multi-outcome site has several. Every wrapper uses
+    // this same mechanism.
+    //
+    // Fixed storage rather than a hash map, for two reasons. Iteration order is
+    // load-bearing: the swarm sampler draws per site, and an unordered
+    // container's order is specified nowhere — it varies across standard library
+    // implementations and versions — so the same seed could produce different
+    // configs on different machines, breaking Rules 4 and 8 and the (build, seed)
+    // repro contract. And the rules array never allocates, so the decision path
+    // and a rules-only config copy cannot re-enter __wrap_malloc (Rule 7);
+    // scheduled_episodes and knobs are vectors and do allocate, so a config
+    // carrying either is not allocation-free to copy. Event-site slots exist so
+    // that a rule wrongly placed on one is representable, and therefore
+    // rejectable by validate().
+    std::array<std::optional<FaultRule>, kSiteCount> rules;
 
     // Fault-model limits: never exceed what the application promises to survive.
     uint32_t max_crashed_nodes  = 0;
@@ -774,7 +835,9 @@ struct FaultConfig {
     // Knob faults (§4.3): extreme-but-legal tuning values, sampled once per
     // universe. The harness delivers them to the app (env/CLI/config) before
     // the app starts; static for the whole run (Rule 14).
-    std::unordered_map<KnobId, int64_t> knobs;
+    // Strictly ascending by id, checked by validate(): sampling draws per knob,
+    // so the order is part of the reproduction contract exactly as `rules` is.
+    std::vector<Knob> knobs;
 
     // Run lifecycle windows.
     Time warmup_until  = Time::zero();
@@ -787,17 +850,34 @@ struct FaultConfig {
     static FaultConfig sample(Rng& swarm_rng);
 
     /// Rejects configs that would silently misbehave:
-    ///   - every rule rate and outcome weight must be finite and in [0, 1];
+    ///   - every rule rate must be finite and in [0, 1];
     ///   - a rule with rate > 0 or a trigger must have >= 1 outcome; every
-    ///     outcome weight must be > 0; the table is normalized to sum to 1;
+    ///     outcome weight must be > 0 and finite (weights are relative, so any
+    ///     positive scale is legal; normalize() rescales them to sum to 1);
+    ///   - every outcome kind must be one its site's API could really produce
+    ///     (Rule 15), and never FaultKind::None;
+    ///   - a scheduled episode must name real nodes and have a nonzero duration;
+    ///   - max_crashed_nodes + min_healthy_quorum must fit within the node count,
+    ///     or the config contradicts itself;
     ///   - fire_on_eligible_call must be > skip_first (else it can never fire);
     ///   - occurrence triggers are rejected on event sites (§10.2);
     ///   - rules and triggers are rejected for sites whose class is disabled;
     ///   - scheduled episodes must lie inside [warmup_until, quiesce_after);
     ///   - min_healthy_quorum must not exceed the node count;
     ///   - warmup_until must be <= quiesce_after.
+    /// Reports the first problem found, in a fixed order: whole-config limits,
+    /// then sites by ascending slot, then episodes, then knobs. Within a site:
+    /// placement, class, rate, outcomes, trigger. So a NaN rate on a disabled
+    /// class reports RuleOnDisabledClass, not BadRate.
     /// Enforced in sample() and again in the FaultInjector constructor.
-    [[nodiscard]] std::expected<void, ConfigError> validate() const;
+    /// node_count is a parameter rather than a field: cluster size is topology,
+    /// not fault configuration. The error carries the offending site.
+    [[nodiscard]] std::expected<void, ConfigProblem> validate(uint32_t node_count) const;
+
+    /// Rescales every outcome table to sum to 1, once, the way
+    /// std::discrete_distribution does at construction. Separate from validate()
+    /// so a checker never rewrites the config it was asked to inspect; the
+    /// injector calls it on its own copy.
 };
 
 /// Stateful engine. Owns the per-class RNG sub-streams, the budgets, the quiet
@@ -919,6 +999,23 @@ class Scenario {
 
 The scaffolded `FaultProfile` (`oom_rate` + `should_inject_oom(Rng&)` in `include/cosmos/faults.hpp`) is replaced by `FaultConfig` / `FaultRule` / `FaultInjector`. The split exists precisely because `FaultProfile` fused user-facing config with engine state: the scaffold's intermediate-rate decisions currently draw from the Simulator's Memory sub-stream via `should_inject_oom(Rng& rng)` (endpoint rates consume no draw, §7 Rule 3), and sprint F2 moves that decision into `FaultInjector::decide(FaultClass::Memory, SiteId::malloc)` with full rule/timeline support. `wrap_memory.cpp` is re-pointed at that call site in sprint F2, `FaultProfile` is deleted, and the `FaultProfile` mentions in `docs/design.md` §4/§9 are updated to match. What survives from the current header: `FaultClass` and `fault_class_seed` (§7 Rule 2's per-class sub-stream derivation), which the new design keeps unchanged.
 
+### 12.3 What Phase 1 ships, and how it differs from the reference above
+
+The declarations in §12 describe the **F6-complete** injector. Phases 1–5 ship strict subsets, so reading §12 against the code turns up differences that are planned sequencing rather than drift. This table is the reconciliation; a row leaves it when the sprint in its last column lands. A difference still listed here after that sprint is real drift and should be fixed.
+
+| §12 reference | What the code has today | Closed by |
+|---|---|---|
+| `FaultInjector(cfg, Rng, VirtualClock&, EventQueue&, NodeRegistry&)` | `BasicFaultInjector<ClockLike>`, built by `create(cfg, fault_stream_seed, node_count, clock)` | F6: event queue + node registry |
+| Constructor enforces `validate()` | `create()` returns `std::expected<BasicFaultInjector, ConfigProblem>`; the constructor is private, so there is no unchecked path | — the factory is the permanent shape |
+| `const VirtualClock&` | Templated on a `ClockLike` concept (anything answering `now()`). `include/cosmos/virtual_clock.hpp` is a placeholder pending the runtime clock | F6: replacing that header, with no change to the injector |
+| Categorical walk shown inline in `decide()` | Split into a pure `constexpr FaultKind select_outcome(double, const FaultRule&)`; `decide()` still takes exactly one `uniform()` per call | — permanent; see below |
+| Ledger | Records fires only, in fixed non-allocating storage (Rule 7), with the §11.1 printer. No `Status` field yet: `Fired` is the only status P1 can produce, so the printer emits it as a literal in that column | F6 adds `Status` with episodes and heals; F5 adds the decision trace (§11.2) |
+| Episodes, `begin_quiesce()`, mode transitions | Absent | F6 (episodes, limits, mode) |
+
+**Why `select_outcome` is a separate function.** `uniform()` returns multiples of 2⁻⁵³, so a draw landing exactly on a rate or on a cumulative-weight boundary is a 1-in-2⁵³ event that no seed will produce. Those boundaries are precisely where an off-by-one hides, and they cannot be reached by sampling. Extracting the value-to-outcome half as a pure function lets the boundaries be pinned with `static_assert` at exact values, which makes a regression a compile error rather than a test that may never fire. The behaviour is unchanged and the one-draw-per-call rule of §6.5 is untouched — `decide()` still owns the draw and the injection counter.
+
+**One conformance note on the walk.** `normalize()` divides by the weight total, so the walk's cumulative sum can stop a hair below 1, and a draw landing in that gap returns `None` — a fire is lost. The pseudocode in §6.5 has the same property, so the implementation is conformant rather than buggy. The gap is the per-fire loss probability, and it is asserted to stay within a few ULPs, which bounds the loss at roughly one fire in 10¹⁵ rather than leaving it unquantified.
+
 ---
 
 ## 13. Determinism Rules (Summary)
@@ -933,7 +1030,7 @@ The scaffolded `FaultProfile` (`oom_rate` + `should_inject_oom(Rng&)` in `includ
 | 6 | Fault identity comes from the recorded decision trace, not a live counter | Minimization (Phase 5) cannot be built |
 | 7 | Engine-internal allocations are never faulted | The simulator corrupts itself; all results invalid |
 | 8 | **Config sampling** uses a fixed class-indexed draw schedule, including disabled classes | Swarm dimensions become correlated; toggling one class shifts another's rate |
-| 9 | The ledger is recorded for every decision, with status and `drew` flag | Replay cannot distinguish "returned early" from "drew and lost" |
+| 9 | Every recorded decision carries a status and a `drew` flag. The **ledger** records fires, heals and limit-refusals (§11.1); the **decision trace** (§11.2, F5) is the every-decision record | Replay cannot distinguish "returned early" from "drew and lost" |
 | 10 | The trace hash covers a canonical encoding, never in-memory layout | `--verify` fails across compilers and platforms for non-determinism reasons |
 | 11 | A deterministic trigger (§10.1 occurrence, §10.2 virtual-time) firing never consumes a draw | A scripted, exact scenario would perturb unrelated probabilistic faults sharing the same run |
 | 12 | Replay of a fixed decision trace never invents new faults: on trace mismatch or exhaustion, eligible calls pass through with no draw | Minimization re-runs get confounded by faults that never existed in the original run (§11.2) |

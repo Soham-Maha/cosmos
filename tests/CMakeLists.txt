@@ -39,7 +39,44 @@ add_test(NAME test_seed_derivation COMMAND test_seed_derivation)
 
 add_executable(test_time test_time.cpp)
 target_link_libraries(test_time PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_time PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+    )
+    target_link_options(test_time PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=clock_gettime"
+        "-Wl,--wrap=gettimeofday"
+        "-Wl,--wrap=nanosleep"
+        "-Wl,--wrap=clock_nanosleep"
+    )
+endif()
+
 add_test(NAME test_time COMMAND test_time)
+
+add_executable(test_faults test_faults.cpp)
+target_link_libraries(test_faults PRIVATE cosmos)
+add_test(NAME test_faults COMMAND test_faults)
+
+add_executable(test_faultinjection_phase1_gate test_faultinjection_phase1_gate.cpp)
+target_link_libraries(test_faultinjection_phase1_gate PRIVATE cosmos)
+add_test(NAME test_faultinjection_phase1_gate COMMAND test_faultinjection_phase1_gate)
+
+add_executable(test_ledger test_ledger.cpp)
+target_link_libraries(test_ledger PRIVATE cosmos)
+add_test(NAME test_ledger COMMAND test_ledger)
+
+add_executable(test_fault_draw test_fault_draw.cpp)
+target_link_libraries(test_fault_draw PRIVATE cosmos)
+add_test(NAME test_fault_draw COMMAND test_fault_draw)
+
+add_executable(test_fault_injector test_fault_injector.cpp)
+target_link_libraries(test_fault_injector PRIVATE cosmos)
+add_test(NAME test_fault_injector COMMAND test_fault_injector)
 
 add_executable(test_simulator test_simulator.cpp)
 target_link_libraries(test_simulator PRIVATE cosmos)
