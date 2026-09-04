@@ -95,3 +95,34 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 add_test(NAME test_simulator COMMAND test_simulator)
+
+add_executable(test_wrap_random test_wrap_random.cpp)
+target_link_libraries(test_wrap_random PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # Wrapped symbols must stay opaque calls; random-family builtins would otherwise fold.
+    target_compile_options(test_wrap_random PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+        "-fno-builtin-random"
+        "-fno-builtin-rand"
+        "-fno-builtin-srand"
+        "-fno-builtin-srandom"
+    )
+    target_link_options(test_wrap_random PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=getrandom"
+        "-Wl,--wrap=random"
+        "-Wl,--wrap=rand"
+        "-Wl,--wrap=srandom"
+        "-Wl,--wrap=srand"
+    )
+endif()
+
+add_test(NAME test_wrap_random COMMAND test_wrap_random)
