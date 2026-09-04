@@ -23,9 +23,12 @@ struct NoInjector {};
 // syscall.
 template <typename Injector> class BasicSimulator {
   public:
-    // The seed feeds the per-class fault sub-streams; the Memory stream drives OOM injection.
+    // The seed is the universe seed: fault decisions derive via the Fault stream, user-visible
+    // randomness via the User stream (Rule 1). fault_rng_ derivation is legacy (FaultProfile) and
+    // will be removed when wrap_memory moves to FaultInjector::decide.
     explicit BasicSimulator(uint64_t seed = kDefaultUniverseSeed)
-        : fault_rng_(fault_class_seed(seed, FaultClass::Memory)) {}
+        : fault_rng_(fault_class_seed(seed, FaultClass::Memory)),
+          user_rng_(stream_seed(seed, StreamDomain::User)) {}
 
     ~BasicSimulator() {
         if (current_sim_ == this) {
@@ -62,6 +65,10 @@ template <typename Injector> class BasicSimulator {
     // endpoint probabilities must not.
     Rng& fault_rng() { return fault_rng_; }
 
+    // User-visible randomness (getrandom/random values). Never draws for fault decisions (Rule 1).
+    Rng& user_rng() { return user_rng_; }
+    const Rng& user_rng() const { return user_rng_; }
+
     bool has_injector() const { return injector_.has_value(); }
 
     // Returns nullptr when the slot is empty. A pointer rather than a checked reference because
@@ -86,6 +93,7 @@ template <typename Injector> class BasicSimulator {
     TrackedHeap heap_{};
     FaultProfile faults_{};
     Rng fault_rng_;
+    Rng user_rng_;
     VirtualClock clock_{};
     std::optional<Injector> injector_{};
 };
