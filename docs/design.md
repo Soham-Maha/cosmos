@@ -94,7 +94,9 @@ The following table lists every standard POSIX function intercepted by `libcosmo
 | | `write(fd, buf, count)` | `__wrap_write` | Appends dirty bytes to un-synced virtual page cache |
 | | `fsync(fd)` | `__wrap_fsync` | Flushes un-synced page cache bytes to durable virtual storage |
 | **Random** | `getrandom(buf, len, fl)` | `__wrap_getrandom` | Fills buffer with bytes from seeded `xoshiro256**` stream |
-| | `random()` | `__wrap_random` | Returns uint32 draw from seeded `workload` RNG stream |
+| | `random()` | `__wrap_random` | Returns a draw from the seeded `User` RNG stream |
+| | `rand()` | `__wrap_rand` | Returns a draw from the seeded `User` RNG stream (shared with `random()`) |
+| | `srandom(seed)`, `srand(seed)` | `__wrap_srandom`, `__wrap_srand` | Deterministic no-ops; host seeding never perturbs the `User` stream |
 | **Threads / Sync** | `pthread_create(thread, attr, fn, arg)` | `__wrap_pthread_create` | Spawns green thread / fiber task in sim scheduler (no OS thread) |
 | | `pthread_join(thread, retval)` | `__wrap_pthread_join` | Suspends current task until target green thread completes |
 | | `pthread_mutex_lock(mutex)` | `__wrap_pthread_mutex_lock` | Locks sim mutex; suspends task on mutex wait queue if contested |
