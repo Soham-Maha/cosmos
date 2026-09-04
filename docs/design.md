@@ -80,6 +80,7 @@ The following table lists every standard POSIX function intercepted by `libcosmo
 | **Time** | `clock_gettime(clk_id, tp)`| `__wrap_clock_gettime` | Writes current virtual simulation time into `timespec` |
 | | `gettimeofday(tv, tz)` | `__wrap_gettimeofday` | Writes current virtual simulation time into `timeval` |
 | | `nanosleep(req, rem)` | `__wrap_nanosleep` | Suspends caller until virtual time reaches `now + req` |
+| | `clock_nanosleep(clk, flags, req, rem)` | `__wrap_clock_nanosleep` | Suspends caller until `now + req`, or until `req` as an absolute deadline under `TIMER_ABSTIME` |
 | **Network**| `socket(domain, type, p)` | `__wrap_socket` | Returns virtual socket descriptor bound to active Node |
 | | `bind(fd, addr, len)` | `__wrap_bind` | Binds virtual socket descriptor to virtual port |
 | | `listen(fd, backlog)` | `__wrap_listen` | Marks virtual socket descriptor as passive listener |
