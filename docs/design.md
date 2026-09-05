@@ -94,7 +94,9 @@ The following table lists every standard POSIX function intercepted by `libcosmo
 | | `write(fd, buf, count)` | `__wrap_write` | Appends dirty bytes to un-synced virtual page cache |
 | | `fsync(fd)` | `__wrap_fsync` | Flushes un-synced page cache bytes to durable virtual storage |
 | **Random** | `getrandom(buf, len, fl)` | `__wrap_getrandom` | Fills buffer with bytes from seeded `xoshiro256**` stream |
-| | `random()` | `__wrap_random` | Returns uint32 draw from seeded `workload` RNG stream |
+| | `random()` | `__wrap_random` | Returns a draw from the seeded `User` RNG stream |
+| | `rand()` | `__wrap_rand` | Returns a draw from the seeded `User` RNG stream (shared with `random()`) |
+| | `srandom(seed)`, `srand(seed)` | `__wrap_srandom`, `__wrap_srand` | Deterministic no-ops; host seeding never perturbs the `User` stream |
 | **Threads / Sync** | `pthread_create(thread, attr, fn, arg)` | `__wrap_pthread_create` | Spawns green thread / fiber task in sim scheduler (no OS thread) |
 | | `pthread_join(thread, retval)` | `__wrap_pthread_join` | Suspends current task until target green thread completes |
 | | `pthread_mutex_lock(mutex)` | `__wrap_pthread_mutex_lock` | Locks sim mutex; suspends task on mutex wait queue if contested |
@@ -169,6 +171,19 @@ RNG stream domains: `Schedule=1`, `Fault=2`, `Workload=3`, `User=4`. Splitmix64 
 ---
 
 ## 8. Storage Subsystem Reference
+
+**Today (point faults only).** `__wrap_open/read/write/fsync` ask the fault injector for one
+decision per eligible call and translate it to a legal result — `EIO`/`ENOSPC` failures, or a
+`ShortWrite` that performs a *real* partial transfer of `count / 2` bytes (write() reporting k
+bytes must mean k bytes were transferred; claiming a short count without transferring would be
+an impossible world). Decisions happen before the real call, so a faulted call has no side
+effects. Eligibility: standard stream fds (0/1/2) and zero-length transfers never reach the
+injector — logging must not consume Storage-stream draws, and no outcome is observable on an
+empty transfer — so `fire_on_eligible_call` on `SiteId::write` counts only writes of
+`count >= 1` to fds `>= 3`. 1-byte writes stay eligible: they can legally fail with
+`EIO`/`ENOSPC` (a single-byte WAL commit marker is a real shape); the one degenerate case is a
+fired `ShortWrite` on a 1-byte write, which has no legal short observable and observably
+degrades to a complete write. The page-cache/durability model below is layered on later.
 
 Simulates page-cache buffering, `fsync` durability, and torn writes upon crash-reboot:
 
