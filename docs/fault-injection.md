@@ -1017,7 +1017,8 @@ not dump the ledger: a vacuous run has no failure for a ledger to explain.
 not on the `decide()` path so allocation would be legal there, but type erasure buys nothing and
 costs an indirection. `check` returns the oracle's verdict and takes a `detail` string, which
 §17.4's report prints. `ScenarioReport` carries the seed, the checks, the coverage notes, and a
-snapshot of the per-site `eligible_calls` / `injections` counters taken at `quiesce()` — §11.4's
+snapshot taken at `quiesce()` of the per-site `eligible_calls` / `injections` counters and the
+heap's `active_allocations` — §11.4's
 vacuous-coverage guard reads counters, so a campaign must not have to reach back into a finished
 universe's injector for them.
 

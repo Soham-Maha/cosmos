@@ -50,6 +50,9 @@ struct ScenarioReport {
     // and the campaign must not have to reach back into a finished universe's injector.
     SiteCounterMap eligible_calls{};
     SiteCounterMap injections{};
+    // Snapshotted rather than read live: an oracle reading the count inside check()'s CurrentGuard
+    // would include its own allocations wherever operator new reaches the wrappers.
+    size_t active_allocations = 0;
     // Rendered before the universe dies, because the sugar returns the report by value and the
     // ledger would otherwise be unreachable. Empty on a pass, and for a Scenario used directly.
     std::string ledger_dump{};
@@ -102,6 +105,9 @@ class Scenario {
         quiesced_ = true;
         // A scenario that never ran its workload would otherwise report PASSED: the harness must
         // not be capable of the vacuous pass §11.4 exists to catch.
+        // Snapshot first: record_lifecycle allocates, and if this universe happens to be current
+        // the complaint would land in the count it is about to describe.
+        report_.active_allocations = sim_->heap().active_count();
         if (!ran_) record_lifecycle("quiesce() called without run()");
         auto* injector = sim_->injector_or_null();
         if (injector == nullptr) return;
@@ -136,6 +142,17 @@ class Scenario {
         report_.checks.push_back(CheckResult{std::move(id), std::move(detail), ok, at});
         if (!ok) report_.no_check_failed = false;
         return ok;
+    }
+
+    // Opt-in, not automatic at universe end: a workload that deliberately holds state past quiesce
+    // — a cache is the ordinary case — is not leaking, and would false-positive on a blanket check.
+    // Runs through check(), so it inherits the after-quiesce rule and reads the snapshot, never the
+    // live count: one oracle's allocations must not change a later leak verdict.
+    bool check_no_leaks(std::string id) {
+        const size_t live = report_.active_allocations;
+        return check(
+            std::move(id), [live] { return live == 0; },
+            "active_allocations=" + std::to_string(live));
     }
 
     // Legal at any point, unlike check(): this records a fact the caller already holds rather than

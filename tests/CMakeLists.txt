@@ -220,3 +220,65 @@ if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 else()
     message(STATUS "test_scenario_static skipped: no static libstdc++ for this toolchain")
 endif()
+
+# The P2-S3 end-to-end fixture: a plain C application that knows nothing about libcosmos, driven by
+# the Scenario harness. Compiled twice from one source -- the fix is the -D, so the two targets
+# differ only by the nullptr check -- and both run under ctest.
+foreach(variant broken fixed)
+    set(target test_${variant}_app)
+    add_executable(${target}
+        test_broken_app.cpp
+        ${CMAKE_SOURCE_DIR}/examples/single_node/broken_cache.c
+    )
+    target_link_libraries(${target} PRIVATE cosmos)
+    target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR}/examples/single_node)
+    if(variant STREQUAL fixed)
+        target_compile_definitions(${target} PRIVATE BROKEN_CACHE_CHECKS_MALLOC)
+    endif()
+
+    if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${target} PRIVATE
+            "-fno-builtin-malloc"
+            "-fno-builtin-free"
+            "-fno-builtin-calloc"
+            "-fno-builtin-realloc"
+        )
+        target_link_options(${target} PRIVATE
+            "-Wl,--gc-sections"
+            "-Wl,--wrap=malloc"
+            "-Wl,--wrap=free"
+            "-Wl,--wrap=calloc"
+            "-Wl,--wrap=realloc"
+        )
+    endif()
+
+    add_test(NAME ${target} COMMAND ${target})
+endforeach()
+
+# The leak snapshot is read rather than measured live because a live read self-contaminates
+# wherever operator new reaches the wrappers; that only happens under a static libstdc++, so the
+# property needs this second link to be guarded rather than argued.
+if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(test_broken_app_static
+        test_broken_app.cpp
+        ${CMAKE_SOURCE_DIR}/examples/single_node/broken_cache.c
+    )
+    target_link_libraries(test_broken_app_static PRIVATE cosmos)
+    target_include_directories(test_broken_app_static
+        PRIVATE ${CMAKE_SOURCE_DIR}/examples/single_node)
+    target_compile_options(test_broken_app_static PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_broken_app_static PRIVATE
+        "-static-libstdc++"
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+    )
+    add_test(NAME test_broken_app_static COMMAND test_broken_app_static)
+endif()
