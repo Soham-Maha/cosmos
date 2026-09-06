@@ -985,15 +985,47 @@ using FaultPlan = FaultConfig;
 
 class Scenario {
   public:
-    explicit Scenario(FaultPlan plan);
-    void run(std::function<void()> workload);                    // execute with faults ON
-    void quiesce();                                              // heal_all + drain + settle (§9.3)
-    void check(std::string id, std::function<bool()> oracle);    // always-style (§12 of design.md)
-    void note_covered(std::string id, bool hit);                 // sometimes-style (§11.4)
+    // A factory, not a constructor: installing the plan can fail, and a scenario must carry the
+    // seed it is reproducible from. Lifecycle: create -> run (exactly once) -> quiesce
+    // (idempotent) -> check. Any deviation records a `cosmos.lifecycle` failure rather than
+    // asserting, so a release build cannot pass by ignoring one -- including quiescing a scenario
+    // whose workload never ran, which would otherwise be a vacuous PASS. note_covered is free at
+    // any point: it records a fact the caller already holds rather than observing the world. Ids
+    // beginning `cosmos.` are reserved for the harness.
+    static std::expected<Scenario, ConfigProblem>
+    create(uint64_t seed, FaultPlan plan, uint32_t node_count = 1);
+
+    template <Workload F> void run(F&& workload);                 // execute with faults ON
+    void quiesce();                                               // heal_all + drain + settle (§9.3)
+    template <Oracle F> bool check(std::string id, F&& oracle,     // always-style (§12 of design.md)
+                                   std::string detail = "");
+    void note_covered(std::string id, bool hit);                  // sometimes-style (§11.4)
+
+    bool passed() const;                                          // see the vacuity rule below
+    const ScenarioReport& report() const;
 };
 ```
 
-`cosmos::run` (the §17 teaser) is pure sugar over the pieces above: `cosmos::run({.seed = S, .oom = {.fail_on_call = K}}, workload, oracle)` builds a `FaultConfig` whose only rule is `SiteId::malloc → { outcomes = {OutOfMemory}, fire_on_eligible_call = K }`, runs warmup → workload → quiesce → oracle in one universe, and prints the ledger on failure. It exists so the smallest useful test is one expression; anything richer drops down to `Scenario` or `Campaign`.
+**A scenario with no checks has verified nothing.** `ScenarioReport::no_check_failed` means exactly
+that and no more; the verdict is `passed()`, on both `Scenario` and `ScenarioReport`, and it also
+requires `!vacuous()` — at least one registered check. The field is deliberately *not* called
+`passed`, so a caller reaching for the verdict cannot land on the narrower spelling by accident.
+`print_report` emits `VACUOUS: no checks registered` instead of `PASSED` for such a run, and does
+not dump the ledger: a vacuous run has no failure for a ledger to explain.
+
+`run` and `check` are constrained templates rather than `std::function` parameters: the harness is
+not on the `decide()` path so allocation would be legal there, but type erasure buys nothing and
+costs an indirection. `check` returns the oracle's verdict and takes a `detail` string, which
+§17.4's report prints. `ScenarioReport` carries the seed, the checks, the coverage notes, and a
+snapshot of the per-site `eligible_calls` / `injections` counters taken at `quiesce()` — §11.4's
+vacuous-coverage guard reads counters, so a campaign must not have to reach back into a finished
+universe's injector for them.
+
+> **Stale spelling in §17.** §17.2 and §17.3 write `Scenario scenario{.faults = plan}`. That form
+> cannot coexist with a user-declared constructor or factory, and predates `create()`. Read those
+> two lines as `auto scenario = Scenario::create(seed, plan);`.
+
+`cosmos::run` (the §17 teaser) is pure sugar over the pieces above: `cosmos::run({.seed = S, .oom = {.fail_on_call = K}}, workload, oracle)` builds a `FaultConfig` whose only rule is `SiteId::malloc → { outcomes = {OutOfMemory}, fire_on_eligible_call = K }`, runs warmup → workload → quiesce → oracle in one universe, and returns a `ScenarioReport`. On failure the report carries `ledger_dump`, the §11.1 ledger rendered **before** the universe is destroyed — otherwise no caller could ever print it, since the sugar owns the injector and destroys it on return. `print_report` appends the dump when it is present. It exists so the smallest useful test is one expression; anything richer drops down to `Scenario` or `Campaign`. `RunSpec::check_id` names the oracle's check so a failing report is self-describing. The universe is destroyed when `run` returns, so any block the workload hands back outlives its heap and is released through the orphan path — nothing can count those blocks afterwards, which is why a universe-end leak check can never fire for the sugar. `fail_on_call` is an **eligible-call** index at `SiteId::malloc` (§10) and counts every allocation that reaches the wrapped symbol, the harness's own included. It does **not** count what never reaches it, and which allocations do is **linkage-dependent**. Under the default shared-`libstdc++` link, `operator new` — and therefore every `std::` container — is not interposed, because it lives in `libstdc++.so` whose internal `malloc` binding `--wrap` does not rewrite. Under `-static-libstdc++` it is; `tests/CMakeLists.txt` links the scenario suite a second time that way as `test_scenario_static` so both sides are pinned rather than assumed (that target is probed for and skipped on toolchains without a static `libstdc++`, which includes this repository's clang). Do not rely on either behaviour: a test needing an exact eligible count must use the raw allocator, which is why the worked example's fixture allocates into a stack array. The oracle is a bool-returning callable; the teaser's `CHECK(...)` spelling arrives with `assert.hpp` in F4.
 
 ### 12.2 Migration note: `FaultProfile` is superseded — **done**
 

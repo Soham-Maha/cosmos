@@ -162,3 +162,61 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 add_test(NAME test_wrap_storage COMMAND test_wrap_storage)
+
+add_executable(test_scenario test_scenario.cpp)
+target_link_libraries(test_scenario PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # The harness drives real allocations through the wrapped symbols, so they must stay opaque.
+    target_compile_options(test_scenario PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_scenario PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+endif()
+
+add_test(NAME test_scenario COMMAND test_scenario)
+
+# Second link of the same source. operator new reaches the wrappers only when libstdc++ is linked
+# statically, and that is the only configuration in which the harness's own bookkeeping is visible
+# to the universe it reports on -- so test_counters_are_snapshotted_at_quiesce can only guard that
+# property here. See IMPLEMENTATION_NOTES.md, "what --wrap actually reaches".
+#
+# Probed rather than assumed: this flake's clang has no static libstdc++, so an unconditional
+# target breaks the build-clang and build-asan trees at link time rather than merely skipping.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_LINK_OPTIONS "-static-libstdc++")
+check_cxx_source_compiles("int main() { return 0; }" COSMOS_HAVE_STATIC_LIBSTDCXX)
+unset(CMAKE_REQUIRED_LINK_OPTIONS)
+
+if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(test_scenario_static test_scenario.cpp)
+    target_link_libraries(test_scenario_static PRIVATE cosmos)
+    target_compile_options(test_scenario_static PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_scenario_static PRIVATE
+        "-static-libstdc++"
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+    add_test(NAME test_scenario_static COMMAND test_scenario_static)
+else()
+    message(STATUS "test_scenario_static skipped: no static libstdc++ for this toolchain")
+endif()
