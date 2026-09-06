@@ -1,9 +1,7 @@
 #pragma once
 
-// Internal helpers shared by the __wrap_* translation units. Deliberately not part of the
-// public include/ surface, and header-only so every __wrap_* function stays in its own
-// -ffunction-sections section: --gc-sections must still be able to discard an unused wrapper
-// without dragging in the others (docs/design.md §2).
+// Header-only on purpose: each __wrap_* must stay in its own section so --gc-sections can discard
+// an unused wrapper without dragging in the others (docs/design.md §2).
 
 #include "cosmos/faults.hpp"
 
@@ -12,14 +10,12 @@
 
 namespace cosmos::wrappers {
 
-// Set for the duration of one wrapper's own logic. A wrapped POSIX call arriving while this is
-// set is a re-entry from engine-internal work: it passes through to the real call without a
-// fault decision, mirroring wrap_memory.cpp's in_wrap_memory guard. The previous value is
-// restored rather than cleared, so a guard instantiated in an inner scope cannot unguard an
-// outer one.
+// Set while a wrapper runs its own logic: a wrapped call arriving now is engine work and must pass
+// through unfaulted (Rule 7).
 inline thread_local bool in_wrapper_logic = false;
 
 struct ReentrancyGuard {
+    // Restores rather than clears, so an inner guard cannot unguard an outer one.
     ReentrancyGuard() : previous_(in_wrapper_logic) { in_wrapper_logic = true; }
     ~ReentrancyGuard() { in_wrapper_logic = previous_; }
 
@@ -30,8 +26,7 @@ struct ReentrancyGuard {
     bool previous_;
 };
 
-// Call exactly once per eligible wrapped call and never on a passthrough path: that is Rule 3's
-// gate-before-draw discipline, enforced at the call site rather than by the engine.
+// Call once per eligible wrapped call and never on a passthrough path (Rule 3).
 template <typename Sim> FaultKind decide_for(Sim* sim, FaultClass cls, SiteId site) {
     if (sim == nullptr) {
         return FaultKind::None;
@@ -44,18 +39,9 @@ template <typename Sim> FaultKind decide_for(Sim* sim, FaultClass cls, SiteId si
     return FaultKind::None;
 }
 
-// Eligibility policy for storage I/O: a call reaches the injector only when a decision could
-// produce a legal, observable outcome on it (Rule 15 applied to eligibility). Compile-time so
-// the policy is pinned and testable without an injector (tests/test_wrap_storage.cpp).
-//
-// - Standard stream fds (0/1/2) are never eligible: application and harness logging must not
-//   consume Storage-stream draws or fail with injected errors — terminal/pipe writes are not
-//   the disk fault model. Every other fd, negative ones included, goes to the host untouched
-//   by the decision (a negative fd is an EBADF from the host, not a storage fault).
-// - Zero-length reads and writes are never eligible: no outcome is observable.
-// - 1-byte writes ARE eligible: they can legally fail with EIO/ENOSPC (a single-byte WAL
-//   commit marker is a real shape). Only the ShortWrite outcome is unobservable there, which
-//   the wrapper degrades per-call (see wrap_storage.cpp).
+// A call is eligible only where a decision could produce a legal, observable outcome (Rule 15).
+// Standard streams are excluded so logging cannot consume Storage draws or fail with injected
+// errors; an empty transfer has nothing to observe. 1-byte writes stay eligible.
 inline constexpr bool storage_fd_eligible(int fd) { return fd > 2; }
 
 inline constexpr bool storage_read_eligible(int fd, size_t count) {

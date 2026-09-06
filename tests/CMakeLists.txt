@@ -156,6 +156,7 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=realloc"
         "-Wl,--wrap=open"
         "-Wl,--wrap=read"
+        "-Wl,--wrap=__read_chk"
         "-Wl,--wrap=write"
         "-Wl,--wrap=fsync"
     )

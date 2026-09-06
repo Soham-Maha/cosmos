@@ -37,6 +37,7 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=clock_nanosleep"
         "-Wl,--wrap=open"
         "-Wl,--wrap=read"
+        "-Wl,--wrap=__read_chk"
         "-Wl,--wrap=write"
         "-Wl,--wrap=fsync"
         "-Wl,--wrap=getrandom"

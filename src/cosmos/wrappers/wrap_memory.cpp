@@ -9,13 +9,8 @@
 
 namespace {
 
-// Frees a block whose owning heap was destroyed while the block was still allocated. Registry
-// membership proves the pointer is a sim payload, so the header read is safe. A corrupted canary
-// leaks the block rather than freeing a bogus header-offset address; the registry entry stays in
-// that case, so any later free of the same pointer takes this same header-verified path instead of
-// a passthrough __real_free of a header-offset address. On a successful release the entry is
-// removed: a stale Orphaned entry would outlive the freed block and misroute a later passthrough
-// allocation that reuses the address.
+// Releases a block whose owning heap died first. The registry entry is dropped only on success: a
+// stale one would misroute a later passthrough allocation that reuses the address.
 void free_orphaned_block(void* ptr) {
     auto* header = cosmos::header_for(ptr);
     if (header->magic == cosmos::COSMOS_CANARY_MAGIC) {
@@ -25,10 +20,7 @@ void free_orphaned_block(void* ptr) {
     }
 }
 
-// realloc semantics for a block whose owning heap is gone: fresh allocation (through the active
-// sim heap when one exists), copy min(old, new), release the old block. No fault injection: the
-// block never belonged to the currently active universe. A corrupted canary fails the resize and
-// leaves the original untouched.
+// Never faulted: the block never belonged to the currently active universe.
 void* reallocate_orphaned_block(void* ptr, size_t new_size) {
     auto* header = cosmos::header_for(ptr);
     if (header->magic != cosmos::COSMOS_CANARY_MAGIC) {

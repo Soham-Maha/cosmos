@@ -233,6 +233,41 @@ void test_no_alloc_smoke() {
     std::cout << "[PASS] test_no_alloc_smoke" << std::endl;
 }
 
+// glibc substitutes __read_chk for read() wherever the destination size is known and fortification
+// is on, so the alias has to reach the same site or the wrapper has a hole nobody notices. Called
+// directly because whether the compiler emits it depends on the build: -fsanitize=address does,
+// a plain build does not.
+extern "C" ssize_t __wrap___read_chk(int fd, void* buf, size_t count, size_t buflen);
+
+void test_fortified_read_alias_reaches_the_same_site() {
+    const std::string path = temp_path("readchk");
+    int fd = open_scratch(path);
+    assert(::write(fd, "0123456789", 10) == 10);
+    assert(lseek(fd, 0, SEEK_SET) == 0);
+
+    char buf[10];
+    {
+        cosmos::Simulator sim(7);
+        must(sim.install_faults(storage_config(cosmos::SiteId::read, cosmos::FaultKind::ReadEio))
+                 .has_value());
+        cosmos::Simulator::set_current(&sim);
+        errno = 0;
+        assert(__wrap___read_chk(fd, buf, sizeof(buf), sizeof(buf)) == -1);
+        assert(errno == EIO);
+        assert(sim.injector_or_null()->injections(cosmos::SiteId::read) == 1);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    // Same alias, no universe: the host answers and the data is intact.
+    assert(lseek(fd, 0, SEEK_SET) == 0);
+    assert(__wrap___read_chk(fd, buf, sizeof(buf), sizeof(buf)) == 10);
+    assert(std::memcmp(buf, "0123456789", 10) == 0);
+
+    close(fd);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_fortified_read_alias_reaches_the_same_site" << std::endl;
+}
+
 // Minimum live slice only; the full per-site legality matrix is P3-S2's.
 void test_storage_outcomes_map_to_errno() {
     const std::string path = temp_path("errno");
@@ -393,6 +428,7 @@ int main() {
     test_open_mode_forwarding();
     test_no_alloc_smoke();
     test_storage_outcomes_map_to_errno();
+    test_fortified_read_alias_reaches_the_same_site();
     test_unactivated_site_never_moves_the_storage_stream();
     test_allocation_inside_wrapper_logic_is_never_faulted();
 
