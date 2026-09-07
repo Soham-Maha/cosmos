@@ -36,17 +36,12 @@ long int __real_random(void);
 int __real_rand(void);
 
 ssize_t __wrap_getrandom(void* buf, size_t buflen, unsigned int flags) {
-    // Passthrough first, like every other wrapper: outside a universe the host kernel owns all
-    // validation, including flag checks and zero-length semantics.
-    if (!cosmos::Simulator::has_current()) {
+    if (!cosmos::Simulator::has_current() || cosmos::wrappers::in_wrapper_logic) {
         return __real_getrandom(buf, buflen, flags);
     }
 
-    // Inside a universe, mirror the kernel's validation order (drivers/char/random.c,
-    // SYSCALL_DEFINE3(getrandom)): unknown flag bits, then the INSECURE|RANDOM combination,
-    // then count clamping, then the count == 0 short-circuit, then the buffer itself. Calling
-    // getrandom(nullptr, 16, 0x80000000) must fail with EINVAL, not EFAULT, and
-    // getrandom(buf, 0, 0x80000000) must fail with EINVAL, not succeed with 0.
+    // Validation order mirrors the kernel's (drivers/char/random.c): flags, then count, then the
+    // buffer. Reordering changes which errno a bad call reports.
     if ((flags & ~allowed_getrandom_flags()) != 0) {
         errno = EINVAL;
         return -1;
@@ -59,8 +54,7 @@ ssize_t __wrap_getrandom(void* buf, size_t buflen, unsigned int flags) {
     }
 #endif
 
-    // The kernel clamps count to INT_MAX; mirroring that keeps the ssize_t cast below from
-    // overflowing negative and misrepresenting success as an unknown error.
+    // Clamped like the kernel, or the ssize_t cast below reports success as a negative error.
     const size_t count =
         buflen > static_cast<size_t>(INT_MAX) ? static_cast<size_t>(INT_MAX) : buflen;
     if (count == 0) {
@@ -71,6 +65,8 @@ ssize_t __wrap_getrandom(void* buf, size_t buflen, unsigned int flags) {
         return -1;
     }
 
+    cosmos::wrappers::ReentrancyGuard guard;
+
     auto* sim = cosmos::Simulator::current();
     // Decision first, values second: a failed call must not consume the User stream (Rule 1).
     if (cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Random, cosmos::SiteId::getrandom) ==
@@ -79,8 +75,7 @@ ssize_t __wrap_getrandom(void* buf, size_t buflen, unsigned int flags) {
         return -1;
     }
 
-    // Deterministic bytes from the User stream, 8 at a time. Allocation-free (Rule 7): stack
-    // word plus memcpy, no malloc, no errno clobber on success.
+    // Allocation-free (Rule 7): a stack word and memcpy, never a buffer.
     auto* out = static_cast<unsigned char*>(buf);
     size_t remaining = count;
     while (remaining > 0) {
@@ -102,9 +97,8 @@ long int __wrap_random(void) {
     return static_cast<long int>(sim->user_rng().range(0, static_cast<uint64_t>(RAND_MAX)));
 }
 
-// glibc's rand() is a separate public symbol whose internal path does not re-enter our wrapped
-// random(), so it must be wrapped on its own or it leaks host nondeterminism into a run. It
-// shares the User stream with random(): both are user-visible draws, consumed in call order.
+// rand() does not re-enter our wrapped random(), so it needs its own wrapper or it leaks host
+// nondeterminism. Shares the User stream with random(), consumed in call order.
 int __wrap_rand(void) {
     if (!cosmos::Simulator::has_current()) {
         return __real_rand();
@@ -113,8 +107,7 @@ int __wrap_rand(void) {
     return static_cast<int>(sim->user_rng().range(0, static_cast<uint64_t>(RAND_MAX)));
 }
 
-// Deterministic no-ops: host seeding must not perturb the User stream. Deliberately do not touch
-// any RNG, fault stream, or errno.
+// No-ops on purpose: host seeding must not perturb the User stream.
 void __wrap_srandom(unsigned int seed) { (void)seed; }
 
 void __wrap_srand(unsigned int seed) { (void)seed; }
