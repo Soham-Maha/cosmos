@@ -3,6 +3,9 @@
 # so a prior Release configure would otherwise leak NDEBUG into the test binaries.
 add_compile_options(-UNDEBUG)
 
+# The campaign worker pool runs on std::thread; the platform pthread flag must reach it.
+find_package(Threads REQUIRED)
+
 add_executable(test_wrap_malloc test_wrap_malloc.cpp)
 target_link_libraries(test_wrap_malloc PRIVATE cosmos)
 # White-box test: pins the internal memory eligibility policy from wrapper_fault.hpp.
@@ -123,6 +126,25 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 add_test(NAME test_assert COMMAND test_assert)
+
+add_executable(test_campaign test_campaign.cpp)
+target_link_libraries(test_campaign PRIVATE cosmos Threads::Threads)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # Same opaque-call reason as test_wrap_malloc: record_finding and the flush paths allocate
+    # through the wrapped heap when a universe is current.
+    target_compile_options(test_campaign PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+    )
+    target_link_options(test_campaign PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+    )
+endif()
+
+add_test(NAME test_campaign COMMAND test_campaign)
 
 add_executable(test_wrap_random test_wrap_random.cpp)
 target_link_libraries(test_wrap_random PRIVATE cosmos)
