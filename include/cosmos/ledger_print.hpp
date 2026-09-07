@@ -24,7 +24,7 @@ inline std::string grouped(uint64_t value) {
 
 // Sub-millisecond fires are common once a real clock runs, and two of them 999us apart must not
 // print as the same instant in the artifact whose only job is being read.
-inline std::string format_time(Time at) {
+inline std::string format_ms(Time at) {
     // Split on the magnitude, not the signed value: a negative remainder renders with a minus sign,
     // and the pad width below would underflow rather than print it. Negating via (n + 1) keeps
     // Time::min() in range.
@@ -39,8 +39,10 @@ inline std::string format_time(Time at) {
         const std::string fraction = std::to_string(remainder_us);
         text += "." + std::string(3 - fraction.size(), '0') + fraction;
     }
-    return negative ? "t=-" + text + "ms" : "t=" + text + "ms";
+    return negative ? "-" + text + "ms" : text + "ms";
 }
+
+inline std::string format_time(Time at) { return "t=" + format_ms(at); }
 
 } // namespace detail
 

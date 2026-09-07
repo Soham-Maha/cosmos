@@ -399,7 +399,48 @@ enum class ConfigError : uint8_t {
     QuorumExceedsNodes,
     LimitsExceedNodes,
     BadWindowOrder,
+    InjectorAlreadyInstalled,
 };
+
+constexpr const char* name_of(ConfigError error) {
+    switch (error) {
+    case ConfigError::BadRate:
+        return "BadRate";
+    case ConfigError::BadWeight:
+        return "BadWeight";
+    case ConfigError::BadOutcomeKind:
+        return "BadOutcomeKind";
+    case ConfigError::IllegalOutcome:
+        return "IllegalOutcome";
+    case ConfigError::EmptyOutcomes:
+        return "EmptyOutcomes";
+    case ConfigError::TriggerLeSkipFirst:
+        return "TriggerLeSkipFirst";
+    case ConfigError::TriggerOnEventSite:
+        return "TriggerOnEventSite";
+    case ConfigError::RuleOnEventSite:
+        return "RuleOnEventSite";
+    case ConfigError::RuleOnDisabledClass:
+        return "RuleOnDisabledClass";
+    case ConfigError::EpisodeOutsideWindows:
+        return "EpisodeOutsideWindows";
+    case ConfigError::BadEpisodeDuration:
+        return "BadEpisodeDuration";
+    case ConfigError::UnknownNode:
+        return "UnknownNode";
+    case ConfigError::BadKnobOrder:
+        return "BadKnobOrder";
+    case ConfigError::QuorumExceedsNodes:
+        return "QuorumExceedsNodes";
+    case ConfigError::LimitsExceedNodes:
+        return "LimitsExceedNodes";
+    case ConfigError::BadWindowOrder:
+        return "BadWindowOrder";
+    case ConfigError::InjectorAlreadyInstalled:
+        return "InjectorAlreadyInstalled";
+    }
+    return "?";
+}
 
 // Carries the offending site so a rejected config says where, not just what.
 struct ConfigProblem {
@@ -616,17 +657,5 @@ inline void FaultConfig::normalize() {
         }
     }
 }
-
-// Superseded by FaultConfig/FaultRule; deleted in P2-S1 once wrap_memory.cpp is rewired.
-struct FaultProfile {
-    double oom_rate = 0.0; // Heap allocation failure probability [0.0, 1.0]
-
-    // Endpoint rates never draw (Rule 3): only intermediate rates consume a decision.
-    bool should_inject_oom(Rng& rng) const {
-        if (oom_rate <= 0.0) return false;
-        if (oom_rate >= 1.0) return true;
-        return rng.uniform() < oom_rate;
-    }
-};
 
 } // namespace cosmos
