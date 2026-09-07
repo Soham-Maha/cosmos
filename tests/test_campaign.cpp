@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <filesystem>
 #include <iostream>
 #include <random>
 #include <string>
@@ -218,6 +219,88 @@ void test_run_single_contract() {
     std::cout << "[PASS] test_run_single_contract" << std::endl;
 }
 
+// Phase 1.5 crash attribution (option b, no signal handlers): on-disk per-worker markers are
+// live during the run and gone after a clean run; a crashed worker's surviving marker names its
+// in-flight seed, which IS the finding.
+void test_disk_markers_live_during_run_and_cleared_after() {
+    cosmos::sometimes_registry().reset();
+
+    const std::string dir = "/tmp/cosmos_campaign_marker_test";
+    std::filesystem::remove_all(dir);
+
+    // The workload runs inside a universe while its worker's marker is on disk.
+    const auto workload = [&dir](cosmos::Simulator& sim, uint64_t seed) {
+        (void)seed;
+        (void)sim;
+        bool marker_seen = false;
+        std::error_code error;
+        for (const std::filesystem::directory_entry& entry :
+             std::filesystem::directory_iterator(dir, error)) {
+            if (entry.path().filename().string().find("worker-") == 0) marker_seen = true;
+        }
+        assert(marker_seen); // some worker's marker file is live during the run
+    };
+
+    cosmos::CampaignConfig cfg = small_config(false);
+    cfg.marker_dir = dir;
+    const auto report = cosmos::run(cfg, workload);
+
+    assert(report.runs == 24);
+    assert(std::filesystem::directory_iterator(dir) ==
+           std::filesystem::directory_iterator{}); // clean run deletes every marker
+
+    std::filesystem::remove_all(dir);
+    std::cout << "[PASS] test_disk_markers_live_during_run_and_cleared_after" << std::endl;
+}
+
+// Crash attribution: a marker file left behind by a dead worker names its in-flight seed.
+void test_crash_attribution_reads_surviving_markers() {
+    const std::string dir = "/tmp/cosmos_campaign_crash_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    // Simulate two workers dying mid-run: their marker files survive the process.
+    cosmos::detail::write_seed_marker(dir, 0, 4242);
+    cosmos::detail::write_seed_marker(dir, 1, 7777);
+    cosmos::detail::remove_seed_marker(dir, 2); // a worker that finished cleanly
+
+    const auto attributed = cosmos::detail::crash_attributed_seeds(dir);
+    assert((attributed == std::vector<uint64_t>{4242, 7777}));
+
+    std::filesystem::remove_all(dir);
+    std::cout << "[PASS] test_crash_attribution_reads_surviving_markers" << std::endl;
+}
+
+// Failure-triggered flush: a finding reaches disk the moment its universe merges, even when
+// the periodic cadence alone would never fire during this run.
+void test_flush_on_failed_run() {
+    cosmos::sometimes_registry().reset();
+
+    const std::string path = "/tmp/cosmos_campaign_failure_flush_test.txt";
+    std::remove(path.c_str());
+
+    cosmos::CampaignConfig cfg = small_config(false);
+    cfg.report_path = path;
+    cfg.flush_every = 100; // > trials: the cadence would never fire
+    const auto report = cosmos::run(cfg, planted_violation_workload);
+
+    FILE* file = std::fopen(path.c_str(), "r");
+    assert(file != nullptr); // a flush happened despite the cadence never firing
+    std::string on_disk;
+    char buffer[512];
+    size_t read_bytes = 0;
+    while ((read_bytes = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        on_disk.append(buffer, read_bytes);
+    }
+    std::fclose(file);
+    std::remove(path.c_str());
+
+    assert(on_disk == report.to_string(cfg.max_seeds_per_finding));
+    assert(on_disk.find(kPlantedId) != std::string::npos);
+
+    std::cout << "[PASS] test_flush_on_failed_run" << std::endl;
+}
+
 int main() {
     test_campaign_finds_planted_violation();
     test_report_grouping_respects_the_cap();
@@ -227,6 +310,9 @@ int main() {
     test_incremental_disk_flush();
     test_worker_seed_marker();
     test_run_single_contract();
+    test_disk_markers_live_during_run_and_cleared_after();
+    test_crash_attribution_reads_surviving_markers();
+    test_flush_on_failed_run();
     std::cout << "All campaign tests passed successfully!" << std::endl;
     return 0;
 }

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -29,10 +30,17 @@ struct CampaignConfig {
     uint64_t max_seeds_per_finding = 10;
 
     // Incremental flushing (Crash Containment item 2): the merged report is written to
-    // report_path (if non-empty) every flush_every completed runs. A crash then loses at most
-    // the current universe — never the campaign.
+    // report_path (if non-empty) every flush_every completed runs, immediately after any run
+    // that produced findings, and once more after the pool shuts down. A crash then loses at
+    // most the current universe — never the campaign, and never an already-found finding.
     std::string report_path;
     uint64_t flush_every = 100;
+
+    // On-disk per-worker seed markers (Crash Containment item 1): before running a universe
+    // each worker writes worker-<id>.seed into marker_dir and deletes it on clean completion.
+    // After a crash, the surviving files name the in-flight seeds — those seeds ARE the
+    // findings; read them back with crash_attributed_seeds(). Empty disables marker files.
+    std::string marker_dir;
 };
 
 // Aggregated result of the full campaign. failed_runs counts universes (one run can produce
@@ -105,7 +113,9 @@ class Campaign {
 
 // Crash Containment item 1 (§4): a per-worker marker naming the seed the worker is currently
 // running. If the process dies, the marker identifies the crashing seed — that seed IS the
-// finding. In-memory for now; Phase 1.5 adds the on-disk marker and signal handling.
+// finding. The in-memory slot is the live copy; the on-disk twin (below) is what survives the
+// process. Signal handling and fork-per-seed subprocess isolation are deferred until Phase 2's
+// Process fault class makes crashing universes reproducible enough to exercise them.
 class WorkerSeedMarker {
   public:
     void publish(uint64_t seed) {
@@ -122,6 +132,47 @@ class WorkerSeedMarker {
 };
 
 namespace detail {
+
+// The on-disk twin of WorkerSeedMarker: worker-<id>.seed holds the seed of the universe the
+// worker is currently running. Survives the process, which is the point. All I/O is
+// best-effort — a failed marker write must never abort the campaign.
+inline std::filesystem::path seed_marker_path(const std::string& dir, unsigned worker_id) {
+    return std::filesystem::path(dir) / ("worker-" + std::to_string(worker_id) + ".seed");
+}
+
+inline void write_seed_marker(const std::string& dir, unsigned worker_id, uint64_t seed) {
+    if (dir.empty()) return;
+    std::FILE* file = std::fopen(seed_marker_path(dir, worker_id).c_str(), "w");
+    if (file == nullptr) return;
+    std::fprintf(file, "%llu\n", static_cast<unsigned long long>(seed));
+    std::fclose(file);
+}
+
+inline void remove_seed_marker(const std::string& dir, unsigned worker_id) {
+    if (dir.empty()) return;
+    std::error_code ignored;
+    std::filesystem::remove(seed_marker_path(dir, worker_id), ignored);
+}
+
+// Crash attribution: every marker file left in dir names a seed that was in flight when the
+// process died. Those seeds ARE the findings. Sorted for stable output; files are left in
+// place — the caller decides what to do with them.
+inline std::vector<uint64_t> crash_attributed_seeds(const std::string& dir) {
+    std::vector<uint64_t> seeds;
+    std::error_code error;
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::directory_iterator(dir, error)) {
+        std::FILE* file = std::fopen(entry.path().c_str(), "r");
+        if (file == nullptr) continue;
+        unsigned long long seed = 0;
+        if (std::fscanf(file, "%llu", &seed) == 1) {
+            seeds.push_back(seed);
+        }
+        std::fclose(file);
+    }
+    std::sort(seeds.begin(), seeds.end());
+    return seeds;
+}
 
 // One worker's shard: findings accumulate locally; the merge under a single mutex happens per
 // universe (and the flush cadence rides the same lock). record_finding is per-universe state,
@@ -152,7 +203,8 @@ inline void flush_report_to_disk(const std::string& path, const CampaignReport& 
 // distribution across workers varies.
 //
 // Worker loop per seed:
-//   1. publish the seed to this worker's marker (crash attribution)
+//   1. publish the seed to this worker's marker, memory + disk (crash attribution; surviving
+//      worker-<id>.seed files after a crash are readable via crash_attributed_seeds())
 //   2. Scope scope(sim) — RAII context install, never manual set_current()
 //   3. build_fn(sim, seed) — the user workload + assertions (the IDENTICAL build_fn that
 //      run_single receives; factor it into a named function, or repro runs will diverge)
@@ -165,6 +217,11 @@ inline void flush_report_to_disk(const std::string& path, const CampaignReport& 
 // never_hit is computed from the campaign-wide registry after the pool shuts down; the report
 // is then sorted for stable output. The registry is NOT reset by run() — a campaign composes
 // with whatever ids were registered before it.
+//
+// Deferred (Phase 2): signal handlers (SIGSEGV/SIGABRT → marker + report flush + re-raise) and
+// fork-per-seed subprocess isolation. Both need the Process fault class to make crashing
+// universes reproducible enough to exercise; until then a hard crash is attributed by the
+// surviving on-disk markers alone.
 template <typename BuildFn> CampaignReport run(CampaignConfig cfg, BuildFn build_fn) {
     CampaignReport report;
     if (cfg.parallel == 0) cfg.parallel = 1;
@@ -174,18 +231,27 @@ template <typename BuildFn> CampaignReport run(CampaignConfig cfg, BuildFn build
     std::vector<detail::WorkerShard> shards(cfg.parallel);
     std::vector<WorkerSeedMarker> markers(cfg.parallel);
 
-    const auto merge_and_maybe_flush = [&](unsigned worker_id) {
+    if (!cfg.marker_dir.empty()) {
+        std::error_code ignored;
+        std::filesystem::create_directories(cfg.marker_dir, ignored);
+    }
+
+    const auto merge_and_maybe_flush = [&](unsigned worker_id, bool run_failed) {
         detail::WorkerShard& shard = shards[worker_id];
         std::lock_guard<std::mutex> lock(report_mutex);
         for (Failure& failure : shard.findings) {
             report.findings.push_back(std::move(failure));
         }
         if (shard.failed_run) ++report.failed_runs;
+        const bool merged_run_failed = shard.failed_run;
         shard.findings.clear();
         shard.failed_run = false;
         ++report.runs;
-        if (!cfg.report_path.empty() && cfg.flush_every != 0 &&
-            report.runs % cfg.flush_every == 0) {
+        // Failure-triggered flush: a finding reaches disk the moment its universe merges, so a
+        // later crash cannot lose it — not just on the periodic cadence.
+        if (!cfg.report_path.empty() &&
+            (run_failed || merged_run_failed ||
+             (cfg.flush_every != 0 && report.runs % cfg.flush_every == 0))) {
             detail::flush_report_to_disk(cfg.report_path, report, cfg.max_seeds_per_finding);
         }
     };
@@ -197,6 +263,7 @@ template <typename BuildFn> CampaignReport run(CampaignConfig cfg, BuildFn build
             if (index >= cfg.trials) return;
             const uint64_t seed = cfg.base_seed + index;
             marker.publish(seed);
+            detail::write_seed_marker(cfg.marker_dir, worker_id, seed);
 
             {
                 Simulator sim(seed);
@@ -226,10 +293,12 @@ template <typename BuildFn> CampaignReport run(CampaignConfig cfg, BuildFn build
                         shards[worker_id].failed_run = true;
                     }
                 }
-            } // Scope restored, sim destroyed: the marker still names the seed until cleared.
+            } // Scopes restored, sims destroyed: the markers still name the seed until cleared.
 
             marker.clear();
-            merge_and_maybe_flush(worker_id);
+            detail::remove_seed_marker(cfg.marker_dir, worker_id);
+            const bool run_failed = !shards[worker_id].findings.empty();
+            merge_and_maybe_flush(worker_id, run_failed);
         }
     };
 
