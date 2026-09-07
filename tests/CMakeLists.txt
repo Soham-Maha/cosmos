@@ -5,6 +5,8 @@ add_compile_options(-UNDEBUG)
 
 add_executable(test_wrap_malloc test_wrap_malloc.cpp)
 target_link_libraries(test_wrap_malloc PRIVATE cosmos)
+# White-box test: pins the internal memory eligibility policy from wrapper_fault.hpp.
+target_include_directories(test_wrap_malloc PRIVATE ${CMAKE_SOURCE_DIR}/src/cosmos/wrappers)
 
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # Linker --wrap substitutes malloc/free AFTER optimization, but GCC/Clang
@@ -98,6 +100,8 @@ add_test(NAME test_simulator COMMAND test_simulator)
 
 add_executable(test_wrap_random test_wrap_random.cpp)
 target_link_libraries(test_wrap_random PRIVATE cosmos)
+# White-box test: exercises the shared reentrancy guard from wrapper_fault.hpp.
+target_include_directories(test_wrap_random PRIVATE ${CMAKE_SOURCE_DIR}/src/cosmos/wrappers)
 
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # Wrapped symbols must stay opaque calls; random-family builtins would otherwise fold.
@@ -152,9 +156,130 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=realloc"
         "-Wl,--wrap=open"
         "-Wl,--wrap=read"
+        "-Wl,--wrap=__read_chk"
         "-Wl,--wrap=write"
         "-Wl,--wrap=fsync"
     )
 endif()
 
 add_test(NAME test_wrap_storage COMMAND test_wrap_storage)
+
+add_executable(test_scenario test_scenario.cpp)
+target_link_libraries(test_scenario PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # The harness drives real allocations through the wrapped symbols, so they must stay opaque.
+    target_compile_options(test_scenario PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_scenario PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+endif()
+
+add_test(NAME test_scenario COMMAND test_scenario)
+
+# Second link of the same source. operator new reaches the wrappers only when libstdc++ is linked
+# statically, and that is the only configuration in which the harness's own bookkeeping is visible
+# to the universe it reports on -- so test_counters_are_snapshotted_at_quiesce can only guard that
+# property here. See IMPLEMENTATION_NOTES.md, "what --wrap actually reaches".
+#
+# Probed rather than assumed: this flake's clang has no static libstdc++, so an unconditional
+# target breaks the build-clang and build-asan trees at link time rather than merely skipping.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_LINK_OPTIONS "-static-libstdc++")
+check_cxx_source_compiles("int main() { return 0; }" COSMOS_HAVE_STATIC_LIBSTDCXX)
+unset(CMAKE_REQUIRED_LINK_OPTIONS)
+
+if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(test_scenario_static test_scenario.cpp)
+    target_link_libraries(test_scenario_static PRIVATE cosmos)
+    target_compile_options(test_scenario_static PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_scenario_static PRIVATE
+        "-static-libstdc++"
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+    add_test(NAME test_scenario_static COMMAND test_scenario_static)
+else()
+    message(STATUS "test_scenario_static skipped: no static libstdc++ for this toolchain")
+endif()
+
+# The P2-S3 end-to-end fixture: a plain C application that knows nothing about libcosmos, driven by
+# the Scenario harness. Compiled twice from one source -- the fix is the -D, so the two targets
+# differ only by the nullptr check -- and both run under ctest.
+foreach(variant broken fixed)
+    set(target test_${variant}_app)
+    add_executable(${target}
+        test_broken_app.cpp
+        ${CMAKE_SOURCE_DIR}/examples/single_node/broken_cache.c
+    )
+    target_link_libraries(${target} PRIVATE cosmos)
+    target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR}/examples/single_node)
+    if(variant STREQUAL fixed)
+        target_compile_definitions(${target} PRIVATE BROKEN_CACHE_CHECKS_MALLOC)
+    endif()
+
+    if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${target} PRIVATE
+            "-fno-builtin-malloc"
+            "-fno-builtin-free"
+            "-fno-builtin-calloc"
+            "-fno-builtin-realloc"
+        )
+        target_link_options(${target} PRIVATE
+            "-Wl,--gc-sections"
+            "-Wl,--wrap=malloc"
+            "-Wl,--wrap=free"
+            "-Wl,--wrap=calloc"
+            "-Wl,--wrap=realloc"
+        )
+    endif()
+
+    add_test(NAME ${target} COMMAND ${target})
+endforeach()
+
+# The leak snapshot is read rather than measured live because a live read self-contaminates
+# wherever operator new reaches the wrappers; that only happens under a static libstdc++, so the
+# property needs this second link to be guarded rather than argued.
+if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(test_broken_app_static
+        test_broken_app.cpp
+        ${CMAKE_SOURCE_DIR}/examples/single_node/broken_cache.c
+    )
+    target_link_libraries(test_broken_app_static PRIVATE cosmos)
+    target_include_directories(test_broken_app_static
+        PRIVATE ${CMAKE_SOURCE_DIR}/examples/single_node)
+    target_compile_options(test_broken_app_static PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_broken_app_static PRIVATE
+        "-static-libstdc++"
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+    )
+    add_test(NAME test_broken_app_static COMMAND test_broken_app_static)
+endif()
