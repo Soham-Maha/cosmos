@@ -14,6 +14,7 @@
 #include "cosmos/simulator.hpp"
 
 #include <algorithm>
+#include <bitset>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -69,6 +70,34 @@ struct Finding {
     std::string ledger; // rendered ledger of the first universe that failed this id
 };
 
+// Why a site the configuration armed was never exercised (§11.4). Never a finding: a finding is a
+// violated assertion, and vacuity is a fact about the configuration, not about the application.
+enum class VacuityReason : uint8_t { NeverActivated, NeverReached, NeverFired };
+
+// Stable tokens, so a dashboard can key on a reason without parsing prose.
+constexpr const char* name_of(VacuityReason reason) {
+    switch (reason) {
+    case VacuityReason::NeverActivated:
+        return "never_activated";
+    case VacuityReason::NeverReached:
+        return "never_reached";
+    case VacuityReason::NeverFired:
+        return "never_fired";
+    }
+    return "?";
+}
+
+// One site the campaign never exercised, with the counters that say which way it never happened.
+struct VacuousSite {
+    SiteId site = SiteId::malloc;
+    uint64_t activated_runs = 0;
+    uint64_t eligible_calls = 0;
+    uint64_t injections = 0;
+    VacuityReason reason = VacuityReason::NeverActivated;
+
+    constexpr bool operator==(const VacuousSite&) const = default;
+};
+
 struct CampaignReport {
     uint64_t runs = 0;
     uint64_t failed_runs = 0;
@@ -79,6 +108,12 @@ struct CampaignReport {
     std::vector<std::string> never_hit; // ids no universe reported as hit, kept apart from findings
     SiteCounterMap eligible_calls{};
     SiteCounterMap injections{};
+    // Per site: universes whose configuration armed it. Without this, eligible_calls == 0 cannot
+    // tell "nothing armed it" from "armed, and the workload never got there" (§11.4).
+    SiteCounterMap activated_runs{};
+    // Sites no universe exercised, ascending slot order, wrapper sites only (event sites are inert
+    // until P6 and judging them here would invent vacuity).
+    std::vector<VacuousSite> vacuous;
     uint64_t out_of_scope_assertions = 0;
 
     // Echoed from the config so a report prints its own repro line without the caller's help.
@@ -174,6 +209,7 @@ class CampaignAccumulator {
         for (size_t slot = 0; slot < kSiteCount; ++slot) {
             report_.eligible_calls[slot] += universe.eligible_calls[slot];
             report_.injections[slot] += universe.injections[slot];
+            report_.activated_runs[slot] += universe.activated_sites.test(slot) ? 1 : 0;
         }
         report_.out_of_scope_assertions += outcome.out_of_scope;
     }
@@ -197,6 +233,23 @@ class CampaignAccumulator {
         }
         for (const auto& [id, hit] : covered_) {
             if (!hit) report.never_hit.push_back(id);
+        }
+        for (size_t slot = 0; slot < kWrapperSiteCount; ++slot) {
+            VacuousSite site;
+            site.site = site_at_slot(slot);
+            site.activated_runs = report.activated_runs[slot];
+            site.eligible_calls = report.eligible_calls[slot];
+            site.injections = report.injections[slot];
+            if (site.activated_runs == 0) {
+                site.reason = VacuityReason::NeverActivated;
+            } else if (site.eligible_calls == 0) {
+                site.reason = VacuityReason::NeverReached;
+            } else if (site.injections == 0) {
+                site.reason = VacuityReason::NeverFired;
+            } else {
+                continue; // reached and fired: the site did work
+            }
+            report.vacuous.push_back(site);
         }
         return report;
     }
@@ -261,6 +314,8 @@ inline std::string serialize_outcome(const UniverseOutcome& outcome) {
         put_field(bytes, count);
     for (uint64_t count : report.injections)
         put_field(bytes, count);
+    // kSiteCount == 17, so the activation set fits one field.
+    put_field(bytes, static_cast<uint64_t>(report.activated_sites.to_ullong()));
     put_field(bytes, static_cast<uint64_t>(report.active_allocations));
     put_text(bytes, report.ledger_dump);
     return bytes;
@@ -305,6 +360,9 @@ class OutcomeReader {
         for (uint64_t& value : parsed.report.injections) {
             if (!take(value)) return false;
         }
+        uint64_t activation_mask = 0;
+        if (!take(activation_mask)) return false;
+        parsed.report.activated_sites = std::bitset<kSiteCount>(activation_mask);
         if (!take(parsed.report.active_allocations)) return false;
         if (!take_text(parsed.report.ledger_dump)) return false;
 
@@ -440,7 +498,22 @@ inline CampaignReport refused_report(const CampaignConfig& config, const char* d
     return report;
 }
 
-// §17.4's shape, plus the repro line §15 promises. Findings and never_hit print in id order.
+// §11.4's sentence for one site: which way the campaign failed to exercise it.
+inline std::string vacuity_detail(const VacuousSite& site) {
+    switch (site.reason) {
+    case VacuityReason::NeverActivated:
+        return "never activated";
+    case VacuityReason::NeverReached:
+        return "activated in " + std::to_string(site.activated_runs) + " universes, never reached";
+    case VacuityReason::NeverFired:
+        return "activated in " + std::to_string(site.activated_runs) + " universes, reached " +
+               std::to_string(site.eligible_calls) + " eligible calls, never fired";
+    }
+    return "?";
+}
+
+// §17.4's shape, plus the repro line §15 promises. Findings, never_hit and the sites nothing
+// exercised print in a fixed order, all three as separate sections.
 inline void print_campaign_report(std::ostream& out, const CampaignReport& report) {
     if (report.refused) {
         out << "REFUSED (" << report.runs << " universes run)\n";
@@ -466,6 +539,10 @@ inline void print_campaign_report(std::ostream& out, const CampaignReport& repor
     }
     for (const std::string& id : report.never_hit) {
         out << "NEVER HIT: \"" << id << "\"\n";
+    }
+    for (const VacuousSite& site : report.vacuous) {
+        out << "NOT EXERCISED: \"" << name_of(site.site) << "\"  (" << vacuity_detail(site)
+            << ")\n";
     }
     if (report.out_of_scope_assertions > 0) {
         out << "OUT OF SCOPE: " << report.out_of_scope_assertions
@@ -508,13 +585,15 @@ inline void json_escape(std::ostream& out, const std::string& text) {
     out << '"';
 }
 
-// Paired rather than two flat maps: a site's eligible count means little without its fire count.
+// A site's counts only mean something together: activated but never reached is §11.4's vacuity,
+// reached but never fired is a rate that never got its chance.
 inline void json_sites(std::ostream& out, const CampaignReport& report) {
     out << "  \"sites\": {";
     for (size_t slot = 0; slot < kSiteCount; ++slot) {
         if (slot != 0) out << ", ";
         out << '"' << name_of(site_at_slot(slot))
-            << "\": {\"eligible\": " << report.eligible_calls[slot]
+            << "\": {\"activated\": " << report.activated_runs[slot]
+            << ", \"eligible\": " << report.eligible_calls[slot]
             << ", \"fired\": " << report.injections[slot] << '}';
     }
     out << "},\n";
@@ -553,6 +632,19 @@ inline void print_campaign_json(std::ostream& out, const CampaignReport& report)
         detail::json_escape(out, report.never_hit[i]);
     }
     out << (report.never_hit.empty() ? "],\n" : "\n  ],\n");
+
+    // Its own group, never a flag on a finding: the Antithesis note under plan §P4 is explicit that
+    // "properties that trivially failed by never being reached" are reported apart from failures.
+    out << "  \"vacuous\": [";
+    for (size_t i = 0; i < report.vacuous.size(); ++i) {
+        const VacuousSite& site = report.vacuous[i];
+        out << (i == 0 ? "\n    " : ",\n    ");
+        out << "{\"site\": \"" << name_of(site.site) << "\", \"reason\": \"" << name_of(site.reason)
+            << "\", \"activated_runs\": " << site.activated_runs
+            << ", \"eligible\": " << site.eligible_calls << ", \"fired\": " << site.injections
+            << '}';
+    }
+    out << (report.vacuous.empty() ? "],\n" : "\n  ],\n");
 
     detail::json_sites(out, report);
     out << "  \"out_of_scope_assertions\": " << report.out_of_scope_assertions << "\n";

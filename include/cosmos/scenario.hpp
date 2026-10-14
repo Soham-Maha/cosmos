@@ -52,6 +52,9 @@ struct ScenarioReport {
     // and the campaign must not have to reach back into a finished universe's injector.
     SiteCounterMap eligible_calls{};
     SiteCounterMap injections{};
+    // What this universe's configuration armed, so a campaign can tell "never activated" from
+    // "activated everywhere and the workload never called it".
+    SiteActivationSet activated_sites{};
     // Snapshotted rather than read live: an oracle reading the count inside check()'s CurrentGuard
     // would include its own allocations wherever operator new reaches the wrappers.
     size_t active_allocations = 0;
@@ -149,6 +152,7 @@ class Scenario {
                     report_.eligible_calls[slot] = injector->eligible_calls(site);
                     report_.injections[slot] = injector->injections(site);
                 }
+                report_.activated_sites = injector->config().activated_sites;
             }
         }
         // Outside the guard so the detail string cannot become a tracked block

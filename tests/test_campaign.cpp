@@ -85,6 +85,25 @@ cosmos::FaultPlan oom_rate(double rate) {
     return plan;
 }
 
+// Armed and eligible, and unable to fire: the counters then describe reach, not luck.
+cosmos::FaultPlan armed_silent_malloc() {
+    cosmos::FaultPlan plan;
+    plan.enable_class(cosmos::FaultClass::Memory);
+    must(plan.activate_site(cosmos::SiteId::malloc));
+    cosmos::FaultRule rule;
+    rule.rate = 0.0;
+    must(rule.outcomes.add(cosmos::FaultKind::OutOfMemory, 1.0));
+    must(plan.set_rule(cosmos::SiteId::malloc, std::move(rule)));
+    return plan;
+}
+
+const cosmos::VacuousSite* find_vacuous(const cosmos::CampaignReport& report, cosmos::SiteId site) {
+    for (const cosmos::VacuousSite& entry : report.vacuous) {
+        if (entry.site == site) return &entry;
+    }
+    return nullptr;
+}
+
 // One universe's result: its report, plus the capacity the application actually saw.
 struct CacheRun {
     cosmos::ScenarioReport report{};
@@ -380,7 +399,9 @@ bool same_findings(const cosmos::CampaignReport& first, const cosmos::CampaignRe
     }
     if (first.never_hit != second.never_hit) return false;
     if (first.eligible_calls != second.eligible_calls) return false;
-    return first.injections == second.injections;
+    if (first.injections != second.injections) return false;
+    if (first.activated_runs != second.activated_runs) return false;
+    return first.vacuous == second.vacuous;
 }
 
 void test_parallel_and_sequential_agree_exactly() {
@@ -425,6 +446,104 @@ void test_crashing_universe_fails_only_itself(unsigned parallel) {
               << std::endl;
 }
 
+// §11.4: the counters must be able to say "the configuration armed this site and nothing ever
+// reached it", which is not the same fact as "nothing armed it".
+void test_the_report_names_sites_the_campaign_never_reached() {
+    cosmos::CampaignConfig config;
+    config.trials = 4;
+    config.base_seed = kBaseSeed;
+    config.parallel = 1;
+
+    const cosmos::CampaignReport report =
+        cosmos::Campaign::run(config, [](cosmos::Simulator& sim, uint64_t) {
+            auto scenario = cosmos::Scenario::on(sim, armed_silent_malloc());
+            must(scenario.has_value());
+            scenario->run([] {}); // allocates nothing, so every Memory site stays unreached
+            scenario->quiesce();
+            scenario->check("always-holds", [] { return true; });
+            return scenario->report();
+        });
+
+    const size_t malloc_slot = cosmos::site_slot(cosmos::SiteId::malloc);
+    must(report.activated_runs[malloc_slot] == 4);
+    must(report.eligible_calls[malloc_slot] == 0);
+
+    const cosmos::VacuousSite* armed = find_vacuous(report, cosmos::SiteId::malloc);
+    must(armed != nullptr);
+    must(armed->reason == cosmos::VacuityReason::NeverReached);
+    must(armed->activated_runs == 4);
+
+    const cosmos::VacuousSite* unarmed = find_vacuous(report, cosmos::SiteId::fsync);
+    must(unarmed != nullptr);
+    must(unarmed->reason == cosmos::VacuityReason::NeverActivated);
+    must(unarmed->activated_runs == 0);
+
+    // Event sites are inert until episodes exist (P6), so the guard does not judge them yet.
+    must(find_vacuous(report, cosmos::SiteId::crash_node) == nullptr);
+
+    std::ostringstream text;
+    cosmos::print_campaign_report(text, report);
+    must(text.str().find("NOT EXERCISED: \"malloc\"  (activated in 4 universes, never reached)") !=
+         std::string::npos);
+    std::ostringstream json;
+    cosmos::print_campaign_json(json, report);
+    must(json.str().find("\"vacuous\": [") != std::string::npos);
+    must(json.str().find("\"reason\": \"never_reached\"") != std::string::npos);
+    must(json.str().find("\"reason\": \"never_activated\"") != std::string::npos);
+
+    // Vacuity is a separate group: it is a fact about the configuration, not a violated assertion.
+    must(report.findings.empty());
+    must(report.failed_runs == 0);
+
+    std::cout << "[PASS] test_the_report_names_sites_the_campaign_never_reached" << std::endl;
+}
+
+// The sad path §11.4 is written for: the fault is armed and reached, its rate is so low that
+// nothing fires, and the campaign would otherwise be a green run that tested nothing.
+void test_a_vacuous_campaign_is_flagged_by_its_counters() {
+    cosmos::CampaignConfig config;
+    config.trials = 4;
+    config.base_seed = kBaseSeed;
+    config.parallel = 1;
+
+    const cosmos::CampaignReport report =
+        cosmos::Campaign::run(config, [](cosmos::Simulator& sim, uint64_t) {
+            auto scenario = cosmos::Scenario::on(sim, oom_rate(1e-6));
+            must(scenario.has_value());
+            scenario->run([] {
+                void* block = std::malloc(16); // one eligible allocation per universe
+                std::free(block);
+            });
+            scenario->quiesce();
+            scenario->check("always-holds", [] { return true; });
+            // §11.4's recommended idiom, now one call: prove the class actually fired.
+            scenario->note_covered("memory-class-fired",
+                                   cosmos::fault_was_injected(scenario->report().injections,
+                                                              cosmos::FaultClass::Memory));
+            return scenario->report();
+        });
+
+    const size_t malloc_slot = cosmos::site_slot(cosmos::SiteId::malloc);
+    must(report.eligible_calls[malloc_slot] > 0);
+    must(report.injections[malloc_slot] == 0);
+
+    const cosmos::VacuousSite* entry = find_vacuous(report, cosmos::SiteId::malloc);
+    must(entry != nullptr);
+    must(entry->reason == cosmos::VacuityReason::NeverFired);
+    must(entry->eligible_calls == report.eligible_calls[malloc_slot]);
+
+    // The counters say it, the coverage note makes it a verdict, and neither is a finding.
+    must(report.findings.empty());
+    must(report.failed_runs == 0);
+    must(lists_never_hit(report, "memory-class-fired"));
+
+    std::ostringstream text;
+    cosmos::print_campaign_report(text, report);
+    must(text.str().find("never fired") != std::string::npos);
+
+    std::cout << "[PASS] test_a_vacuous_campaign_is_flagged_by_its_counters" << std::endl;
+}
+
 // The phase gate's 10k-seed campaign, and the only test that drives the worker channel at scale.
 void test_a_ten_thousand_universe_swarm_campaign_completes() {
     cosmos::CampaignConfig config;
@@ -444,6 +563,13 @@ void test_a_ten_thousand_universe_swarm_campaign_completes() {
     must(report.eligible_calls[cosmos::site_slot(cosmos::SiteId::malloc)] > 0);
     must(report.injections[cosmos::site_slot(cosmos::SiteId::malloc)] > 0);
     must(!lists_never_hit(report, "any-fault-fired"));
+    // The guard, read off a real campaign: Memory did work, so it is not vacuous; the sites the
+    // cache fixture never touches are, and saying so is the report's job.
+    must(find_vacuous(report, cosmos::SiteId::malloc) == nullptr);
+    const cosmos::VacuousSite* storage = find_vacuous(report, cosmos::SiteId::fsync);
+    must(storage != nullptr);
+    must(storage->reason == cosmos::VacuityReason::NeverReached);
+    must(report.activated_runs[cosmos::site_slot(cosmos::SiteId::fsync)] > 0);
 
     std::cout << "[PASS] test_a_ten_thousand_universe_swarm_campaign_completes" << std::endl;
 }
@@ -482,6 +608,8 @@ int main() {
     test_parallel_and_sequential_agree_exactly();
     test_crashing_universe_fails_only_itself(1);
     test_crashing_universe_fails_only_itself(4);
+    test_the_report_names_sites_the_campaign_never_reached();
+    test_a_vacuous_campaign_is_flagged_by_its_counters();
     test_a_ten_thousand_universe_swarm_campaign_completes();
     test_a_sampled_knob_reaches_the_application();
     std::cout << "All campaign tests passed successfully!" << std::endl;

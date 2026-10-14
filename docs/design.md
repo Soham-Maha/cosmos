@@ -347,7 +347,8 @@ struct CampaignReport {
     bool     refused;             // the harness declined to run; findings hold the reason
     std::vector<Finding>     findings;   // sorted by id, so parallel == sequential exactly
     std::vector<std::string> never_hit;  // its own section, never a flag on a finding
-    SiteCounterMap eligible_calls, injections;
+    SiteCounterMap activated_runs, eligible_calls, injections;  // per site, summed over universes
+    std::vector<VacuousSite> vacuous;    // §11.4: sites nothing exercised, with the reason
     uint64_t out_of_scope_assertions;
     uint64_t base_seed;
     std::string program;
@@ -360,8 +361,11 @@ public:
 ```
 
 `print_campaign_report` renders §17.4's shape plus the repro line; `print_campaign_json` emits the
-machine-readable form the P4 exit gate asks for — findings, `never_hit` kept apart, per-site
-counters and repro seeds — so a dashboard consumes the report rather than being a feature to build.
+machine-readable form the P4 exit gate asks for — findings, `never_hit` in its own group, the
+`vacuous` sites in another, per-site `activated`/`eligible`/`fired` counters and repro seeds — so a
+dashboard consumes the report rather than being a feature to build. Whether a configuration did any
+work is answered by the counters, not by reading a log: `fault_was_injected(report.injections,
+FaultClass::Storage)` for the class-level question, and `report.vacuous` for the site-level one.
 
 **`verify` is refused, not ignored.** It names a double-run FNV-1a trace-hash check that needs the
 decision trace (§11.2), which lands with P5. Until then `run` returns immediately with a

@@ -152,6 +152,20 @@ constexpr FaultClass class_of(SiteId site) {
     return FaultClass::_Count;
 }
 
+// Sums one class's counters. A universe report and a campaign report hold the same map, so §11.4's
+// "did this class fire?" is one function rather than a slot loop at each call site.
+inline uint64_t injections_for(const SiteCounterMap& injections, FaultClass fault_class) {
+    uint64_t total = 0;
+    for (size_t slot = 0; slot < kSiteCount; ++slot) {
+        if (class_of(site_at_slot(slot)) == fault_class) total += injections[slot];
+    }
+    return total;
+}
+
+inline bool fault_was_injected(const SiteCounterMap& injections, FaultClass fault_class) {
+    return injections_for(injections, fault_class) > 0;
+}
+
 // The wrapper, never the injector, maps a kind to a legal result for its API (§8.2). Append-only.
 enum class FaultKind : uint8_t {
     None = 0,

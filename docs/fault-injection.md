@@ -683,6 +683,28 @@ Records are hashed in trace order (`seq` ascending), each field appended in that
 
 If a configured fault rate is `0.001` and a run reaches only 200 eligible sites, most runs inject nothing at all and the test is silently vacuous. A campaign-level coverage check such as `sometimes(fault_was_injected(FaultClass::Storage), "storage fault path exercised")` proves the configuration is genuinely doing work — and it is backed by the per-site counters of §11.1, not by manual log inspection. This is Antithesis's primary recommended use for `sometimes`.
 
+**The campaign report carries the same guarantee as data.** `CampaignReport::vacuous` names every
+wrapper site no universe exercised, with the counters that say which way it never happened:
+
+| `reason` | counters | what it means |
+|---|---|---|
+| `never_activated` | `activated_runs == 0` | the configuration never armed the site |
+| `never_reached` | armed, `eligible_calls == 0` | the config asked for it and the workload never got there |
+| `never_fired` | reached, `injections == 0` | the rate was too low for the workload's depth |
+
+Per-site `activated_runs`, `eligible_calls` and `injections` travel with it, so a report says
+"activated in 400 universes, reached 0" rather than leaving three numbers to be compared by hand.
+
+It is a **separate group, never a finding**: a finding's identity is the assertion id (that is the
+dedup key), and vacuity is a fact about the configuration rather than a violated application
+property, so it must not enter `findings` or `failed_runs`. In the text report it prints after the
+`NEVER HIT` lines as `NOT EXERCISED: "<site>"  (<reason>)`; in `campaign.json` it is its own
+`"vacuous"` array, so a dashboard keys on the reason token. Event sites stay outside the guard until
+episodes exist (F6): their activation is inert before then, and judging it would invent vacuity.
+
+`fault_was_injected(injections, FaultClass)` is the one call the idiom above needs, for a universe's
+counters or a whole campaign's — both hold the same `SiteCounterMap`.
+
 ---
 
 ## 12. Public API Reference
