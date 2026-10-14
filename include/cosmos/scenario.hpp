@@ -6,10 +6,12 @@
 #include "cosmos/simulator.hpp"
 #include <concepts>
 #include <cstdint>
+#include <cstdlib>
 #include <expected>
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <span>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -312,6 +314,37 @@ struct RunSpec {
     uint32_t node_count = 1;
     std::string check_id = "oracle";
 };
+
+// What an environment variable held before delivery, so it can be put back.
+struct SavedEnv {
+    std::string name;
+    std::string value;
+    bool existed = false;
+};
+
+// Knob delivery (§4.3): set each declared knob in the environment, run the body, put back what was
+// there. Call before the universe becomes current: setenv allocates, and that allocation would be
+// counted as the application's own.
+template <typename Body>
+void with_knob_env(const FaultConfig& config, std::span<const KnobSpec> specs, Body&& body) {
+    std::vector<SavedEnv> saved;
+    for (const KnobSpec& spec : specs) {
+        const auto value = spec.env != nullptr ? config.knob_value(spec.id) : std::nullopt;
+        if (!value) continue;
+        const char* previous = std::getenv(spec.env);
+        saved.push_back(
+            SavedEnv{spec.env, previous != nullptr ? previous : "", previous != nullptr});
+        setenv(spec.env, std::to_string(*value).c_str(), 1);
+    }
+    body();
+    for (const SavedEnv& entry : saved) {
+        if (entry.existed) {
+            setenv(entry.name.c_str(), entry.value.c_str(), 1);
+        } else {
+            unsetenv(entry.name.c_str());
+        }
+    }
+}
 
 // fail_on_call is the K-th *eligible* call at SiteId::malloc (§10), counting every allocation that
 // reaches the wrapped symbol. Which ones do is linkage-dependent: under the default shared

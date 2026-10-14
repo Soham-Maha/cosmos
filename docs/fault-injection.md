@@ -759,6 +759,25 @@ using NodeId            = uint32_t;
 using NodeSet           = std::vector<NodeId>;
 using EpisodeId         = uint64_t;
 using KnobId            = uint64_t;   // named per app tunable; append-only, like SiteId
+
+/// A sampled tuning value (§4.3). The id names the tunable; only the harness knows what it means.
+struct Knob { KnobId id; int64_t value; };
+
+/// How a knob's value spreads over its legal range: a timeout wants Logarithmic (every order of
+/// magnitude equally likely), a retry budget wants Linear.
+enum class KnobScale : uint8_t { Linear, Logarithmic };
+
+/// A tunable the harness lets the sampler choose (§4.3). The legal range is application knowledge —
+/// the engine cannot invent it — and `env` is the name the application reads the value from
+/// (harness-mediated delivery). A knob that is not declared here is never sampled.
+struct KnobSpec {
+    KnobId      id;
+    int64_t     low;
+    int64_t     high;
+    KnobScale   scale;   // Logarithmic requires low > 0
+    const char* env;     // nullptr: this harness delivers the value some other way
+};
+
 /// Every site occupies a pinned slot: wrapper sites fill [0, kWrapperSiteCount), event sites
 /// follow. site_slot() is written out rather than derived from the enum value, so retiring a site
 /// never shifts the slots after it (Rule 13). Slot order — not hash order — is what the swarm
@@ -843,11 +862,25 @@ struct FaultConfig {
     Time warmup_until  = Time::zero();
     Time quiesce_after = Time::max();
 
-    /// Level 1 swarm sampler. Draws from the dedicated `Swarm` stream, using a
-    /// fixed class-indexed draw schedule that covers disabled classes too
-    /// (§6.4), so the swarm dimensions stay independent.
+    /// Level 1 swarm sampler. Draws from the dedicated `Swarm` stream with one sub-stream per fault
+    /// class and one per knob position, so no dimension can shift another (§6.4, Rule 8).
+    /// The ranges are the sampler's, not the caller's: class enable and site activation 0.5, rule
+    /// rates log-uniform in [1e-5, 1e-2], outcome weights log-uniform in [1e-2, 1], rule magnitudes
+    /// log-uniform in [1us, 10ms].
     /// Postcondition: validate() passes.
+    ///
+    /// `sample(rng)` samples no knobs — an application that declares none. The `knobs` overload
+    /// samples the declared menu. `sample_with` takes the class enable bits instead of drawing
+    /// them: Rule 8's direct test needs to flip one class and prove nothing else moved, and this is
+    /// the only input that can.
     static FaultConfig sample(Rng& swarm_rng);
+    static FaultConfig sample(Rng& swarm_rng, std::span<const KnobSpec> knobs);
+    static FaultConfig sample_with(Rng& swarm_rng, std::bitset<kFaultClassCount> enabled,
+                                   std::span<const KnobSpec> knobs = {});
+
+    /// The sampled value of one knob, or nullopt when this universe did not sample it. A scan:
+    /// `knobs` is strictly ascending.
+    std::optional<int64_t> knob_value(KnobId id) const;
 
     /// Rejects configs that would silently misbehave:
     ///   - every rule rate must be finite and in [0, 1];

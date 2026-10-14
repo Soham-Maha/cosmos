@@ -8,6 +8,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -84,33 +85,84 @@ cosmos::FaultPlan oom_rate(double rate) {
     return plan;
 }
 
-// §17.2's scenario, shaped for a campaign: the universe comes in, the report goes out. The rates
-// are fixed here because FaultConfig::sample() is P4-S2; only the universe seed varies, which is
-// exactly what the repro identity needs.
-cosmos::ScenarioReport run_cache_universe(cosmos::Simulator& sim, uint64_t) {
+// One universe's result: its report, plus the capacity the application actually saw.
+struct CacheRun {
+    cosmos::ScenarioReport report{};
+    size_t observed_capacity = 0;
+};
+
+void put_every_key(const Keys& keys, Fixture& fixture) {
+    fixture.cache = cache_create();
+    if (fixture.cache == nullptr) return;
+    for (int i = 0; i < kKeys; ++i) {
+        fixture.put_ok[i] = cache_put(fixture.cache, keys.key[i], keys.value[i]) == CACHE_OK;
+    }
+}
+
+// §17.2's scenario, shaped for a campaign: the universe comes in, the report goes out. Every cache
+// campaign shape shares it, so the oracle and the counters stay comparable across tests.
+CacheRun run_cache_once(cosmos::Simulator& sim, cosmos::FaultPlan plan,
+                        int64_t expected_low = CACHE_CAPACITY,
+                        int64_t expected_high = CACHE_CAPACITY) {
     static const Keys keys;
     Fixture fixture;
 
-    auto scenario = cosmos::Scenario::on(sim, oom_rate(kOomRate));
+    auto scenario = cosmos::Scenario::on(sim, std::move(plan));
     must(scenario.has_value());
 
-    scenario->run([&] {
-        fixture.cache = cache_create();
-        if (fixture.cache == nullptr) return;
-        for (int i = 0; i < kKeys; ++i) {
-            fixture.put_ok[i] = cache_put(fixture.cache, keys.key[i], keys.value[i]) == CACHE_OK;
-        }
-    });
+    scenario->run([&] { put_every_key(keys, fixture); });
     scenario->quiesce();
+    const size_t observed = fixture.cache != nullptr ? cache_capacity(fixture.cache) : 0;
     scenario->check(
         "no-acknowledged-key-lost", [&] { return every_acknowledged_key_survived(keys, fixture); },
         "cache_put reported success for every key");
-    scenario->note_covered(
-        "oom-path-exercised",
-        scenario->report().injections[cosmos::site_slot(cosmos::SiteId::malloc)] > 0);
+    // §4.3's delivery contract: what the application saw is what the harness handed it. A universe
+    // whose cache never allocated has nothing to say about the capacity it was given.
+    scenario->check(
+        "knob-was-delivered",
+        [&] {
+            return fixture.cache == nullptr || (observed >= static_cast<size_t>(expected_low) &&
+                                                observed <= static_cast<size_t>(expected_high));
+        },
+        "capacity=" + std::to_string(observed));
 
-    cosmos::ScenarioReport report = scenario->report();
+    size_t fires = 0;
+    for (size_t slot = 0; slot < cosmos::kSiteCount; ++slot) {
+        fires += scenario->report().injections[slot];
+    }
+    scenario->note_covered("any-fault-fired", fires > 0);
+    // §11.4: the campaign can see the rare path being reached rather than inferring it.
+    scenario->note_covered("capacity-below-default", observed < CACHE_CAPACITY);
+
+    CacheRun run;
+    run.observed_capacity = observed;
+    run.report = scenario->report();
     fixture.release();
+    return run;
+}
+
+// The fixed-rate shape: only the universe seed varies, which is what the repro identity needs.
+cosmos::ScenarioReport run_cache_universe(cosmos::Simulator& sim, uint64_t) {
+    return run_cache_once(sim, oom_rate(kOomRate)).report;
+}
+
+// §17.3's shape: one sampled config per universe seed (P4-S2).
+cosmos::ScenarioReport run_swarm_universe(cosmos::Simulator& sim, uint64_t) {
+    return run_cache_once(sim, cosmos::FaultConfig::sample(sim.swarm_rng())).report;
+}
+
+// The capacity is the fixture's tunable, so the knob's declared range is the fixture's limit.
+constexpr cosmos::KnobSpec kCapacityKnob{1, 1, CACHE_CAPACITY, cosmos::KnobScale::Logarithmic,
+                                         CACHE_CAPACITY_ENV};
+const cosmos::KnobSpec kKnobSpecs[] = {kCapacityKnob};
+
+// Sampled config plus a sampled knob, delivered to the application through the environment.
+cosmos::ScenarioReport run_knob_universe(cosmos::Simulator& sim, uint64_t) {
+    const cosmos::FaultConfig plan = cosmos::FaultConfig::sample(sim.swarm_rng(), kKnobSpecs);
+    cosmos::ScenarioReport report;
+    cosmos::with_knob_env(plan, kKnobSpecs, [&] {
+        report = run_cache_once(sim, plan, kCapacityKnob.low, kCapacityKnob.high).report;
+    });
     return report;
 }
 
@@ -373,6 +425,49 @@ void test_crashing_universe_fails_only_itself(unsigned parallel) {
               << std::endl;
 }
 
+// The phase gate's 10k-seed campaign, and the only test that drives the worker channel at scale.
+void test_a_ten_thousand_universe_swarm_campaign_completes() {
+    cosmos::CampaignConfig config;
+    config.trials = 10000;
+    config.base_seed = kBaseSeed;
+    config.parallel = 4;
+    config.program = "test_campaign";
+
+    const cosmos::CampaignReport report = cosmos::Campaign::run(config, run_swarm_universe);
+
+    must(report.runs == 10000);
+    must(report.crashed_runs == 0);
+    must(report.failed_runs > 0);
+    // One assertion, one finding: the harness's own verdicts stay out of the findings list.
+    must(report.findings.size() == 1);
+    must(report.findings[0].id == "no-acknowledged-key-lost");
+    must(report.eligible_calls[cosmos::site_slot(cosmos::SiteId::malloc)] > 0);
+    must(report.injections[cosmos::site_slot(cosmos::SiteId::malloc)] > 0);
+    must(!lists_never_hit(report, "any-fault-fired"));
+
+    std::cout << "[PASS] test_a_ten_thousand_universe_swarm_campaign_completes" << std::endl;
+}
+
+// §4.3 end to end: the sampled knob reaches the application, varies across universes, and the
+// environment is put back afterwards.
+void test_a_sampled_knob_reaches_the_application() {
+    cosmos::CampaignConfig config;
+    config.trials = 200;
+    config.base_seed = kBaseSeed;
+    config.parallel = 1;
+    config.program = "test_campaign";
+
+    const cosmos::CampaignReport report = cosmos::Campaign::run(config, run_knob_universe);
+
+    must(report.runs == 200);
+    must(find_finding(report, "knob-was-delivered") == nullptr);
+    // The extreme end of the declared range was delivered at least once.
+    must(!lists_never_hit(report, "capacity-below-default"));
+    must(std::getenv(CACHE_CAPACITY_ENV) == nullptr);
+
+    std::cout << "[PASS] test_a_sampled_knob_reaches_the_application" << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -387,6 +482,8 @@ int main() {
     test_parallel_and_sequential_agree_exactly();
     test_crashing_universe_fails_only_itself(1);
     test_crashing_universe_fails_only_itself(4);
+    test_a_ten_thousand_universe_swarm_campaign_completes();
+    test_a_sampled_knob_reaches_the_application();
     std::cout << "All campaign tests passed successfully!" << std::endl;
     return 0;
 }

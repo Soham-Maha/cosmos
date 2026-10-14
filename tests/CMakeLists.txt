@@ -64,6 +64,24 @@ add_executable(test_faults test_faults.cpp)
 target_link_libraries(test_faults PRIVATE cosmos)
 add_test(NAME test_faults COMMAND test_faults)
 
+add_executable(test_swarm test_swarm.cpp)
+target_link_libraries(test_swarm PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # Touches Simulator, whose scheduler allocates, so the memory family must be wrapped.
+    target_compile_options(test_swarm PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+    )
+    target_link_options(test_swarm PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+    )
+endif()
+
+add_test(NAME test_swarm COMMAND test_swarm)
+
 add_executable(test_faultinjection_phase1_gate test_faultinjection_phase1_gate.cpp)
 target_link_libraries(test_faultinjection_phase1_gate PRIVATE cosmos)
 add_test(NAME test_faultinjection_phase1_gate COMMAND test_faultinjection_phase1_gate)

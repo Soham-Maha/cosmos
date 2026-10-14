@@ -17,6 +17,10 @@
 #define CACHE_KEY_MAX 24
 #define CACHE_VALUE_MAX 32
 
+/* Environment variable a harness may use to hand the application an extreme-but-legal capacity
+   (a knob fault, docs/fault-injection.md §4.3). Unset, malformed, or out of range means 64. */
+#define CACHE_CAPACITY_ENV "COSMOS_CACHE_CAPACITY"
+
 #define CACHE_OK 0
 #define CACHE_FULL (-1)
 #define CACHE_NO_MEMORY (-2)
@@ -38,6 +42,9 @@ int cache_put(Cache* cache, const char* key, const char* value);
 const char* cache_get(const Cache* cache, const char* key);
 
 size_t cache_size(const Cache* cache);
+
+/* The capacity this cache was created with, so a harness can see the knob it delivered. */
+size_t cache_capacity(const Cache* cache);
 
 #ifdef __cplusplus
 }

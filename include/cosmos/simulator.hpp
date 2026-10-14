@@ -29,6 +29,7 @@ template <typename Injector> class BasicSimulator {
   public:
     explicit BasicSimulator(uint64_t seed = kDefaultUniverseSeed)
         : seed_(seed), user_rng_(stream_seed(seed, StreamDomain::User)),
+          swarm_rng_(stream_seed(seed, StreamDomain::Swarm)),
           scheduler_(stream_seed(seed, StreamDomain::Schedule), clock_), net_(scheduler_, clock_) {}
 
     ~BasicSimulator() {
@@ -85,6 +86,10 @@ template <typename Injector> class BasicSimulator {
     Rng& user_rng() { return user_rng_; }
     const Rng& user_rng() const { return user_rng_; }
 
+    // Universe config sampling (Rule 1: the Fault domain is untouched by it).
+    Rng& swarm_rng() { return swarm_rng_; }
+    const Rng& swarm_rng() const { return swarm_rng_; }
+
     bool has_injector() const { return injector_.has_value(); }
 
     // Returns nullptr when the slot is empty. A pointer rather than a checked reference because
@@ -114,6 +119,7 @@ template <typename Injector> class BasicSimulator {
     uint64_t seed_;
     TrackedHeap heap_{};
     Rng user_rng_;
+    Rng swarm_rng_;
     VirtualClock clock_{};
     // After clock_: borrows it for timer wakeups. Before injector_: both borrow
     // the clock and destruction is reverse order.

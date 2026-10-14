@@ -214,6 +214,15 @@ cfg.set_rule(SiteId::malloc, oom);
 sim.install_faults(std::move(cfg));
 ```
 
+**Swarm sampling (P4).** A campaign does not hand-write that config per universe; it samples one:
+`FaultConfig::sample(sim.swarm_rng())` — or `sample(sim.swarm_rng(), knob_specs)` when the application
+declares tunables — draws which classes are enabled, which sites are activated, each rule's rate,
+weights and magnitude, and the knob values from the universe's `Swarm` stream (`docs/fault-injection.md`
+§6.4). Class and site dimensions that are off are still drawn, on their own sub-streams, so toggling
+one class cannot shift another's rate (Rule 8). Knob delivery is the harness's half of §4.3's
+boundary: `with_knob_env(cfg, specs, body)` sets each declared knob in the environment, runs the body,
+and puts the environment back.
+
 Four composable fault mechanisms:
 1. **Declarative Config**: rates applied automatically via the `fault` RNG stream.
 2. **Imperative Scripting**: `sim.net().partition(...)`, `sim.crash(node)`, `sim.reboot(node)`.
