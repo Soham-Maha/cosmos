@@ -683,6 +683,28 @@ Records are hashed in trace order (`seq` ascending), each field appended in that
 
 If a configured fault rate is `0.001` and a run reaches only 200 eligible sites, most runs inject nothing at all and the test is silently vacuous. A campaign-level coverage check such as `sometimes(fault_was_injected(FaultClass::Storage), "storage fault path exercised")` proves the configuration is genuinely doing work — and it is backed by the per-site counters of §11.1, not by manual log inspection. This is Antithesis's primary recommended use for `sometimes`.
 
+**The campaign report carries the same guarantee as data.** `CampaignReport::vacuous` names every
+wrapper site no universe exercised, with the counters that say which way it never happened:
+
+| `reason` | counters | what it means |
+|---|---|---|
+| `never_activated` | `activated_runs == 0` | the configuration never armed the site |
+| `never_reached` | armed, `eligible_calls == 0` | the config asked for it and the workload never got there |
+| `never_fired` | reached, `injections == 0` | the rate was too low for the workload's depth |
+
+Per-site `activated_runs`, `eligible_calls` and `injections` travel with it, so a report says
+"activated in 400 universes, reached 0" rather than leaving three numbers to be compared by hand.
+
+It is a **separate group, never a finding**: a finding's identity is the assertion id (that is the
+dedup key), and vacuity is a fact about the configuration rather than a violated application
+property, so it must not enter `findings` or `failed_runs`. In the text report it prints after the
+`NEVER HIT` lines as `NOT EXERCISED: "<site>"  (<reason>)`; in `campaign.json` it is its own
+`"vacuous"` array, so a dashboard keys on the reason token. Event sites stay outside the guard until
+episodes exist (F6): their activation is inert before then, and judging it would invent vacuity.
+
+`fault_was_injected(injections, FaultClass)` is the one call the idiom above needs, for a universe's
+counters or a whole campaign's — both hold the same `SiteCounterMap`.
+
 ---
 
 ## 12. Public API Reference
@@ -759,6 +781,25 @@ using NodeId            = uint32_t;
 using NodeSet           = std::vector<NodeId>;
 using EpisodeId         = uint64_t;
 using KnobId            = uint64_t;   // named per app tunable; append-only, like SiteId
+
+/// A sampled tuning value (§4.3). The id names the tunable; only the harness knows what it means.
+struct Knob { KnobId id; int64_t value; };
+
+/// How a knob's value spreads over its legal range: a timeout wants Logarithmic (every order of
+/// magnitude equally likely), a retry budget wants Linear.
+enum class KnobScale : uint8_t { Linear, Logarithmic };
+
+/// A tunable the harness lets the sampler choose (§4.3). The legal range is application knowledge —
+/// the engine cannot invent it — and `env` is the name the application reads the value from
+/// (harness-mediated delivery). A knob that is not declared here is never sampled.
+struct KnobSpec {
+    KnobId      id;
+    int64_t     low;
+    int64_t     high;
+    KnobScale   scale;   // Logarithmic requires low > 0
+    const char* env;     // nullptr: this harness delivers the value some other way
+};
+
 /// Every site occupies a pinned slot: wrapper sites fill [0, kWrapperSiteCount), event sites
 /// follow. site_slot() is written out rather than derived from the enum value, so retiring a site
 /// never shifts the slots after it (Rule 13). Slot order — not hash order — is what the swarm
@@ -843,11 +884,25 @@ struct FaultConfig {
     Time warmup_until  = Time::zero();
     Time quiesce_after = Time::max();
 
-    /// Level 1 swarm sampler. Draws from the dedicated `Swarm` stream, using a
-    /// fixed class-indexed draw schedule that covers disabled classes too
-    /// (§6.4), so the swarm dimensions stay independent.
+    /// Level 1 swarm sampler. Draws from the dedicated `Swarm` stream with one sub-stream per fault
+    /// class and one per knob position, so no dimension can shift another (§6.4, Rule 8).
+    /// The ranges are the sampler's, not the caller's: class enable and site activation 0.5, rule
+    /// rates log-uniform in [1e-5, 1e-2], outcome weights log-uniform in [1e-2, 1], rule magnitudes
+    /// log-uniform in [1us, 10ms].
     /// Postcondition: validate() passes.
+    ///
+    /// `sample(rng)` samples no knobs — an application that declares none. The `knobs` overload
+    /// samples the declared menu. `sample_with` takes the class enable bits instead of drawing
+    /// them: Rule 8's direct test needs to flip one class and prove nothing else moved, and this is
+    /// the only input that can.
     static FaultConfig sample(Rng& swarm_rng);
+    static FaultConfig sample(Rng& swarm_rng, std::span<const KnobSpec> knobs);
+    static FaultConfig sample_with(Rng& swarm_rng, std::bitset<kFaultClassCount> enabled,
+                                   std::span<const KnobSpec> knobs = {});
+
+    /// The sampled value of one knob, or nullopt when this universe did not sample it. A scan:
+    /// `knobs` is strictly ascending.
+    std::optional<int64_t> knob_value(KnobId id) const;
 
     /// Rejects configs that would silently misbehave:
     ///   - every rule rate must be finite and in [0, 1];
@@ -1022,9 +1077,11 @@ heap's `active_allocations` — §11.4's
 vacuous-coverage guard reads counters, so a campaign must not have to reach back into a finished
 universe's injector for them.
 
-> **Stale spelling in §17.** §17.2 and §17.3 write `Scenario scenario{.faults = plan}`. That form
-> cannot coexist with a user-declared constructor or factory, and predates `create()`. Read those
-> two lines as `auto scenario = Scenario::create(seed, plan);`.
+> **Stale spelling in §17.** §17.2 writes `Scenario scenario{.faults = plan}`. That form cannot
+> coexist with a user-declared constructor or factory, and predates `create()`. Read that line as
+> `auto scenario = Scenario::create(seed, plan);`. §17.3's campaign sketch carried the same form and
+> a `void`-returning `build_fn`; both are corrected in place there, and `design.md` §13 now declares
+> the shipped surface.
 
 `cosmos::run` (the §17 teaser) is pure sugar over the pieces above: `cosmos::run({.seed = S, .oom = {.fail_on_call = K}}, workload, oracle)` builds a `FaultConfig` whose only rule is `SiteId::malloc → { outcomes = {OutOfMemory}, fire_on_eligible_call = K }`, runs warmup → workload → quiesce → oracle in one universe, and returns a `ScenarioReport`. On failure the report carries `ledger_dump`, the §11.1 ledger rendered **before** the universe is destroyed — otherwise no caller could ever print it, since the sugar owns the injector and destroys it on return. `print_report` appends the dump when it is present. It exists so the smallest useful test is one expression; anything richer drops down to `Scenario` or `Campaign`. `RunSpec::check_id` names the oracle's check so a failing report is self-describing. The universe is destroyed when `run` returns, so any block the workload hands back outlives its heap and is released through the orphan path — nothing can count those blocks afterwards, which is why a universe-end leak check can never fire for the sugar. `fail_on_call` is an **eligible-call** index at `SiteId::malloc` (§10) and counts every allocation that reaches the wrapped symbol, the harness's own included. It does **not** count what never reaches it, and which allocations do is **linkage-dependent**. Under the default shared-`libstdc++` link, `operator new` — and therefore every `std::` container — is not interposed, because it lives in `libstdc++.so` whose internal `malloc` binding `--wrap` does not rewrite. Under `-static-libstdc++` it is; `tests/CMakeLists.txt` links the scenario suite a second time that way as `test_scenario_static` so both sides are pinned rather than assumed (that target is probed for and skipped on toolchains without a static `libstdc++`, which includes this repository's clang). Do not rely on either behaviour: a test needing an exact eligible count must use the raw allocator, which is why the worked example's fixture allocates into a stack array. The oracle is a bool-returning callable; the teaser's `CHECK(...)` spelling arrives with `assert.hpp` in F4.
 
@@ -1240,7 +1297,7 @@ scenario.note_covered("node-crash-path-exercised", a_process_fault_fired_this_ru
 
 ### 17.3 Step 3 — Run the campaign
 
-The scenario from §17.2 runs once per seed, unchanged — a campaign is just this same harness repeated:
+The scenario from §17.2 runs once per seed, unchanged — a campaign is just this same harness repeated. The two call forms the sketch got wrong are corrected here: a scenario is built by a factory, never by brace-initialising a `faults` member, and `build_fn` returns the universe's report, because a `void` return would leave the findings unreachable.
 
 ```cpp
 CampaignConfig ccfg;
@@ -1248,12 +1305,12 @@ ccfg.trials    = 5000;
 ccfg.base_seed = 1;
 
 CampaignReport report = Campaign::run(ccfg, [&](Simulator& sim, uint64_t universe_index) {
-    Scenario scenario{.faults = FaultConfig::sample(sim.swarm_rng())};
-    run_replicated_kv_scenario(scenario);   // the exact harness from §17.2, one seed at a time
+    auto scenario = Scenario::on(sim, FaultConfig::sample(sim.swarm_rng()));
+    return run_replicated_kv_scenario(*scenario);   // the exact harness from §17.2, one seed at a time
 });
 ```
 
-Each of the 5000 universes gets its own seed (§6.4), its own swarm-sampled rates (§6), and runs the full lifecycle from §9. The user does not watch any of this run — they read `report` afterward:
+Each of the 5000 universes gets its own seed (§6.4), its own swarm-sampled rates (§6), and runs the full lifecycle from §9. `build_fn` runs in a worker process, not in the caller's: that is what turns a crashing universe into a finding instead of a dead campaign, and it means the returned report is the only channel back. The user does not watch any of this run — they read `report` afterward:
 
 ```text
 report.runs        = 5000

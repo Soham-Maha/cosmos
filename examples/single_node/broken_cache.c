@@ -10,8 +10,23 @@ struct Entry {
 
 struct Cache {
     struct Entry* slots[CACHE_CAPACITY];
+    size_t capacity;
     size_t count;
 };
+
+/* The knob's value, read once so one run sees one fixed capacity. */
+static size_t configured_capacity(void) {
+    const char* raw = getenv(CACHE_CAPACITY_ENV);
+    if (raw == NULL) {
+        return CACHE_CAPACITY;
+    }
+    char* end = NULL;
+    const long parsed = strtol(raw, &end, 10);
+    if (end == raw || parsed <= 0 || parsed > CACHE_CAPACITY) {
+        return CACHE_CAPACITY;
+    }
+    return (size_t)parsed;
+}
 
 Cache* cache_create(void) {
     Cache* cache = malloc(sizeof(*cache));
@@ -19,6 +34,7 @@ Cache* cache_create(void) {
         return NULL;
     }
     memset(cache, 0, sizeof(*cache));
+    cache->capacity = configured_capacity();
     return cache;
 }
 
@@ -58,7 +74,7 @@ int cache_put(Cache* cache, const char* key, const char* value) {
         return CACHE_OK;
     }
 
-    if (cache->count == CACHE_CAPACITY) {
+    if (cache->count == cache->capacity) {
         return CACHE_FULL;
     }
 
@@ -89,3 +105,5 @@ const char* cache_get(const Cache* cache, const char* key) {
 }
 
 size_t cache_size(const Cache* cache) { return cache->count; }
+
+size_t cache_capacity(const Cache* cache) { return cache->capacity; }

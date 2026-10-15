@@ -4,10 +4,12 @@
 #include "cosmos/time.hpp"
 #include <array>
 #include <bitset>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <expected>
 #include <optional>
+#include <span>
 #include <variant>
 #include <vector>
 
@@ -148,6 +150,20 @@ constexpr FaultClass class_of(SiteId site) {
         return FaultClass::Process;
     }
     return FaultClass::_Count;
+}
+
+// Sums one class's counters. A universe report and a campaign report hold the same map, so §11.4's
+// "did this class fire?" is one function rather than a slot loop at each call site.
+inline uint64_t injections_for(const SiteCounterMap& injections, FaultClass fault_class) {
+    uint64_t total = 0;
+    for (size_t slot = 0; slot < kSiteCount; ++slot) {
+        if (class_of(site_at_slot(slot)) == fault_class) total += injections[slot];
+    }
+    return total;
+}
+
+inline bool fault_was_injected(const SiteCounterMap& injections, FaultClass fault_class) {
+    return injections_for(injections, fault_class) > 0;
 }
 
 // The wrapper, never the injector, maps a kind to a legal result for its API (§8.2). Append-only.
@@ -387,6 +403,8 @@ struct FaultRule {
     // A clock may only move time forward and a sleep cannot have elapsed a negative amount
     // (Rule 15).
     Duration amount{};
+
+    constexpr bool operator==(const FaultRule&) const = default;
 };
 
 enum class ConfigError : uint8_t {
@@ -466,12 +484,15 @@ using KnobId = uint64_t;
 
 struct CrashNode {
     NodeId id;
+    constexpr bool operator==(const CrashNode&) const = default;
 };
 struct Partition {
     NodeSet a, b;
+    constexpr bool operator==(const Partition&) const = default;
 };
 struct PauseNode {
     NodeId id;
+    constexpr bool operator==(const PauseNode&) const = default;
 };
 using EpisodeSpec = std::variant<CrashNode, Partition, PauseNode>;
 
@@ -479,11 +500,28 @@ struct ScheduledEpisode {
     Time at{};
     EpisodeSpec spec{CrashNode{0}};
     Duration until_heal{};
+    constexpr bool operator==(const ScheduledEpisode&) const = default;
 };
 
 struct Knob {
     KnobId id = 0;
     int64_t value = 0;
+
+    constexpr bool operator==(const Knob&) const = default;
+};
+
+// How a knob's value spreads over its legal range: a timeout wants logarithmic, a retry count
+// linear.
+enum class KnobScale : uint8_t { Linear, Logarithmic };
+
+// A tunable the sampler may choose (§4.3). The range is the application's; `env` is its delivery
+// name.
+struct KnobSpec {
+    KnobId id = 0;
+    int64_t low = 0;
+    int64_t high = 0;
+    KnobScale scale = KnobScale::Linear;
+    const char* env = nullptr;
 };
 
 // Pure data, sampled once per universe; copyable so a failing run can report it.
@@ -543,6 +581,24 @@ struct FaultConfig {
 
     // Scales tables to sum to 1, like std::discrete_distribution; called on the injector's copy.
     void normalize();
+
+    // Level-1 swarm sampling (§6.4): harness-side, once per universe, before install_faults().
+    static FaultConfig sample(Rng& swarm_rng);
+    static FaultConfig sample(Rng& swarm_rng, std::span<const KnobSpec> knobs);
+
+    // Same schedule with the enable bits supplied instead of drawn: Rule 8's direct test seam.
+    static FaultConfig sample_with(Rng& swarm_rng, std::bitset<kFaultClassCount> enabled,
+                                   std::span<const KnobSpec> knobs = {});
+
+    // The sampled value of one knob, or nullopt when this universe did not sample it.
+    [[nodiscard]] std::optional<int64_t> knob_value(KnobId id) const;
+
+    constexpr bool operator==(const FaultConfig&) const = default;
+
+  private:
+    static FaultConfig sample_from(uint64_t swarm_base, std::bitset<kFaultClassCount> enabled,
+                                   std::span<const KnobSpec> knobs);
+    [[nodiscard]] static std::bitset<kFaultClassCount> draw_enabled(uint64_t swarm_base);
 };
 
 inline bool is_finite_rate(double v) { return std::isfinite(v) && v >= 0.0 && v <= 1.0; }
@@ -670,6 +726,127 @@ inline void FaultConfig::normalize() {
             table.entries[i].weight /= total;
         }
     }
+}
+
+// ---- swarm sampling (§6.4) -------------------------------------------------
+
+namespace swarm {
+
+constexpr double kClassProbability = 0.5; // per class, per universe
+constexpr double kSiteProbability = 0.5;  // per site, within an enabled class
+constexpr double kRateLow = 1e-5;         // §6.4's log-uniform rate range
+constexpr double kRateHigh = 1e-2;
+constexpr double kWeightLow = 1e-2; // keeps every normalized weight clear of underflow
+constexpr double kWeightHigh = 1.0;
+constexpr int64_t kAmountLowNs = 1'000;       // 1us: zero would make PacketDelay/ClockStep no-ops
+constexpr int64_t kAmountHighNs = 10'000'000; // 10ms: a large ClockStep can end the fault window
+constexpr uint64_t kKnobStreamBase = uint64_t{1} << 32; // knob positions, clear of class indices
+
+inline double log_uniform(Rng& rng, double low, double high) {
+    return std::exp(std::log(low) + rng.uniform() * (std::log(high) - std::log(low)));
+}
+
+inline int64_t log_uniform_ns(Rng& rng, int64_t low, int64_t high) {
+    return static_cast<int64_t>(
+        log_uniform(rng, static_cast<double>(low), static_cast<double>(high)));
+}
+
+// A rule over every kind the site's own API can produce (Rule 15), in enum order.
+inline FaultRule sample_rule(Rng& rng, SiteId site) {
+    FaultRule rule;
+    rule.rate = log_uniform(rng, kRateLow, kRateHigh);
+    for (uint8_t raw = 1; raw < static_cast<uint8_t>(FaultKind::_Count); ++raw) {
+        const auto kind = static_cast<FaultKind>(raw);
+        if (!is_legal_outcome(site, kind)) continue;
+        (void)rule.outcomes.add(kind, log_uniform(rng, kWeightLow, kWeightHigh));
+    }
+    rule.amount = Duration{log_uniform_ns(rng, kAmountLowNs, kAmountHighNs)};
+    return rule;
+}
+
+inline int64_t sample_knob(Rng& rng, const KnobSpec& spec) {
+    if (spec.scale == KnobScale::Logarithmic) return log_uniform_ns(rng, spec.low, spec.high);
+    return spec.low +
+           static_cast<int64_t>(rng.range(0, static_cast<uint64_t>(spec.high - spec.low)));
+}
+
+// One sub-stream per knob position, so knobs and fault classes cannot shift each other (§6.4).
+inline void sample_knobs(uint64_t swarm_base, std::span<const KnobSpec> specs,
+                         std::vector<Knob>& out) {
+    KnobId previous = 0;
+    bool first = true;
+    for (size_t i = 0; i < specs.size(); ++i) {
+        const KnobSpec& spec = specs[i];
+        // The result must be strictly ascending by id (validate() checks it), so a malformed spec
+        // is the harness's bug: skipped, never sampled into a range the application did not
+        // declare.
+        const bool ordered = first || spec.id > previous;
+        const bool ranged =
+            spec.low <= spec.high && (spec.scale != KnobScale::Logarithmic || spec.low > 0);
+        assert(ordered && ranged);
+        if (!ordered || !ranged) continue;
+        Rng knob_rng(derive_seed(swarm_base, kKnobStreamBase + i));
+        out.push_back(Knob{spec.id, sample_knob(knob_rng, spec)});
+        previous = spec.id;
+        first = false;
+    }
+}
+
+} // namespace swarm
+
+inline FaultConfig FaultConfig::sample(Rng& swarm_rng) { return sample(swarm_rng, {}); }
+
+inline FaultConfig FaultConfig::sample(Rng& swarm_rng, std::span<const KnobSpec> knobs) {
+    const uint64_t swarm_base = swarm_rng.next();
+    return sample_from(swarm_base, draw_enabled(swarm_base), knobs);
+}
+
+inline FaultConfig FaultConfig::sample_with(Rng& swarm_rng, std::bitset<kFaultClassCount> enabled,
+                                            std::span<const KnobSpec> knobs) {
+    return sample_from(swarm_rng.next(), enabled, knobs);
+}
+
+inline std::bitset<kFaultClassCount> FaultConfig::draw_enabled(uint64_t swarm_base) {
+    std::bitset<kFaultClassCount> enabled;
+    for (size_t index = 0; index < kFaultClassCount; ++index) {
+        enabled.set(index, Rng(derive_seed(swarm_base, index)).coin(swarm::kClassProbability));
+    }
+    return enabled;
+}
+
+inline FaultConfig FaultConfig::sample_from(uint64_t swarm_base,
+                                            std::bitset<kFaultClassCount> enabled,
+                                            std::span<const KnobSpec> knobs) {
+    FaultConfig cfg;
+    for (size_t index = 0; index < kFaultClassCount; ++index) {
+        const FaultClass fault_class = static_cast<FaultClass>(index);
+        Rng class_rng(derive_seed(swarm_base, index));
+        // Position 0 of this class's stream is its enable bit (§6.4); draw_enabled took that one.
+        (void)class_rng.next();
+        const bool on = enabled.test(index);
+        if (on) cfg.enable_class(fault_class);
+
+        for (size_t slot = 0; slot < kSiteCount; ++slot) {
+            const SiteId site = site_at_slot(slot);
+            if (class_of(site) != fault_class) continue;
+            const bool activated = class_rng.coin(swarm::kSiteProbability);
+            if (!on || !activated) continue;
+            (void)cfg.activate_site(site);
+            // Event sites have no legal outcome, so they get activation and never a rule.
+            if (slot >= kWrapperSiteCount) continue;
+            (void)cfg.set_rule(site, swarm::sample_rule(class_rng, site));
+        }
+    }
+    swarm::sample_knobs(swarm_base, knobs, cfg.knobs);
+    return cfg;
+}
+
+inline std::optional<int64_t> FaultConfig::knob_value(KnobId id) const {
+    for (const Knob& knob : knobs) {
+        if (knob.id == id) return knob.value;
+        if (knob.id > id) break; // strictly ascending, so it cannot appear later
+    }
+    return std::nullopt;
 }
 
 } // namespace cosmos
