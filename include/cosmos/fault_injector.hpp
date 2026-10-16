@@ -4,6 +4,7 @@
 #include "cosmos/ledger.hpp"
 #include "cosmos/random.hpp"
 #include "cosmos/time.hpp"
+#include "cosmos/trace.hpp"
 #include <array>
 #include <cassert>
 #include <concepts>
@@ -33,15 +34,23 @@ constexpr FaultKind select_outcome(double value, const FaultRule& rule) {
     return FaultKind::None;
 }
 
+// Rate 0 cannot fire so it never draws (Rule 3); rate 1 still draws, to pick the outcome.
+constexpr bool consumes_draw(const FaultRule& rule) { return rule.rate > 0.0; }
+
 template <ClockLike Clock> class BasicFaultInjector {
   public:
     // A factory, not a constructor: an assert would wave an invalid config through under NDEBUG.
     [[nodiscard]] static std::expected<BasicFaultInjector, ConfigProblem>
-    create(FaultConfig cfg, uint64_t fault_stream_seed, uint32_t node_count, const Clock& clock) {
+    create(FaultConfig cfg, uint64_t fault_stream_seed, uint32_t node_count, const Clock& clock,
+           TraceOptions trace_options = {}) {
         if (const auto checked = cfg.validate(node_count); !checked.has_value()) {
             return std::unexpected(checked.error());
         }
-        return BasicFaultInjector(std::move(cfg), fault_stream_seed, clock);
+        // An enabled trace with no room is a configuration mistake, not a silently empty trace.
+        if (trace_options.enabled && trace_options.capacity == 0) {
+            return std::unexpected(ConfigProblem{ConfigError::BadTraceCapacity, std::nullopt});
+        }
+        return BasicFaultInjector(std::move(cfg), fault_stream_seed, clock, trace_options);
     }
 
     // A copy would fork the engine: two stream positions and two budgets against one run.
@@ -83,10 +92,13 @@ template <ClockLike Clock> class BasicFaultInjector {
         // always lands there. Reading it directly is what keeps the fire zero-draw (Rule 11) —
         // passing 0.0 to select_outcome() would return None for the legal rate-0 trigger-only rule.
         if (rule->fire_on_eligible_call == eligible_calls_[slot]) {
-            return record_fire(site_class, site, slot, rule->outcomes.entries[0].kind, false);
+            const FaultKind kind = rule->outcomes.entries[0].kind;
+            record_decision(site, slot, *rule, kind, false);
+            return record_fire(site_class, site, slot, kind, false);
         }
 
         const FaultKind kind = draw(site_class, *rule);
+        record_decision(site, slot, *rule, kind, consumes_draw(*rule));
         if (kind == FaultKind::None) return FaultKind::None;
         return record_fire(site_class, site, slot, kind, true);
     }
@@ -115,11 +127,17 @@ template <ClockLike Clock> class BasicFaultInjector {
 
     const FaultLedger& ledger() const { return ledger_; }
 
+    const FaultTrace& trace() const { return trace_; }
+    uint64_t decisions() const { return decisions_; }
+
   private:
-    BasicFaultInjector(FaultConfig cfg, uint64_t fault_stream_seed, const Clock& clock)
+    BasicFaultInjector(FaultConfig cfg, uint64_t fault_stream_seed, const Clock& clock,
+                       TraceOptions trace_options)
         : cfg_(std::move(cfg)),
           streams_(make_streams(fault_stream_seed, std::make_index_sequence<kFaultClassCount>{})),
-          clock_(clock) {
+          clock_(clock),
+          // Sized once, while no universe is current: the buffer is not tracked and not faulted.
+          trace_(trace_options.enabled ? trace_options.capacity : 0) {
         cfg_.normalize();
     }
 
@@ -130,8 +148,23 @@ template <ClockLike Clock> class BasicFaultInjector {
 
     // Rate 0 cannot fire so it never draws (Rule 3); rate 1 still draws, to pick the outcome.
     FaultKind draw(FaultClass cls, const FaultRule& rule) {
-        if (rule.rate <= 0.0) return FaultKind::None;
+        if (!consumes_draw(rule)) return FaultKind::None;
         return select_outcome(streams_[static_cast<size_t>(cls)].uniform(), rule);
+    }
+
+    // One entry per post-gate decision, numbered by the trace's own seq, never by fire_index. The
+    // counter runs whether or not the trace does, so decisions() stays the decision count.
+    void record_decision(SiteId site, size_t slot, const FaultRule& rule, FaultKind kind,
+                         bool drew) {
+        ++decisions_;
+        if (!trace_.enabled()) return;
+        trace_.record(TraceEntry{.seq = decisions_,
+                                 .eligible_index = eligible_calls_[slot],
+                                 .at = clock_.now(),
+                                 .site = site,
+                                 .amount = rule.amount,
+                                 .outcome = kind,
+                                 .drew = drew});
     }
 
     // Both fire paths land here, so the counter and the ledger cannot drift apart.
@@ -156,6 +189,8 @@ template <ClockLike Clock> class BasicFaultInjector {
     SiteCounterMap injections_{};
     FaultLedger ledger_{};
     uint64_t fires_{0};
+    FaultTrace trace_{};
+    uint64_t decisions_{0};
 };
 
 // Non-movable too: a second owner would pop a quiet window it never pushed.

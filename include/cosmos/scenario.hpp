@@ -78,9 +78,11 @@ inline bool failed(const ScenarioReport& report) { return !report.no_check_faile
 class Scenario {
   public:
     [[nodiscard]] static std::expected<Scenario, ConfigProblem>
-    create(uint64_t seed, FaultPlan plan, uint32_t node_count = 1) {
+    create(uint64_t seed, FaultPlan plan, uint32_t node_count = 1,
+           TraceOptions trace_options = {}) {
         auto sim = std::make_unique<Simulator>(seed);
-        if (auto installed = sim->install_faults(std::move(plan), node_count); !installed) {
+        if (auto installed = sim->install_faults(std::move(plan), node_count, trace_options);
+            !installed) {
             return std::unexpected(installed.error());
         }
         return Scenario(seed, std::move(sim));
@@ -88,9 +90,10 @@ class Scenario {
 
     // A scenario over a universe the caller owns and outlives: the campaign runner builds one
     // Simulator per universe and must not hand its ownership to the harness.
-    [[nodiscard]] static std::expected<Scenario, ConfigProblem> on(Simulator& sim, FaultPlan plan,
-                                                                   uint32_t node_count = 1) {
-        if (auto installed = sim.install_faults(std::move(plan), node_count); !installed) {
+    [[nodiscard]] static std::expected<Scenario, ConfigProblem>
+    on(Simulator& sim, FaultPlan plan, uint32_t node_count = 1, TraceOptions trace_options = {}) {
+        if (auto installed = sim.install_faults(std::move(plan), node_count, trace_options);
+            !installed) {
             return std::unexpected(installed.error());
         }
         return Scenario(sim);
