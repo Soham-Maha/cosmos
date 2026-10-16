@@ -79,6 +79,8 @@ template <typename Injector> class BasicSimulator {
                                      node_count, clock_, trace_options);
         if (!made.has_value()) return std::unexpected(made.error());
         injector_.emplace(std::move(*made));
+        // The trace names its own universe, so Scenario::replay needs no seed argument.
+        injector_->set_universe_seed(seed_);
         return {};
     }
 

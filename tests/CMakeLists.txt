@@ -549,6 +549,29 @@ endif()
 
 add_test(NAME test_trace COMMAND test_trace)
 
+# The replay engine drives the same wrapped allocator channel the trace does, and needs calloc for
+# the two-site fixture that makes divergence observable.
+add_executable(test_replay test_replay.cpp)
+target_link_libraries(test_replay PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_replay PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_replay PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+    )
+endif()
+
+add_test(NAME test_replay COMMAND test_replay)
+
 # Second link of the trace suite. std:: allocations only reach the wrappers under a static
 # libstdc++, so the preallocation claim in test_recording_never_allocates_with_a_universe_current
 # is only measurable here.

@@ -444,6 +444,7 @@ enum class ConfigError : uint8_t {
     InjectorAlreadyInstalled,
     BadAmount,
     BadTraceCapacity,
+    TruncatedTrace,
 };
 
 constexpr const char* name_of(ConfigError error) {
@@ -486,6 +487,8 @@ constexpr const char* name_of(ConfigError error) {
         return "BadAmount";
     case ConfigError::BadTraceCapacity:
         return "BadTraceCapacity";
+    case ConfigError::TruncatedTrace:
+        return "TruncatedTrace";
     }
     return "?";
 }
