@@ -36,11 +36,15 @@ struct CheckResult {
     std::string detail;
     bool passed = false;
     Time at{};
+
+    bool operator==(const CheckResult&) const = default;
 };
 
 struct CoverageNote {
     std::string id;
     bool hit = false;
+
+    bool operator==(const CoverageNote&) const = default;
 };
 
 struct ScenarioReport {
@@ -61,6 +65,8 @@ struct ScenarioReport {
     // Rendered before the universe dies, because the sugar returns the report by value and the
     // ledger would otherwise be unreachable. Empty on a pass, and for a Scenario used directly.
     std::string ledger_dump{};
+
+    bool operator==(const ScenarioReport&) const = default;
 
     bool vacuous() const { return checks.empty(); }
 

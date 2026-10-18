@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <string>
+#include <string_view>
 #include <utility>
 
 using namespace cosmos::literals;
@@ -438,6 +440,151 @@ void test_trace_buffer_is_invisible_to_the_sim_heap() {
     std::cout << "[PASS] test_trace_buffer_is_invisible_to_the_sim_heap" << std::endl;
 }
 
+// Two entries covering every field, including a negative timestamp and a suppressed status.
+cosmos::FaultTrace codec_trace() {
+    cosmos::FaultTrace trace(8);
+    trace.set_universe_seed(0x0123456789ABCDEFULL);
+
+    cosmos::TraceEntry first{};
+    first.seq = 1;
+    first.eligible_index = 3;
+    first.at = cosmos::Time{1'500'000};
+    first.site = cosmos::SiteId::write;
+    first.amount = cosmos::Duration{7'000'000};
+    first.outcome = cosmos::FaultKind::WriteEio;
+    first.drew = true;
+    first.status = cosmos::DecisionStatus::Fired;
+    trace.record(first);
+
+    cosmos::TraceEntry second{};
+    second.seq = 2;
+    second.eligible_index = 9;
+    second.at = cosmos::Time{-1};
+    second.site = cosmos::SiteId::send;
+    second.amount = cosmos::Duration{0};
+    second.outcome = cosmos::FaultKind::PacketDrop;
+    second.drew = false;
+    second.status = cosmos::DecisionStatus::Suppressed;
+    trace.record(second);
+    return trace;
+}
+
+void test_fnv1a_64_matches_known_vectors() {
+    assert(cosmos::detail::fnv1a_64("") == 0xcbf29ce484222325ULL);
+    assert(cosmos::detail::fnv1a_64("a") == 0xaf63dc4c8601ec8cULL);
+    assert(cosmos::detail::fnv1a_64("hello") == 0xa430d84680aabd0bULL);
+
+    std::cout << "[PASS] test_fnv1a_64_matches_known_vectors" << std::endl;
+}
+
+void test_trace_encoding_round_trips_entries() {
+    const cosmos::FaultTrace original = codec_trace();
+    const std::string bytes = cosmos::encode_trace(original);
+
+    auto decoded = cosmos::decode_trace(bytes);
+    must(decoded.has_value());
+    assert(decoded->size() == original.size());
+    assert(decoded->universe_seed() == original.universe_seed());
+    for (size_t index = 0; index < original.size(); ++index) {
+        assert((*decoded)[index] == original[index]);
+    }
+    assert(cosmos::encode_trace(*decoded) == bytes);
+    assert(cosmos::trace_hash(*decoded) == cosmos::trace_hash(original));
+
+    cosmos::FaultTrace empty(4);
+    empty.set_universe_seed(42);
+    auto decoded_empty = cosmos::decode_trace(cosmos::encode_trace(empty));
+    must(decoded_empty.has_value());
+    assert(decoded_empty->size() == 0);
+    assert(decoded_empty->universe_seed() == 42);
+
+    std::cout << "[PASS] test_trace_encoding_round_trips_entries" << std::endl;
+}
+
+// The struct is 48 bytes and the encoding is 43: padding is not part of the canonical form.
+void test_trace_encoding_emits_no_padding() {
+    static_assert(sizeof(cosmos::TraceEntry) == 48);
+    static_assert(cosmos::kTraceHeaderBytes == 17);
+    static_assert(cosmos::kTraceEntryBytes == 43);
+
+    const cosmos::FaultTrace trace = codec_trace();
+    assert(cosmos::encode_trace(trace).size() ==
+           cosmos::kTraceHeaderBytes + cosmos::kTraceEntryBytes * trace.size());
+
+    std::cout << "[PASS] test_trace_encoding_emits_no_padding" << std::endl;
+}
+
+void test_flipping_one_trace_field_changes_the_hash() {
+    const cosmos::FaultTrace base = codec_trace();
+    const uint64_t hash = cosmos::trace_hash(base);
+
+    cosmos::FaultTrace flipped(base.size());
+    flipped.set_universe_seed(base.universe_seed());
+    for (size_t index = 0; index < base.size(); ++index) {
+        cosmos::TraceEntry entry = base[index];
+        if (index == 0) entry.drew = !entry.drew;
+        flipped.record(entry);
+    }
+    assert(cosmos::trace_hash(flipped) != hash);
+
+    cosmos::FaultTrace shifted(base.size());
+    shifted.set_universe_seed(base.universe_seed());
+    for (size_t index = 0; index < base.size(); ++index) {
+        cosmos::TraceEntry entry = base[index];
+        if (index == 1) entry.at = cosmos::Time{entry.at.ns + 1};
+        shifted.record(entry);
+    }
+    assert(cosmos::trace_hash(shifted) != hash);
+
+    std::cout << "[PASS] test_flipping_one_trace_field_changes_the_hash" << std::endl;
+}
+
+void test_the_same_trace_hashes_identically() {
+    const cosmos::FaultTrace first = codec_trace();
+    const cosmos::FaultTrace second = codec_trace();
+    assert(cosmos::trace_hash(first) == cosmos::trace_hash(first));
+    assert(cosmos::trace_hash(first) == cosmos::trace_hash(second));
+
+    std::cout << "[PASS] test_the_same_trace_hashes_identically" << std::endl;
+}
+
+void test_decode_trace_rejects_malformed_bytes() {
+    const std::string valid = cosmos::encode_trace(codec_trace());
+    must(cosmos::decode_trace(valid).has_value());
+
+    auto truncated = cosmos::decode_trace(std::string_view(valid).substr(0, valid.size() - 1));
+    must(!truncated.has_value());
+    assert(truncated.error() == cosmos::TraceError::Truncated);
+
+    auto empty = cosmos::decode_trace("");
+    must(!empty.has_value());
+    assert(empty.error() == cosmos::TraceError::Truncated);
+
+    std::string bad_source = valid;
+    bad_source[0] = 2;
+    auto wrong_source = cosmos::decode_trace(bad_source);
+    must(!wrong_source.has_value());
+    assert(wrong_source.error() == cosmos::TraceError::BadSource);
+
+    auto trailing = cosmos::decode_trace(valid + "x");
+    must(!trailing.has_value());
+    assert(trailing.error() == cosmos::TraceError::TrailingBytes);
+
+    std::string bad_outcome = valid;
+    bad_outcome[cosmos::kTraceHeaderBytes + 40] = static_cast<char>(0xFF);
+    auto wrong_outcome = cosmos::decode_trace(bad_outcome);
+    must(!wrong_outcome.has_value());
+    assert(wrong_outcome.error() == cosmos::TraceError::BadValue);
+
+    std::string bad_site = valid;
+    bad_site[cosmos::kTraceHeaderBytes + 24] = static_cast<char>(0xFF);
+    auto wrong_site = cosmos::decode_trace(bad_site);
+    must(!wrong_site.has_value());
+    assert(wrong_site.error() == cosmos::TraceError::BadValue);
+
+    std::cout << "[PASS] test_decode_trace_rejects_malformed_bytes" << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -453,6 +600,12 @@ int main() {
     test_recording_never_allocates_with_a_universe_current();
     test_an_enabled_trace_with_no_capacity_is_rejected();
     test_trace_buffer_is_invisible_to_the_sim_heap();
+    test_fnv1a_64_matches_known_vectors();
+    test_trace_encoding_round_trips_entries();
+    test_trace_encoding_emits_no_padding();
+    test_flipping_one_trace_field_changes_the_hash();
+    test_the_same_trace_hashes_identically();
+    test_decode_trace_rejects_malformed_bytes();
     std::cout << "All trace tests passed successfully!" << std::endl;
     return 0;
 }

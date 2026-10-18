@@ -14,6 +14,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -317,12 +319,109 @@ void test_never_hit_stays_out_of_findings() {
     std::cout << "[PASS] test_never_hit_stays_out_of_findings" << std::endl;
 }
 
-// The flag promises a trace-hash check we cannot deliver until P5-S4, so it is refused rather than
-// accepted and quietly unhonoured.
-void test_verify_is_refused_rather_than_ignored() {
+// Verify really runs the body twice per universe; the shared mapping is visible across the fork.
+void test_verify_runs_every_universe_twice() {
+    int* runs = static_cast<int*>(
+        ::mmap(nullptr, sizeof(int), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+    must(runs != MAP_FAILED);
+    *runs = 0;
+
     cosmos::CampaignConfig config;
-    config.trials = 1000;
+    config.trials = 3;
+    config.base_seed = kBaseSeed;
+    config.parallel = 1;
     config.verify = true;
+    config.trace_capacity = 4096;
+
+    const cosmos::CampaignReport report =
+        cosmos::Campaign::run(config, [runs](cosmos::Simulator& sim, uint64_t) {
+            auto scenario = cosmos::Scenario::on(sim, oom_rate(kOomRate));
+            must(scenario.has_value());
+            scenario->run([] { std::free(std::malloc(16)); });
+            scenario->quiesce();
+            scenario->check("verify-ran", [] { return true; });
+            ++*runs;
+            return scenario->report();
+        });
+
+    must(!report.refused);
+    must(report.verify);
+    must(report.runs == 3);
+    must(report.findings.empty());
+    std::ostringstream shown;
+    cosmos::print_campaign_report(shown, report);
+    must(shown.str().find("(verify: double-run)") != std::string::npos);
+    assert(*runs == 6);
+    must(::munmap(runs, sizeof(int)) == 0);
+
+    std::cout << "[PASS] test_verify_runs_every_universe_twice" << std::endl;
+}
+
+// A body whose second run differs is a determinism bug: one finding, not a quiet pass.
+void test_verify_reports_a_mismatch_when_runs_differ() {
+    cosmos::CampaignConfig config;
+    config.trials = 2;
+    config.base_seed = kBaseSeed;
+    config.parallel = 1;
+    config.verify = true;
+    config.trace_capacity = 4096;
+
+    const cosmos::CampaignReport report =
+        cosmos::Campaign::run(config, [](cosmos::Simulator& sim, uint64_t) {
+            static int runs = 0;
+            ++runs;
+            auto scenario = cosmos::Scenario::on(sim, cosmos::FaultPlan{});
+            must(scenario.has_value());
+            scenario->run([] {});
+            scenario->quiesce();
+            scenario->check("same-every-run", [] { return runs % 2 == 1; });
+            return scenario->report();
+        });
+
+    must(!report.refused);
+    must(report.verify);
+    must(report.runs == 2);
+    must(report.failed_runs == 2);
+    must(report.findings.size() == 1);
+    must(report.findings[0].id == cosmos::kVerifyFailedId);
+    must(report.findings[0].detail == "checks[0].passed");
+
+    std::cout << "[PASS] test_verify_reports_a_mismatch_when_runs_differ" << std::endl;
+}
+
+// The hash covers the trace, not just the report: a differing hash is a mismatch even when every
+// observable in the report agrees.
+void test_verify_detects_a_trace_hash_difference() {
+    cosmos::detail::UniverseOptions options;
+    options.trace = {.enabled = true, .capacity = 4096};
+    options.verify = true;
+
+    const cosmos::detail::UniverseOutcome first = cosmos::detail::run_one_universe(
+        0, cosmos::universe_seed(kBaseSeed, 0),
+        [](cosmos::Simulator& sim, uint64_t) {
+            auto scenario = cosmos::Scenario::on(sim, oom_rate(1.0));
+            must(scenario.has_value());
+            scenario->run([] { std::free(std::malloc(16)); });
+            scenario->quiesce();
+            scenario->check("always-fails", [] { return false; });
+            return scenario->report();
+        },
+        options);
+
+    must(first.traced);
+    cosmos::detail::UniverseOutcome second = first;
+    second.trace_hash ^= 1;
+    must(cosmos::detail::verify_difference(first, second) == "trace hash");
+
+    std::cout << "[PASS] test_verify_detects_a_trace_hash_difference" << std::endl;
+}
+
+// A zero-capacity trace cannot be hashed, so verify refuses before running any universe.
+void test_verify_with_zero_capacity_is_refused() {
+    cosmos::CampaignConfig config;
+    config.trials = 4;
+    config.verify = true;
+    config.trace_capacity = 0;
 
     const cosmos::CampaignReport report =
         cosmos::Campaign::run(config, [](cosmos::Simulator&, uint64_t) -> cosmos::ScenarioReport {
@@ -331,11 +430,13 @@ void test_verify_is_refused_rather_than_ignored() {
         });
 
     must(report.refused);
+    must(report.verify);
     must(report.runs == 0);
     must(report.findings.size() == 1);
-    must(report.findings[0].id == cosmos::kVerifyRefusedId);
+    must(report.findings[0].id == cosmos::kVerifyFailedId);
+    must(report.findings[0].detail.find("trace_capacity") != std::string::npos);
 
-    std::cout << "[PASS] test_verify_is_refused_rather_than_ignored" << std::endl;
+    std::cout << "[PASS] test_verify_with_zero_capacity_is_refused" << std::endl;
 }
 
 void test_report_prints_a_repro_line() {
@@ -602,7 +703,10 @@ int main() {
     test_every_universe_gets_its_own_derived_seed();
     test_throwing_universe_fails_only_itself();
     test_never_hit_stays_out_of_findings();
-    test_verify_is_refused_rather_than_ignored();
+    test_verify_runs_every_universe_twice();
+    test_verify_reports_a_mismatch_when_runs_differ();
+    test_verify_detects_a_trace_hash_difference();
+    test_verify_with_zero_capacity_is_refused();
     test_report_prints_a_repro_line();
     test_json_report_is_well_formed();
     test_parallel_and_sequential_agree_exactly();
