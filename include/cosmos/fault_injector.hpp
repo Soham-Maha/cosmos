@@ -196,7 +196,10 @@ template <ClockLike Clock> class BasicFaultInjector {
         // Consumed even when withheld: the stream has to end where the source run left it.
         if (entry->drew) (void)next_value(cls);
 
-        if (filter_.withholds(entry->seq)) {
+        // A trace that is itself a replay already carries its suppressions; never re-fire them.
+        const bool suppressed =
+            entry->status != DecisionStatus::Fired || filter_.withholds(entry->seq);
+        if (suppressed) {
             record_withheld(cls, site, slot, *entry);
             record_decision(site, slot, rule, entry->outcome, entry->drew,
                             DecisionStatus::Suppressed);

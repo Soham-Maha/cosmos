@@ -572,6 +572,34 @@ endif()
 
 add_test(NAME test_replay COMMAND test_replay)
 
+# The minimizer replays a recorded trace in forked children over the same deliberately-broken
+# application the campaign uses, so it needs the same fixture and allocator channel.
+add_executable(test_minimize
+    test_minimize.cpp
+    ${CMAKE_SOURCE_DIR}/examples/single_node/broken_cache.c
+)
+target_link_libraries(test_minimize PRIVATE cosmos)
+target_include_directories(test_minimize PRIVATE ${CMAKE_SOURCE_DIR}/examples/single_node)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_minimize PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_minimize PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+endif()
+
+add_test(NAME test_minimize COMMAND test_minimize)
+
 # Second link of the trace suite. std:: allocations only reach the wrappers under a static
 # libstdc++, so the preallocation claim in test_recording_never_allocates_with_a_universe_current
 # is only measurable here.

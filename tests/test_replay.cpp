@@ -243,6 +243,27 @@ void test_two_replays_of_one_trace_are_identical() {
     std::cout << "[PASS] test_two_replays_of_one_trace_are_identical" << std::endl;
 }
 
+// A replay's own trace is a valid source: an entry it suppressed must stay suppressed, or a chain
+// of replays could resurrect a fault the first one withheld.
+void test_a_replay_trace_keeps_its_suppressions() {
+    const FaultConfig plan = two_site_plan(0.25, 0.25);
+    const Source source = record_source(plan, kIterations);
+    const uint64_t seq = first_fire_seq(source.trace, SiteId::calloc);
+    must(seq != 0);
+
+    const Replay first = run_replay(plan, source.trace, TraceFilter::withhold({seq}), kIterations);
+    must(first.withheld == 1);
+
+    const Replay second = run_replay(plan, first.trace, TraceFilter::honour_all(), kIterations);
+    assert(second.withheld == 1);
+    assert(second.consumed == first.trace.size());
+    assert(second.injections == first.injections);
+    assert(second.draws == first.draws);
+    assert(same_trace(first.trace, second.trace));
+
+    std::cout << "[PASS] test_a_replay_trace_keeps_its_suppressions" << std::endl;
+}
+
 // §11.2: a withheld entry still consumes its draw, or every later honoured entry would read the
 // stream from the wrong place. Nothing downstream can see that except the draw count.
 void test_a_withheld_fire_still_consumes_its_draw() {
@@ -394,6 +415,7 @@ void test_only_faults_keeps_exactly_the_named_fires() {
 int main() {
     test_a_unmodified_trace_replays_the_run_identically();
     test_two_replays_of_one_trace_are_identical();
+    test_a_replay_trace_keeps_its_suppressions();
     test_a_withheld_fire_still_consumes_its_draw();
     test_divergence_invents_no_faults();
     test_an_exhausted_trace_passes_through();

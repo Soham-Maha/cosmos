@@ -374,6 +374,46 @@ a determinism guarantee.
 
 ---
 
+## 13.1 Minimization (`minimize.hpp`)
+
+`minimize()` is trace-first, not seed-first: the caller records the failing universe (the trace is
+the regenerable artifact, per `SPRINT_PLAN.md` §P5) and passes it in with the body half of a
+universe. A replay cannot be driven through `UniverseFn`: that shape constructs its own Scenario via
+`Scenario::on`, and the replay injector must be installed by `Scenario::replay`.
+
+```cpp
+using ScenarioBody = std::function<void(Scenario&)>; // run, quiesce, check; no Scenario of its own
+
+struct MinimizeConfig {
+    FaultConfig plan;       // the failing run's plan; replay needs the same gate verdicts
+    std::string finding_id; // the check that must keep failing
+    uint32_t node_count = 1;
+    std::string program;    // named in the repro line
+};
+
+MinimizeReport minimize(const FaultTrace& source, const MinimizeConfig&, const ScenarioBody&);
+void print_minimize_report(std::ostream&, const MinimizeReport&);
+```
+
+The loop is greedy one-at-a-time suppression over the trace's fires (`outcome != None`): dropping a
+fault that still reproduces is permanent, and full passes repeat until one drops nothing. That
+final pass *is* the 1-minimal guarantee — every survivor was last tested against the other
+survivors alone and the finding survived only without it. Global (ddmin) minimality is out of scope,
+and the report says `1-minimal`, never `minimal`.
+
+Each trial is a `Scenario::replay` in a forked child, so a crash, a throw, or an exit without a
+report is read as "not reproduction" — the entry is essential — rather than ending the reduction. A
+crash is a different finding id, and keeping a fault because removing it turns a check failure into
+a crash would keep noise in the minimal set. Before any reduction, one baseline replay with
+everything honoured must still reproduce the named finding; otherwise the minimizer refuses rather
+than returning a meaningless set. A truncated trace, a harness finding id (`cosmos.*`), a trace that
+is itself a replay, and a call from inside a live universe are refused for the same reason.
+
+No binary ships. `--minimize` and `--only-faults=` are the harness's flags, and the printer emits
+the exact decision seqs the harness passes to `TraceFilter::only_faults`.
+
+---
+
 ## 14. The Determinism Contract
 
 Under `libcosmos`, determinism holds provided that application code:
@@ -387,6 +427,8 @@ Under `libcosmos`, determinism holds provided that application code:
 ## 15. Error Handling & Tracing
 
 - Findings output a clear repro command: `myapp_test --seed 12345`.
+- After minimization the repro names the kept decision seqs: `myapp_test --seed 12345
+  --only-faults=17,42`.
 - Tracing sink records FNV-1a event hash (`trace_hash`) used by `--verify` double-run validation.
 
 ---
