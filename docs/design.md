@@ -329,7 +329,8 @@ struct CampaignConfig {
     uint64_t base_seed = 0;
     unsigned parallel  = std::thread::hardware_concurrency();
     uint32_t node_count = 1;
-    bool     verify    = false;   // needs the P5 decision trace; refused, never ignored
+    bool     verify    = false;   // runs each universe twice; report + trace hash must agree
+    uint64_t trace_capacity = kDefaultTraceCapacity;  // verify only; overflow is reported
     std::string program;          // named in the repro line, e.g. "myapp_test"
 };
 
@@ -352,6 +353,7 @@ struct CampaignReport {
     uint64_t out_of_scope_assertions;
     uint64_t base_seed;
     std::string program;
+    bool     verify;              // echoed: the double-run check ran
 };
 
 class Campaign {
@@ -367,10 +369,83 @@ dashboard consumes the report rather than being a feature to build. Whether a co
 work is answered by the counters, not by reading a log: `fault_was_injected(report.injections,
 FaultClass::Storage)` for the class-level question, and `report.vacuous` for the site-level one.
 
-**`verify` is refused, not ignored.** It names a double-run FNV-1a trace-hash check that needs the
-decision trace (§11.2), which lands with P5. Until then `run` returns immediately with a
-`cosmos.campaign.verify` finding and `runs == 0`, because a caller must not read a green campaign as
-a determinism guarantee.
+**`verify` is the double-run check.** Each universe runs twice from the same seed with tracing on,
+in the same worker process — deliberate, because the hidden global state it exists to catch only
+shows up that way. Two things are compared: the full `ScenarioReport` (checks, coverage notes,
+per-site counters, `activated_sites`, `active_allocations`, `ledger_dump`) and the canonical trace
+hash. A mismatch becomes one `cosmos.campaign.verify` finding whose detail names the first differing
+field, so the diagnosis is a field rather than a bit. Identical throws are deterministic and keep
+their own `cosmos.campaign.threw` finding; a signal kills the worker and is handled by the existing
+crash path. Tracing is turned on by the campaign through `Simulator::set_default_trace_options`, so a
+body that installs its plan with `Scenario::on(sim, plan)` needs no change; a body that bypasses the
+campaign Simulator is reported as "tracing was not enabled". The one up-front refusal left is
+`verify` with `trace_capacity == 0`, which cannot record anything to hash.
+
+---
+
+## 13.1 Minimization (`minimize.hpp`)
+
+`minimize()` is trace-first, not seed-first: the caller records the failing universe (the trace is
+the regenerable artifact, per `SPRINT_PLAN.md` §P5) and passes it in with the body half of a
+universe. A replay cannot be driven through `UniverseFn`: that shape constructs its own Scenario via
+`Scenario::on`, and the replay injector must be installed by `Scenario::replay`.
+
+```cpp
+using ScenarioBody = std::function<void(Scenario&)>; // run, quiesce, check; no Scenario of its own
+
+struct MinimizeConfig {
+    FaultConfig plan;       // the failing run's plan; replay needs the same gate verdicts
+    std::string finding_id; // the check that must keep failing
+    uint32_t node_count = 1;
+    std::string program;    // named in the repro line
+};
+
+MinimizeReport minimize(const FaultTrace& source, const MinimizeConfig&, const ScenarioBody&);
+void print_minimize_report(std::ostream&, const MinimizeReport&);
+```
+
+The loop is greedy one-at-a-time suppression over the trace's fires (`outcome != None`): dropping a
+fault that still reproduces is permanent, and full passes repeat until one drops nothing. That
+final pass *is* the 1-minimal guarantee — every survivor was last tested against the other
+survivors alone and the finding survived only without it. Global (ddmin) minimality is out of scope,
+and the report says `1-minimal`, never `minimal`.
+
+Each trial is a `Scenario::replay` in a forked child, so a crash, a throw, or an exit without a
+report is read as "not reproduction" — the entry is essential — rather than ending the reduction. A
+crash is a different finding id, and keeping a fault because removing it turns a check failure into
+a crash would keep noise in the minimal set. Before any reduction, one baseline replay with
+everything honoured must still reproduce the named finding; otherwise the minimizer refuses rather
+than returning a meaningless set. A truncated trace, a harness finding id (`cosmos.*`), a trace that
+is itself a replay, and a call from inside a live universe are refused for the same reason.
+
+No binary ships. `--minimize` and `--only-faults=` are the harness's flags, and the printer emits
+the exact decision seqs the harness passes to `TraceFilter::only_faults`.
+
+---
+
+## 13.2 Canonical encoding (`trace.hpp`)
+
+```cpp
+inline constexpr uint8_t kTraceSource   = 1;   // ledger = 2 reserved
+inline constexpr size_t  kTraceHeaderBytes = 17;
+inline constexpr size_t  kTraceEntryBytes  = 43;
+
+enum class TraceError : uint8_t { Truncated, BadSource, BadValue, TrailingBytes };
+
+std::string encode_trace(const FaultTrace&);
+std::expected<FaultTrace, TraceError> decode_trace(std::string_view bytes);
+uint64_t trace_hash(const FaultTrace&);        // FNV-1a 64 over the encoding
+```
+
+The bytes are canonical, not the struct: fixed width, declared entry order, little-endian, no
+padding. Header is `u8 source`, `u64 count`, `u64 universe_seed`; each entry is
+`seq u64 · eligible_index u64 · at.ns i64 · site u64 · amount.ns i64 · outcome u8 · drew u8 ·
+status u8`. `sizeof(TraceEntry)` is 48 while the encoding is 43, and `static_assert`s pin both the
+field widths and that gap, so a struct layout change can never silently alter the hash. Capacity is
+buffer size, not schedule, and is not encoded — a decoded trace gets `max(count, 1)`; `dropped` is
+not encoded either, because a truncated trace is not a valid canonical input (`decode_trace` cannot
+recover what was never written, and `--verify` reports overflow instead of hashing a prefix).
+FNV-1a 64 uses offset basis `14695981039346656037` and prime `1099511628211`.
 
 ---
 
@@ -387,6 +462,8 @@ Under `libcosmos`, determinism holds provided that application code:
 ## 15. Error Handling & Tracing
 
 - Findings output a clear repro command: `myapp_test --seed 12345`.
+- After minimization the repro names the kept decision seqs: `myapp_test --seed 12345
+  --only-faults=17,42`.
 - Tracing sink records FNV-1a event hash (`trace_hash`) used by `--verify` double-run validation.
 
 ---

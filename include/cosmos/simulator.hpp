@@ -66,19 +66,28 @@ template <typename Injector> class BasicSimulator {
 
     uint64_t seed() const { return seed_; }
 
-    [[nodiscard]] std::expected<void, ConfigProblem> install_faults(FaultConfig cfg,
-                                                                    uint32_t node_count = 1) {
+    // The campaign's verify mode applies this when a body installs a plan without trace options.
+    void set_default_trace_options(TraceOptions options) { default_trace_options_ = options; }
+
+    [[nodiscard]] std::expected<void, ConfigProblem>
+    install_faults(FaultConfig cfg, uint32_t node_count = 1, TraceOptions trace_options = {}) {
         // A second install would fork stream positions, counters and the ledger against one run.
         if (injector_.has_value()) {
             return std::unexpected(
                 ConfigProblem{ConfigError::InjectorAlreadyInstalled, std::nullopt});
         }
+        // Campaign verify turns tracing on for bodies that do not ask for it themselves.
+        if (!trace_options.enabled && default_trace_options_.enabled) {
+            trace_options = default_trace_options_;
+        }
         // Seeding from the universe seed instead of the Fault domain would collide five of six
         // class sub-streams with the domain streams.
         auto made = Injector::create(std::move(cfg), stream_seed(seed_, StreamDomain::Fault),
-                                     node_count, clock_);
+                                     node_count, clock_, trace_options);
         if (!made.has_value()) return std::unexpected(made.error());
         injector_.emplace(std::move(*made));
+        // The trace names its own universe, so Scenario::replay needs no seed argument.
+        injector_->set_universe_seed(seed_);
         return {};
     }
 
@@ -128,6 +137,7 @@ template <typename Injector> class BasicSimulator {
     Net net_;
     // Declared after clock_ on purpose: the injector borrows it, and destruction is reverse order.
     std::optional<Injector> injector_{};
+    TraceOptions default_trace_options_{};
 };
 
 using Simulator = BasicSimulator<BasicFaultInjector<VirtualClock>>;
