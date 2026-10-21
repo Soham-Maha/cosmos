@@ -1,5 +1,7 @@
 #include "cosmos/net.hpp"
 
+#include <algorithm>
+
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
@@ -101,6 +103,7 @@ int Net::create_endpoint() {
         if (ep.used) continue;
         ep = Endpoint{};
         ep.used = true;
+        ep.node = scheduler_.current_node();
         return kVirtualFdBase + static_cast<int>(i);
     }
     errno = EMFILE;
@@ -233,7 +236,8 @@ int Net::connect(int fd, const struct sockaddr* addr, socklen_t addrlen) {
     }
     const uint16_t port = ntohs(reinterpret_cast<const struct sockaddr_in*>(addr)->sin_port);
     Endpoint* listener = find_listener(port);
-    if (listener == nullptr || listener->pending.size() >= kMaxPending) {
+    if (listener == nullptr || listener->pending.size() >= kMaxPending ||
+        separated(scheduler_.current_node(), listener->node)) {
         errno = ECONNREFUSED;
         return -1;
     }
@@ -242,6 +246,7 @@ int Net::connect(int fd, const struct sockaddr* addr, socklen_t addrlen) {
 
     Endpoint& client = *ep;
     Endpoint& server = *get(server_fd);
+    server.node = listener->node; // the accepted side belongs to the listener's node
     client.connected = true;
     client.port = alloc_port();
     client.peer = server_fd - kVirtualFdBase;
@@ -272,8 +277,15 @@ int Net::accept(int fd, struct sockaddr* addr, socklen_t* addrlen) {
             return -1;
         }
         scheduler_.mutex_lock(&mu_);
-        while (ep->pending.empty())
+        while (ep->pending.empty()) {
             scheduler_.cond_wait(&cond_, &mu_);
+            ep = get(fd); // the listener may have been closed or crashed under us
+            if (ep == nullptr) {
+                scheduler_.mutex_unlock(&mu_);
+                errno = EBADF;
+                return -1;
+            }
+        }
         scheduler_.mutex_unlock(&mu_);
     }
     const int server_index = ep->pending.front();
@@ -348,6 +360,8 @@ ssize_t Net::send(int fd, const void* buf, size_t len, int flags, InjectedFault 
     }
     const size_t count = fault.kind == FaultKind::ShortSend ? (len >= 2 ? len / 2 : len) : len;
     if (count == 0) return 0;
+    // A partition drops the packet: the send still reports success, as a TCP buffer would.
+    if (separated(ep->node, peer->node)) return static_cast<ssize_t>(count);
     if (fault.kind == FaultKind::PacketDrop) return static_cast<ssize_t>(count);
 
     const bool nonblocking = ep->nonblocking || (flags & MSG_DONTWAIT) != 0;
@@ -404,6 +418,11 @@ ssize_t Net::recv(int fd, void* buf, size_t len, int flags, InjectedFault fault)
     if (len == 0) return 0;
     const bool nonblocking = ep->nonblocking || (flags & MSG_DONTWAIT) != 0;
     while (true) {
+        ep = get(fd); // a close or crash from another fiber invalidates the endpoint
+        if (ep == nullptr) {
+            errno = EBADF;
+            return -1;
+        }
         if (!ep->rx.empty()) {
             Packet& packet = ep->rx.front();
             if (packet.deliver_at > clock_.now()) {
@@ -434,8 +453,15 @@ ssize_t Net::recv(int fd, void* buf, size_t len, int flags, InjectedFault fault)
             return -1;
         }
         scheduler_.mutex_lock(&mu_);
-        while (ep->rx.empty() && !ep->peer_closed)
+        while (ep->rx.empty() && !ep->peer_closed) {
             scheduler_.cond_wait(&cond_, &mu_);
+            ep = get(fd); // closed or crashed while blocked: no data will ever arrive
+            if (ep == nullptr) {
+                scheduler_.mutex_unlock(&mu_);
+                errno = EBADF;
+                return -1;
+            }
+        }
         scheduler_.mutex_unlock(&mu_);
     }
 }
@@ -644,6 +670,52 @@ int Net::local_name(int fd, struct sockaddr* addr, socklen_t* addrlen) const {
     }
     write_addr(addr, addrlen, ep->port);
     return 0;
+}
+
+bool Net::separated(NodeId first, NodeId second) const {
+    if (first == second) return false;
+    for (const Split& split : splits_) {
+        const bool first_a = std::find(split.a.begin(), split.a.end(), first) != split.a.end();
+        const bool first_b = std::find(split.b.begin(), split.b.end(), first) != split.b.end();
+        const bool second_a = std::find(split.a.begin(), split.a.end(), second) != split.a.end();
+        const bool second_b = std::find(split.b.begin(), split.b.end(), second) != split.b.end();
+        if ((first_a && second_b) || (first_b && second_a)) return true;
+    }
+    return false;
+}
+
+void Net::partition(const NodeSet& a, const NodeSet& b) {
+    if (a.empty() || b.empty()) return;
+    splits_.push_back(Split{a, b});
+    signal_change();
+}
+
+void Net::heal_partition(const NodeSet& a, const NodeSet& b) {
+    for (auto split = splits_.begin(); split != splits_.end(); ++split) {
+        if (split->a == a && split->b == b) {
+            splits_.erase(split);
+            signal_change();
+            return;
+        }
+    }
+}
+
+void Net::heal_all_partitions() {
+    if (splits_.empty()) return;
+    splits_.clear();
+    signal_change();
+}
+
+void Net::crash_node(NodeId node) {
+    bool changed = false;
+    for (Endpoint& ep : endpoints_) {
+        if (!ep.used || ep.node != node) continue;
+        Endpoint* peer = peer_of(ep);
+        if (peer != nullptr) peer->peer_closed = true;
+        release(ep);
+        changed = true;
+    }
+    if (changed) signal_change();
 }
 
 } // namespace cosmos

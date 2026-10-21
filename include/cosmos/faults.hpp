@@ -466,6 +466,7 @@ enum class ConfigError : uint8_t {
     BadAmount,
     BadTraceCapacity,
     TruncatedTrace,
+    TooManyScheduledEpisodes,
 };
 
 constexpr const char* name_of(ConfigError error) {
@@ -510,6 +511,8 @@ constexpr const char* name_of(ConfigError error) {
         return "BadTraceCapacity";
     case ConfigError::TruncatedTrace:
         return "TruncatedTrace";
+    case ConfigError::TooManyScheduledEpisodes:
+        return "TooManyScheduledEpisodes";
     }
     return "?";
 }
@@ -524,6 +527,60 @@ struct ConfigProblem {
 
 using NodeId = uint32_t;
 using NodeSet = std::vector<NodeId>;
+// Handle for an active episode; 0 is never a valid id.
+using EpisodeId = uint64_t;
+
+// Why an episode start was refused (§11.1); the ledger names the promise it would have broken.
+enum class SkipReason : uint8_t {
+    None = 0,
+    Quiesce,
+    Warmup,
+    SiteDisabled,
+    UnknownNode,
+    AlreadyCrashed,
+    MaxCrashedNodes,
+    MinHealthyQuorum,
+    TooManyEpisodes,
+    NodeBusy,
+    BadPartition,
+    BadDuration,
+    NoDeps,
+    _Count,
+};
+
+constexpr const char* name_of(SkipReason reason) {
+    switch (reason) {
+    case SkipReason::None:
+        return "none";
+    case SkipReason::Quiesce:
+        return "quiesce";
+    case SkipReason::Warmup:
+        return "warmup";
+    case SkipReason::SiteDisabled:
+        return "site_disabled";
+    case SkipReason::UnknownNode:
+        return "unknown_node";
+    case SkipReason::AlreadyCrashed:
+        return "already_crashed";
+    case SkipReason::MaxCrashedNodes:
+        return "max_crashed_nodes";
+    case SkipReason::MinHealthyQuorum:
+        return "min_healthy_quorum";
+    case SkipReason::TooManyEpisodes:
+        return "too_many_episodes";
+    case SkipReason::NodeBusy:
+        return "node_busy";
+    case SkipReason::BadPartition:
+        return "bad_partition";
+    case SkipReason::BadDuration:
+        return "bad_duration";
+    case SkipReason::NoDeps:
+        return "no_scheduler";
+    case SkipReason::_Count:
+        break;
+    }
+    return "?";
+}
 using KnobId = uint64_t;
 
 struct CrashNode {
@@ -546,6 +603,9 @@ struct ScheduledEpisode {
     Duration until_heal{};
     constexpr bool operator==(const ScheduledEpisode&) const = default;
 };
+
+// Fixed arming table: scheduled episodes are validated against this bound at install.
+constexpr size_t kMaxScheduledEpisodes = 32;
 
 struct Knob {
     KnobId id = 0;
@@ -748,6 +808,10 @@ inline std::expected<void, ConfigProblem> FaultConfig::validate(uint32_t node_co
                 if (id >= node_count) return std::unexpected(unknown_node);
             }
         }
+    }
+
+    if (scheduled_episodes.size() > kMaxScheduledEpisodes) {
+        return std::unexpected(ConfigProblem{ConfigError::TooManyScheduledEpisodes, std::nullopt});
     }
 
     // Knobs are drawn per id, so order is part of the reproduction contract; no duplicates.

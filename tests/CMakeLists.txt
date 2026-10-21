@@ -699,3 +699,113 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 add_test(NAME test_kv_store COMMAND test_kv_store)
+
+# P6-S0 gate: exact virtual-time wakeups, drain-only clock advance, seed-stable interleaving,
+# scheduling that never touches the Fault stream, and per-fiber node identity.
+add_executable(test_runtime_gate test_runtime_gate.cpp)
+target_link_libraries(test_runtime_gate PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_runtime_gate PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+        "-fno-builtin-open"
+        "-fno-builtin-read"
+        "-fno-builtin-write"
+        "-fno-builtin-fsync"
+    )
+    target_link_options(test_runtime_gate PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=pthread_create"
+        "-Wl,--wrap=pthread_join"
+        "-Wl,--wrap=pthread_detach"
+        "-Wl,--wrap=pthread_self"
+        "-Wl,--wrap=pthread_equal"
+        "-Wl,--wrap=pthread_exit"
+        "-Wl,--wrap=pthread_mutex_init"
+        "-Wl,--wrap=pthread_mutex_destroy"
+        "-Wl,--wrap=pthread_mutex_lock"
+        "-Wl,--wrap=pthread_mutex_unlock"
+        "-Wl,--wrap=pthread_mutex_trylock"
+        "-Wl,--wrap=pthread_cond_init"
+        "-Wl,--wrap=pthread_cond_destroy"
+        "-Wl,--wrap=pthread_cond_wait"
+        "-Wl,--wrap=pthread_cond_signal"
+        "-Wl,--wrap=pthread_cond_broadcast"
+        "-Wl,--wrap=sched_yield"
+        "-Wl,--wrap=clock_gettime"
+        "-Wl,--wrap=gettimeofday"
+        "-Wl,--wrap=nanosleep"
+        "-Wl,--wrap=clock_nanosleep"
+        "-Wl,--wrap=open"
+        "-Wl,--wrap=open64"
+        "-Wl,--wrap=__open_2"
+        "-Wl,--wrap=__open64_2"
+        "-Wl,--wrap=read"
+        "-Wl,--wrap=__read_chk"
+        "-Wl,--wrap=write"
+        "-Wl,--wrap=fsync"
+        "-Wl,--wrap=fdatasync"
+        "-Wl,--wrap=close"
+    )
+endif()
+
+add_test(NAME test_runtime_gate COMMAND test_runtime_gate)
+
+# P6-S2: episode lifecycle, fault-model limits, partitions, and quiesce healing.
+add_executable(test_episodes test_episodes.cpp)
+target_link_libraries(test_episodes PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_episodes PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_episodes PRIVATE
+        ${cosmos_net_wraps}
+        "-Wl,--wrap=open"
+        "-Wl,--wrap=open64"
+        "-Wl,--wrap=read"
+        "-Wl,--wrap=write"
+        "-Wl,--wrap=fsync"
+        "-Wl,--wrap=fdatasync"
+        "-Wl,--wrap=ftruncate"
+    )
+endif()
+
+add_test(NAME test_episodes COMMAND test_episodes)
+
+# P6-S5: the distributed fixture (docs §17). The fixed twin links the app's backup-ack path.
+foreach(variant buggy fixed)
+    set(target test_distributed)
+    set(defs)
+    if(variant STREQUAL fixed)
+        set(target test_distributed_fixed)
+        set(defs "-DRKV_REQUIRE_BACKUP_ACK" "-DRKV_FIXED")
+    endif()
+    add_executable(${target}
+        test_distributed.cpp
+        ${CMAKE_SOURCE_DIR}/examples/distributed/replicated_kv.c
+    )
+    target_link_libraries(${target} PRIVATE cosmos)
+    target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR}/examples/distributed)
+    target_compile_definitions(${target} PRIVATE COSMOS_RKV_NO_MAIN ${defs})
+    if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${target} PRIVATE
+            "-fno-builtin-malloc"
+            "-fno-builtin-free"
+            "-fno-builtin-calloc"
+            "-fno-builtin-realloc"
+        )
+        target_link_options(${target} PRIVATE ${cosmos_net_wraps})
+    endif()
+    add_test(NAME ${target} COMMAND ${target})
+endforeach()

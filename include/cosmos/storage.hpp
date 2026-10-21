@@ -26,15 +26,16 @@ class StorageModel {
     NodeId active_node() const { return active_node_; }
 
     // Registers an fd after a successful open. truncate means O_TRUNC: durability restarts empty.
-    // Reopening a known path refreshes its node and shrinks durable size when the file shrank
-    // behind the model's back (unlink+recreate, external truncate).
+    // A new file belongs to the opener; later writes re-home it (record_write). Reopening only
+    // adopts a smaller size when the file shrank behind the model's back.
     void track_open(int fd, std::string path, bool truncate);
     void forget_fd(int fd);
     bool is_tracked(int fd) const { return fd_paths_.contains(fd); }
 
     // Copies the bytes a write is about to overwrite, so a reboot can put them back. length is
-    // what the write itself transferred, which a torn sector zeroes even when it added bytes.
-    void record_write(int fd, off_t offset, std::string_view previous, size_t length);
+    // what the write itself transferred. `node` is the writing fiber: the last writer owns the
+    // file, and a later write from another node re-attributes it (shared fds are unsupported).
+    void record_write(int fd, off_t offset, std::string_view previous, size_t length, NodeId node);
     // fsync's boundary: the file's current size becomes durable and rollback records are dropped.
     void commit_fsync(int fd);
     // An application ftruncate can only lower durability: a cut drops the records past it, and a

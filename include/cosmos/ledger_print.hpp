@@ -72,7 +72,10 @@ template <typename Injector> void print_ledger(std::ostream& out, const Injector
              << ("site=" + std::string(name_of(entry.site))) << " "
              << std::setw(detail::kStatusWidth) << name_of(entry.status) << "drew=" << std::setw(4)
              << (entry.drew ? "yes" : "no") << " eligible #" << entry.eligible_index << " -> "
-             << name_of(entry.outcome) << "\n";
+             << name_of(entry.outcome);
+        if (entry.reason != SkipReason::None) body << " reason=" << name_of(entry.reason);
+        if (entry.persistent) body << " persistent";
+        body << "\n";
     }
     if (ledger.size() == 0) body << "  (no faults fired)\n";
     if (ledger.dropped() > 0) {

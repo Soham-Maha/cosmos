@@ -70,7 +70,7 @@ void discards_unsynced_write() {
     assert(model.is_tracked(fd));
     assert(model.file_count() == 1);
 
-    model.record_write(fd, 0, "", 11);
+    model.record_write(fd, 0, "", 11, 0);
     put(fd, 0, "hello world");
     model.reboot(0, false);
 
@@ -87,7 +87,7 @@ void keeps_fsynced_write() {
 
     StorageModel model;
     model.track_open(fd, path, false);
-    model.record_write(fd, 0, "", 5);
+    model.record_write(fd, 0, "", 5, 0);
     put(fd, 0, "abcde");
     model.commit_fsync(fd);
 
@@ -105,11 +105,11 @@ void restores_overwritten_bytes() {
 
     StorageModel model;
     model.track_open(fd, path, false);
-    model.record_write(fd, 0, "", 5);
+    model.record_write(fd, 0, "", 5, 0);
     put(fd, 0, "AAAAA");
     model.commit_fsync(fd);
 
-    model.record_write(fd, 1, get(fd, 1, 3), 3); // pre-image "AAA"
+    model.record_write(fd, 1, get(fd, 1, 3), 3, 0); // pre-image "AAA"
     put(fd, 1, "BBB");
     assert(get(fd, 0, 5) == "ABBBA");
 
@@ -128,7 +128,7 @@ void torn_reboot_zeroes_tail_sector() {
 
     StorageModel model;
     model.track_open(fd, path, false);
-    model.record_write(fd, 0, "", block.size());
+    model.record_write(fd, 0, "", block.size(), 0);
     put(fd, 0, block);
     model.commit_fsync(fd);
 
@@ -150,7 +150,7 @@ void truncating_open_restarts_durability() {
     StorageModel model;
     int fd = open_path(path);
     model.track_open(fd, path, false);
-    model.record_write(fd, 0, "", 5);
+    model.record_write(fd, 0, "", 5, 0);
     put(fd, 0, "hello");
     model.commit_fsync(fd);
     ::close(fd);
@@ -159,7 +159,7 @@ void truncating_open_restarts_durability() {
 
     fd = open_path(path, true);
     model.track_open(fd, path, true);
-    model.record_write(fd, 0, "", 2);
+    model.record_write(fd, 0, "", 2, 0);
     put(fd, 0, "XY");
     model.reboot(0, false);
 
@@ -177,13 +177,13 @@ void reboot_only_touches_its_node() {
     model.set_active_node(0);
     const int fd0 = open_path(first);
     model.track_open(fd0, first, false);
-    model.record_write(fd0, 0, "", 4);
+    model.record_write(fd0, 0, "", 4, 0);
     put(fd0, 0, "keep");
 
     model.set_active_node(1);
     const int fd1 = open_path(second);
     model.track_open(fd1, second, false);
-    model.record_write(fd1, 0, "", 5);
+    model.record_write(fd1, 0, "", 5, 1);
     put(fd1, 0, "node1");
 
     assert(model.active_node() == 1);
@@ -206,7 +206,7 @@ void untracked_fd_is_ignored() {
     const int fd = open_path(path);
 
     StorageModel model;
-    model.record_write(fd, 0, "old", 3);
+    model.record_write(fd, 0, "old", 3, 0);
     put(fd, 0, "new");
     model.commit_fsync(fd);
     model.forget_fd(fd);
@@ -240,7 +240,7 @@ void degrades_past_preimage_budget() {
     while (!model.degraded() && writes < kFileChunks) {
         assert(::pread(fd, previous.data(), previous.size(), offset) ==
                static_cast<ssize_t>(kChunk));
-        model.record_write(fd, offset, previous, kChunk);
+        model.record_write(fd, offset, previous, kChunk, 0);
         put(fd, offset, chunk);
         offset += static_cast<off_t>(kChunk);
         ++writes;
@@ -252,7 +252,7 @@ void degrades_past_preimage_budget() {
     assert(model.tracked_bytes() == 0);
 
     // Recording on a degraded file is a no-op, and a reboot leaves the host bytes untouched.
-    model.record_write(fd, 0, "abc", 3);
+    model.record_write(fd, 0, "abc", 3, 0);
     assert(model.tracked_bytes() == 0);
     model.reboot(0, false);
 
@@ -274,11 +274,11 @@ void reboot_skips_read_only_fd() {
     StorageModel model;
     model.track_open(reader, path, false);
     model.track_open(writer, path, false);
-    model.record_write(writer, 0, "", 4);
+    model.record_write(writer, 0, "", 4, 0);
     put(writer, 0, "AAAA");
     model.commit_fsync(writer);
 
-    model.record_write(writer, 0, get(writer, 0, 2), 2); // pre-image "AA"
+    model.record_write(writer, 0, get(writer, 0, 2), 2, 0); // pre-image "AA"
     put(writer, 0, "BB");
     assert(get(reader, 0, 4) == "BBAA");
 
@@ -299,7 +299,7 @@ void truncate_cuts_durability() {
 
     StorageModel model;
     model.track_open(fd, path, false);
-    model.record_write(fd, 0, "", 8);
+    model.record_write(fd, 0, "", 8, 0);
     put(fd, 0, "ABCDEFGH");
     model.commit_fsync(fd);
 
@@ -322,11 +322,11 @@ void growing_truncate_stays_undurable() {
 
     StorageModel model;
     model.track_open(fd, path, false);
-    model.record_write(fd, 0, "", 4);
+    model.record_write(fd, 0, "", 4, 0);
     put(fd, 0, "AAAA");
     model.commit_fsync(fd);
 
-    model.record_write(fd, 4, "", 4);
+    model.record_write(fd, 4, "", 4, 0);
     put(fd, 4, "BBBB");
     assert(::ftruncate(fd, 8) == 0); // already 8 bytes: growth is a no-op
     model.record_truncate(fd, 8);
@@ -346,7 +346,7 @@ void recreating_shrinks_durable_size() {
 
     int fd = open_path(path);
     model.track_open(fd, path, false);
-    model.record_write(fd, 0, "", 8);
+    model.record_write(fd, 0, "", 8, 0);
     put(fd, 0, "ABCDEFGH");
     model.commit_fsync(fd);
     ::close(fd);
@@ -371,7 +371,7 @@ void reopening_reattributes_the_node() {
     model.set_active_node(0);
     int fd = open_path(path, true);
     model.track_open(fd, path, true);
-    model.record_write(fd, 0, "", 4);
+    model.record_write(fd, 0, "", 4, 0);
     put(fd, 0, "AAAA");
     model.commit_fsync(fd);
     ::close(fd);
@@ -380,7 +380,7 @@ void reopening_reattributes_the_node() {
     model.set_active_node(1);
     fd = open_path(path);
     model.track_open(fd, path, false);
-    model.record_write(fd, 0, "AA", 2);
+    model.record_write(fd, 0, "AA", 2, 1);
     put(fd, 0, "BB");
 
     // Node 0 no longer owns the path, so its reboot must leave the un-synced bytes alone.
@@ -388,6 +388,58 @@ void reopening_reattributes_the_node() {
     assert(get(fd, 0, 4) == "BBAA");
 
     model.reboot(1, false);
+    assert(get(fd, 0, 4) == "AAAA");
+    ::close(fd);
+}
+
+// A read-only open must not re-home a file to whatever node happened to be active.
+void read_open_does_not_rehome_a_file() {
+    TempDir dir;
+    const std::string path = dir.path + "/reader";
+
+    StorageModel model;
+    model.set_active_node(2);
+    const int writer = open_path(path, true);
+    model.track_open(writer, path, true);
+    model.record_write(writer, 0, "", 4, 2);
+    put(writer, 0, "AAAA");
+    model.commit_fsync(writer);
+    model.record_write(writer, 0, "AA", 2, 2);
+    put(writer, 0, "BB");
+
+    model.set_active_node(0); // stale for the reader below
+    const int reader = ::open(path.c_str(), O_RDONLY);
+    assert(reader >= 0);
+    model.track_open(reader, path, false);
+
+    model.reboot(0, false); // not the owner: node 2's un-synced bytes survive
+    assert(get(reader, 0, 4) == "BBAA");
+
+    model.reboot(2, false); // the writer's reboot discards them
+    assert(get(reader, 0, 4) == "AAAA");
+    ::close(reader);
+}
+
+// B4: the last writer owns a shared fd; rebooting the opener must not discard the writer's bytes.
+void later_writer_owns_the_file() {
+    TempDir dir;
+    const std::string path = dir.path + "/shared-fd";
+
+    StorageModel model;
+    model.set_active_node(0);
+    const int fd = open_path(path, true);
+    model.track_open(fd, path, true);
+    model.record_write(fd, 0, "", 4, 0);
+    put(fd, 0, "AAAA");
+    model.commit_fsync(fd);
+
+    model.record_write(fd, 0, "AA", 2, 1); // node 1 writes through node 0's fd
+    put(fd, 0, "BB");
+
+    model.reboot(0, false); // no longer the owner
+    assert(get(fd, 0, 4) == "BBAA");
+
+    model.reboot(1, false); // the writer's reboot discards its own unsynced bytes
     assert(get(fd, 0, 4) == "AAAA");
     ::close(fd);
 }
@@ -411,5 +463,7 @@ int main() {
     growing_truncate_stays_undurable();
     recreating_shrinks_durable_size();
     reopening_reattributes_the_node();
+    later_writer_owns_the_file();
+    read_open_does_not_rehome_a_file();
     return 0;
 }

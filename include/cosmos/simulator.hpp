@@ -69,8 +69,12 @@ template <typename Injector> class BasicSimulator {
     StorageModel& storage() { return storage_; }
     const StorageModel& storage() const { return storage_; }
 
-    // State only: the storage effect lands at reboot, which is when the application observes it.
-    bool crash_node(NodeId node) { return nodes_.crash(node); }
+    // Crashes the node and closes its endpoints; storage is discarded at reboot.
+    bool crash_node(NodeId node) {
+        if (!nodes_.crash(node)) return false;
+        net_.crash_node(node);
+        return true;
+    }
 
     // Discards un-synced storage, then asks the injector whether the last synced sector tears.
     bool reboot_node(NodeId node) {
@@ -91,6 +95,20 @@ template <typename Injector> class BasicSimulator {
     Time now() const { return clock_.now(); }
     void advance_time(Duration d) { clock_.advance(d); }
 
+    // Node the running fiber belongs to; 0 for the main fiber and engine callbacks.
+    NodeId current_node() const { return scheduler_.current_node(); }
+
+    // Spawns a fiber whose wrapped calls are attributed to `node`.
+    int spawn_node(NodeId node, pthread_t* out, void* (*start)(void*), void* arg) {
+        return scheduler_.spawn(node, out, start, arg);
+    }
+
+    // Arms a callback at virtual `when`; false when the fixed deadline table is full.
+    bool at(Time when, void (*fn)(void*), void* context) {
+        return scheduler_.schedule_at(when, fn, context) != 0;
+    }
+    bool cancel_at(uint64_t id) { return scheduler_.cancel_deadline(id); }
+
     uint64_t seed() const { return seed_; }
 
     // The campaign's verify mode applies this when a body installs a plan without trace options.
@@ -103,6 +121,7 @@ template <typename Injector> class BasicSimulator {
             return std::unexpected(
                 ConfigProblem{ConfigError::InjectorAlreadyInstalled, std::nullopt});
         }
+
         // Campaign verify turns tracing on for bodies that do not ask for it themselves.
         if (!trace_options.enabled && default_trace_options_.enabled) {
             trace_options = default_trace_options_;
@@ -110,13 +129,19 @@ template <typename Injector> class BasicSimulator {
         // Seeding from the universe seed instead of the Fault domain would collide five of six
         // class sub-streams with the domain streams.
         auto made = Injector::create(std::move(cfg), stream_seed(seed_, StreamDomain::Fault),
-                                     node_count, clock_, trace_options);
+                                     node_count, clock_, trace_options, episode_deps());
         if (!made.has_value()) return std::unexpected(made.error());
+        // Nothing is crashed before the first install, so the growth path is the only one taken.
+        (void)nodes_.set_node_count(node_count);
         injector_.emplace(std::move(*made));
         // The trace names its own universe, so Scenario::replay needs no seed argument.
         injector_->set_universe_seed(seed_);
-        // Nothing is crashed before the first install, so the growth path is the only one taken.
-        (void)nodes_.set_node_count(node_count);
+        // Scheduled episodes arm here: the injector is stable only after emplacement.
+        if (!injector_->arm_scheduled()) {
+            injector_.reset();
+            return std::unexpected(
+                ConfigProblem{ConfigError::TooManyScheduledEpisodes, std::nullopt});
+        }
         return {};
     }
 
@@ -145,10 +170,53 @@ template <typename Injector> class BasicSimulator {
     void clear_injector()
         requires(!HasFactory<Injector>)
     {
+        // Heal first: an active episode's heal deadline would otherwise outlive its injector.
+        if constexpr (requires { injector_->heal_all(); }) {
+            if (injector_.has_value()) injector_->heal_all();
+        }
         injector_.reset();
     }
 
   private:
+    // The episode layer reaches the runtime through these, never through a Simulator global.
+    EpisodeDeps episode_deps() {
+        EpisodeDeps deps;
+        deps.timers = &scheduler_;
+        deps.nodes = &nodes_;
+        deps.context = this;
+        deps.crash = &BasicSimulator::episode_crash;
+        deps.reboot = &BasicSimulator::episode_reboot;
+        deps.partition = &BasicSimulator::episode_partition;
+        deps.heal_partition = &BasicSimulator::episode_heal_partition;
+        deps.pause = &BasicSimulator::episode_pause;
+        deps.resume = &BasicSimulator::episode_resume;
+        return deps;
+    }
+
+    static void episode_crash(void* context, NodeId node) {
+        (void)static_cast<BasicSimulator*>(context)->crash_node(node);
+    }
+
+    static void episode_reboot(void* context, NodeId node) {
+        (void)static_cast<BasicSimulator*>(context)->reboot_node(node);
+    }
+
+    static void episode_partition(void* context, const NodeSet& a, const NodeSet& b) {
+        static_cast<BasicSimulator*>(context)->net_.partition(a, b);
+    }
+
+    static void episode_heal_partition(void* context, const NodeSet& a, const NodeSet& b) {
+        static_cast<BasicSimulator*>(context)->net_.heal_partition(a, b);
+    }
+
+    static void episode_pause(void* context, NodeId node) {
+        static_cast<BasicSimulator*>(context)->scheduler_.pause_node(node);
+    }
+
+    static void episode_resume(void* context, NodeId node) {
+        static_cast<BasicSimulator*>(context)->scheduler_.resume_node(node);
+    }
+
     // thread_local on purpose: a universe belongs to one OS thread. Fibers of
     // one universe share this slot; wrapped calls on any fiber reach the same
     // universe. A second OS thread gets its own empty slot and falls through
@@ -164,8 +232,7 @@ template <typename Injector> class BasicSimulator {
     Scheduler scheduler_;
     // After scheduler_ and clock_, both of which it borrows.
     Net net_;
-    // Node state and the durability model are independent of the injector: declared before it so
-    // they outlive it, since a reboot decision reads the injector while storage rollback runs.
+    // Declared before the injector so they outlive it; neither borrows it.
     NodeRegistry nodes_{};
     StorageModel storage_{};
     // Declared after clock_ on purpose: the injector borrows it, and destruction is reverse order.

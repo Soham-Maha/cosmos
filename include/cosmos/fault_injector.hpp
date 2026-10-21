@@ -2,7 +2,9 @@
 
 #include "cosmos/faults.hpp"
 #include "cosmos/ledger.hpp"
+#include "cosmos/node_registry.hpp"
 #include "cosmos/random.hpp"
+#include "cosmos/task.hpp"
 #include "cosmos/time.hpp"
 #include "cosmos/trace.hpp"
 #include <array>
@@ -10,6 +12,7 @@
 #include <concepts>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <utility>
 
 namespace cosmos {
@@ -18,6 +21,19 @@ namespace cosmos {
 template <typename C>
 concept ClockLike = requires(const C& clock) {
     { clock.now() } -> std::same_as<Time>;
+};
+
+// Runtime hooks an episode needs; function pointers keep the injector free of Simulator/Net.
+struct EpisodeDeps {
+    Scheduler* timers = nullptr;
+    const NodeRegistry* nodes = nullptr;
+    void* context = nullptr;
+    void (*crash)(void*, NodeId) = nullptr;
+    void (*reboot)(void*, NodeId) = nullptr;
+    void (*partition)(void*, const NodeSet&, const NodeSet&) = nullptr;
+    void (*heal_partition)(void*, const NodeSet&, const NodeSet&) = nullptr;
+    void (*pause)(void*, NodeId) = nullptr;
+    void (*resume)(void*, NodeId) = nullptr;
 };
 
 // Pure so the edges can be pinned at values no seed reaches; rate 0 returns before dividing.
@@ -42,7 +58,7 @@ template <ClockLike Clock> class BasicFaultInjector {
     // A factory, not a constructor: an assert would wave an invalid config through under NDEBUG.
     [[nodiscard]] static std::expected<BasicFaultInjector, ConfigProblem>
     create(FaultConfig cfg, uint64_t fault_stream_seed, uint32_t node_count, const Clock& clock,
-           TraceOptions trace_options = {}) {
+           TraceOptions trace_options = {}, EpisodeDeps deps = {}) {
         if (const auto checked = cfg.validate(node_count); !checked.has_value()) {
             return std::unexpected(checked.error());
         }
@@ -50,7 +66,7 @@ template <ClockLike Clock> class BasicFaultInjector {
         if (trace_options.enabled && trace_options.capacity == 0) {
             return std::unexpected(ConfigProblem{ConfigError::BadTraceCapacity, std::nullopt});
         }
-        return BasicFaultInjector(std::move(cfg), fault_stream_seed, clock, trace_options);
+        return BasicFaultInjector(std::move(cfg), fault_stream_seed, clock, trace_options, deps);
     }
 
     // A copy would fork the engine: two stream positions and two budgets against one run.
@@ -71,6 +87,78 @@ template <ClockLike Clock> class BasicFaultInjector {
     FaultKind decide_event(FaultClass cls, SiteId site) {
         assert(is_event_site(site));
         return decide_at(cls, site);
+    }
+
+    // ---- Episodes (§10.2): start with a limit check, always schedule a heal ----
+    static constexpr size_t kMaxEpisodes = 32;
+    std::optional<EpisodeId> start_partition(const NodeSet& a, const NodeSet& b,
+                                             Duration until_heal) {
+        return start_episode(SiteId::partition, 0, a, b, until_heal);
+    }
+    std::optional<EpisodeId> crash_node(NodeId node, Duration until_reboot) {
+        return start_episode(SiteId::crash_node, node, {}, {}, until_reboot);
+    }
+    std::optional<EpisodeId> pause_node(NodeId node, Duration until_resume) {
+        return start_episode(SiteId::pause_node, node, {}, {}, until_resume);
+    }
+    // Persistent crash: deliberately no heal; only quiesce clears it (§4.2.1).
+    std::optional<EpisodeId> abandon_node(NodeId node) {
+        return start_episode(SiteId::crash_node, node, {}, {}, Duration{1}, true);
+    }
+    // One-way: heal everything touching `core`, make the rest persistent, and keep it that way.
+    bool liveness() const { return liveness_; }
+    void heal(EpisodeId id) {
+        if (id == 0) return;
+        for (ActiveEpisode& episode : active_) {
+            if (episode.used && episode.id == id) {
+                heal_episode(episode);
+                return;
+            }
+        }
+    }
+    void heal_all() {
+        for (ActiveEpisode& episode : active_) {
+            if (episode.used) heal_episode(episode);
+        }
+    }
+    // Terminal settle-down: faults off, then every episode (persistent included) healed.
+    void begin_quiesce() {
+        quiescing_ = true;
+        heal_all();
+    }
+    bool enter_liveness_mode(const NodeSet& core) {
+        if (liveness_) return false;
+        liveness_ = true;
+        core_ = core;
+        for (ActiveEpisode& episode : active_) {
+            if (!episode.used) continue;
+            if (touches_core(episode.site, episode.node, episode.a, episode.b)) {
+                heal_episode(episode);
+            } else {
+                make_persistent(episode);
+            }
+        }
+        return true;
+    }
+    bool quiescing() const { return quiescing_; }
+    size_t active_episodes() const { return active_count_; }
+    bool arm_scheduled() {
+        if (cfg_.scheduled_episodes.size() > kMaxScheduledEpisodes) return false;
+        for (size_t i = 0; i < cfg_.scheduled_episodes.size(); ++i) {
+            ScheduledEvent& event = scheduled_[i];
+            event.at = cfg_.scheduled_episodes[i].at;
+            event.spec = cfg_.scheduled_episodes[i].spec;
+            event.until = cfg_.scheduled_episodes[i].until_heal;
+            event.owner = this;
+            event.deadline =
+                deps_.timers->schedule_at(event.at, &BasicFaultInjector::fire_scheduled, &event);
+            if (event.deadline == 0) {
+                disarm_scheduled();
+                return false;
+            }
+            event.used = true;
+        }
+        return true;
     }
 
     // A counter, not a flag: an inner critical section ending must not re-enable the outer one.
@@ -120,12 +208,12 @@ template <ClockLike Clock> class BasicFaultInjector {
 
   private:
     BasicFaultInjector(FaultConfig cfg, uint64_t fault_stream_seed, const Clock& clock,
-                       TraceOptions trace_options)
+                       TraceOptions trace_options, EpisodeDeps deps)
         : cfg_(std::move(cfg)),
           streams_(make_streams(fault_stream_seed, std::make_index_sequence<kFaultClassCount>{})),
           clock_(clock),
           // Sized once, while no universe is current: the buffer is not tracked and not faulted.
-          trace_(trace_options.enabled ? trace_options.capacity : 0) {
+          trace_(trace_options.enabled ? trace_options.capacity : 0), deps_(deps) {
         cfg_.normalize();
     }
 
@@ -141,7 +229,7 @@ template <ClockLike Clock> class BasicFaultInjector {
         const size_t slot = site_slot(site);
         if (slot == kNoSite) return FaultKind::None;
 
-        if (quiet_depth_ > 0) return FaultKind::None;
+        if (quiet_depth_ > 0 || quiescing_) return FaultKind::None;
         if (clock_.now() >= cfg_.quiesce_after) return FaultKind::None;
 
         // From the site, never the argument: gating on one class and drawing from another's
@@ -176,6 +264,289 @@ template <ClockLike Clock> class BasicFaultInjector {
         record_decision(site, slot, *rule, kind, consumes_draw(*rule));
         if (kind == FaultKind::None) return FaultKind::None;
         return record_fire(site_class, site, slot, kind, true);
+    }
+
+    // One active episode; the array slot doubles as the heal callback context.
+    struct ActiveEpisode {
+        EpisodeId id = 0;
+        SiteId site = SiteId::crash_node;
+        NodeId node = 0;
+        NodeSet a;
+        NodeSet b;
+        uint64_t deadline = 0;
+        bool used = false;
+        bool persistent = false;
+        BasicFaultInjector* owner = nullptr;
+    };
+
+    static void heal_due(void* context) {
+        auto* episode = static_cast<ActiveEpisode*>(context);
+        if (episode->used && episode->owner != nullptr) episode->owner->heal(episode->id);
+    }
+
+    // A refusal is recorded, never silent: the ledger names the promise that would have broken.
+    bool refuse(SiteId site, SkipReason reason) {
+        ledger_.record(LedgerEntry{.fire_index = fires_,
+                                   .at = clock_.now(),
+                                   .site = site,
+                                   .eligible_index = active_count_,
+                                   .fault_class = class_of(site),
+                                   .outcome = FaultKind::None,
+                                   .drew = false,
+                                   .status = DecisionStatus::Skipped,
+                                   .reason = reason});
+        return false;
+    }
+
+    // In replay, consume this site's recorded start; false when the filter withholds it.
+    bool episode_allowed(SiteId site) {
+        if (!replaying()) return true;
+        const TraceEntry* entry = peek();
+        if (entry == nullptr || entry->site != site) return true;
+        ++cursor_;
+        if (entry->status != DecisionStatus::Fired || filter_.withholds(entry->seq)) {
+            ledger_.record(LedgerEntry{.fire_index = fires_,
+                                       .at = clock_.now(),
+                                       .site = site,
+                                       .eligible_index = active_count_ + 1,
+                                       .fault_class = class_of(site),
+                                       .outcome = FaultKind::None,
+                                       .drew = false,
+                                       .status = DecisionStatus::Suppressed});
+            ++withheld_;
+            return false;
+        }
+        return true;
+    }
+
+    void record_episode(SiteId site, Duration until) {
+        ++decisions_;
+        if (!trace_.enabled()) return;
+        trace_.record(TraceEntry{.seq = decisions_,
+                                 .eligible_index = active_count_,
+                                 .at = clock_.now(),
+                                 .site = site,
+                                 .amount = until,
+                                 .outcome = FaultKind::None,
+                                 .drew = false,
+                                 .status = DecisionStatus::Fired});
+    }
+
+    void heal_episode(ActiveEpisode& episode) {
+        if (episode.deadline != 0) (void)deps_.timers->cancel_deadline(episode.deadline);
+        if (episode.site == SiteId::crash_node) {
+            deps_.reboot(deps_.context, episode.node);
+        } else if (episode.site == SiteId::pause_node) {
+            deps_.resume(deps_.context, episode.node);
+        } else {
+            deps_.heal_partition(deps_.context, episode.a, episode.b);
+        }
+        // A heal row uses the fire counter as its ledger sequence; it is not itself a fire.
+        ledger_.record(LedgerEntry{.fire_index = fires_,
+                                   .at = clock_.now(),
+                                   .site = episode.site,
+                                   .eligible_index = active_count_,
+                                   .fault_class = class_of(episode.site),
+                                   .outcome = FaultKind::None,
+                                   .drew = false,
+                                   .persistent = episode.persistent});
+        ++fires_;
+        episode.used = false;
+        episode.persistent = false;
+        episode.deadline = 0;
+        episode.a.clear();
+        episode.b.clear();
+        --active_count_;
+    }
+
+    bool in_core(NodeId node) const {
+        for (NodeId id : core_) {
+            if (id == node) return true;
+        }
+        return false;
+    }
+
+    // A fault touches core if any node it names is in the core set.
+    bool touches_core(SiteId site, NodeId node, const NodeSet& a, const NodeSet& b) const {
+        if (site != SiteId::partition) return in_core(node);
+        for (NodeId id : a) {
+            if (in_core(id)) return true;
+        }
+        for (NodeId id : b) {
+            if (in_core(id)) return true;
+        }
+        return false;
+    }
+
+    void make_persistent(ActiveEpisode& episode) {
+        if (episode.deadline != 0) (void)deps_.timers->cancel_deadline(episode.deadline);
+        episode.deadline = 0;
+        episode.persistent = true;
+    }
+
+    struct ScheduledEvent {
+        Time at{};
+        EpisodeSpec spec{};
+        Duration until{};
+        uint64_t deadline = 0;
+        bool used = false;
+        BasicFaultInjector* owner = nullptr;
+    };
+
+    static void fire_scheduled(void* context) {
+        auto* event = static_cast<ScheduledEvent*>(context);
+        if (!event->used || event->owner == nullptr) return;
+        event->used = false;
+        event->deadline = 0;
+        event->owner->start_scheduled(*event);
+    }
+
+    // Withdraws every armed event; a half-armed install must leave no callback behind.
+    void disarm_scheduled() {
+        for (ScheduledEvent& event : scheduled_) {
+            if (event.deadline != 0 && deps_.timers != nullptr) {
+                (void)deps_.timers->cancel_deadline(event.deadline);
+            }
+            event.deadline = 0;
+            event.used = false;
+        }
+    }
+
+    void start_scheduled(ScheduledEvent& event) {
+        if (const auto* crash = std::get_if<CrashNode>(&event.spec)) {
+            (void)crash_node(crash->id, event.until);
+        } else if (const auto* pause = std::get_if<PauseNode>(&event.spec)) {
+            (void)start_episode(SiteId::pause_node, pause->id, {}, {}, event.until);
+        } else if (const auto* split = std::get_if<Partition>(&event.spec)) {
+            (void)start_partition(split->a, split->b, event.until);
+        }
+    }
+
+    std::optional<EpisodeId> start_episode(SiteId site, NodeId node, NodeSet a, NodeSet b,
+                                           Duration until, bool persistent = false) {
+        if (deps_.timers == nullptr || deps_.nodes == nullptr || deps_.crash == nullptr ||
+            deps_.reboot == nullptr || deps_.partition == nullptr ||
+            deps_.heal_partition == nullptr || deps_.pause == nullptr || deps_.resume == nullptr) {
+            (void)refuse(site, SkipReason::NoDeps);
+            return std::nullopt;
+        }
+        if (quiescing_ || clock_.now() >= cfg_.quiesce_after) {
+            (void)refuse(site, SkipReason::Quiesce);
+            return std::nullopt;
+        }
+        if (clock_.now() < cfg_.warmup_until) {
+            (void)refuse(site, SkipReason::Warmup);
+            return std::nullopt;
+        }
+        if (!cfg_.is_site_activated(site) || !cfg_.is_class_enabled(class_of(site))) {
+            (void)refuse(site, SkipReason::SiteDisabled);
+            return std::nullopt;
+        }
+        if (until <= Duration::zero()) {
+            (void)refuse(site, SkipReason::BadDuration);
+            return std::nullopt;
+        }
+        if (site == SiteId::crash_node || site == SiteId::pause_node) {
+            if (!deps_.nodes->is_known(node)) {
+                (void)refuse(site, SkipReason::UnknownNode);
+                return std::nullopt;
+            }
+            if (!deps_.nodes->is_live(node)) {
+                (void)refuse(site, SkipReason::AlreadyCrashed);
+                return std::nullopt;
+            }
+            // Crash limits do not apply to a pause: the node is unhealthy, not dead.
+            if (site == SiteId::crash_node) {
+                // Quorum first: both limits are true at the last allowed crash.
+                if (deps_.nodes->live_count() <= cfg_.min_healthy_quorum) {
+                    (void)refuse(site, SkipReason::MinHealthyQuorum);
+                    return std::nullopt;
+                }
+                if (deps_.nodes->crashed_count() >= cfg_.max_crashed_nodes) {
+                    (void)refuse(site, SkipReason::MaxCrashedNodes);
+                    return std::nullopt;
+                }
+            }
+        } else {
+            if (a.empty() || b.empty()) {
+                (void)refuse(site, SkipReason::BadPartition);
+                return std::nullopt;
+            }
+            for (NodeId id : a) {
+                if (!deps_.nodes->is_known(id)) {
+                    (void)refuse(site, SkipReason::UnknownNode);
+                    return std::nullopt;
+                }
+            }
+            for (NodeId id : b) {
+                if (!deps_.nodes->is_known(id)) {
+                    (void)refuse(site, SkipReason::UnknownNode);
+                    return std::nullopt;
+                }
+            }
+        }
+
+        // One node-fault at a time, after the state checks so a crashed node reports that first.
+        if (site != SiteId::partition) {
+            for (const ActiveEpisode& active : active_) {
+                if (active.used && active.node == node) {
+                    (void)refuse(site, SkipReason::NodeBusy);
+                    return std::nullopt;
+                }
+            }
+        }
+
+        size_t free_slot = kMaxEpisodes;
+        for (size_t i = 0; i < kMaxEpisodes; ++i) {
+            if (!active_[i].used) {
+                free_slot = i;
+                break;
+            }
+        }
+        if (free_slot == kMaxEpisodes) {
+            (void)refuse(site, SkipReason::TooManyEpisodes);
+            return std::nullopt;
+        }
+        if (!episode_allowed(site)) return std::nullopt;
+
+        // After the liveness transition, a fault touching no core node stays broken by design.
+        const bool forever = persistent || (liveness_ && !touches_core(site, node, a, b));
+        ActiveEpisode& episode = active_[free_slot];
+        episode.id = next_episode_++;
+        episode.site = site;
+        episode.node = node;
+        episode.a = std::move(a);
+        episode.b = std::move(b);
+        episode.persistent = forever;
+        episode.owner = this;
+        if (!forever) {
+            episode.deadline = deps_.timers->schedule_at(clock_.now() + until,
+                                                         &BasicFaultInjector::heal_due, &episode);
+            if (episode.deadline == 0) {
+                (void)refuse(site, SkipReason::TooManyEpisodes);
+                return std::nullopt;
+            }
+        }
+        episode.used = true;
+        ++active_count_;
+        if (site == SiteId::crash_node) {
+            deps_.crash(deps_.context, node);
+        } else if (site == SiteId::pause_node) {
+            deps_.pause(deps_.context, node);
+        } else {
+            deps_.partition(deps_.context, episode.a, episode.b);
+        }
+        ledger_.record(LedgerEntry{.fire_index = fires_,
+                                   .at = clock_.now(),
+                                   .site = site,
+                                   .eligible_index = active_count_,
+                                   .fault_class = class_of(site),
+                                   .outcome = FaultKind::None,
+                                   .drew = false,
+                                   .persistent = forever});
+        ++fires_;
+        record_episode(site, forever ? Duration::zero() : until);
+        return episode.id;
     }
 
     // Rate 0 cannot fire so it never draws (Rule 3); rate 1 still draws, to pick the outcome.
@@ -282,6 +653,14 @@ template <ClockLike Clock> class BasicFaultInjector {
     TraceFilter filter_{};
     size_t cursor_{0};
     uint64_t withheld_{0};
+    std::array<ActiveEpisode, kMaxEpisodes> active_{};
+    std::array<ScheduledEvent, kMaxScheduledEpisodes> scheduled_{};
+    bool liveness_{false};
+    NodeSet core_;
+    size_t active_count_{0};
+    EpisodeId next_episode_{1};
+    bool quiescing_{false};
+    EpisodeDeps deps_{};
 };
 
 // Non-movable too: a second owner would pop a quiet window it never pushed.

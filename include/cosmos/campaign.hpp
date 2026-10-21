@@ -44,6 +44,8 @@ inline bool is_harness_id(const std::string& id) { return id.rfind("cosmos.", 0)
 // Runs one universe. The campaign owns the Simulator; the callee drives a Scenario over it, so its
 // report comes back as the universe's result.
 using UniverseFn = std::function<ScenarioReport(Simulator&, uint64_t universe_index)>;
+// Same body with the cluster size from CampaignConfig::node_count, so a fixture cannot disagree.
+using NodeUniverseFn = std::function<ScenarioReport(Simulator&, uint64_t, uint32_t node_count)>;
 
 struct CampaignConfig {
     uint64_t trials = 1000;
@@ -772,6 +774,13 @@ inline void print_campaign_json(std::ostream& out, const CampaignReport& report)
 
 class Campaign {
   public:
+    static CampaignReport run(const CampaignConfig& config, const NodeUniverseFn& build_fn) {
+        const uint32_t nodes = config.node_count;
+        return run(config, UniverseFn([build_fn, nodes](Simulator& sim, uint64_t index) {
+                       return build_fn(sim, index, nodes);
+                   }));
+    }
+
     static CampaignReport run(const CampaignConfig& config, const UniverseFn& build_fn) {
         // A zero-capacity trace cannot record, so verify would have nothing to hash.
         if (config.verify && config.trace_capacity == 0) {

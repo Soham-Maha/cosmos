@@ -24,6 +24,10 @@ struct LedgerEntry {
     FaultKind outcome;
     bool drew;
     DecisionStatus status = DecisionStatus::Fired;
+    // Set on a Skipped episode start; None everywhere else.
+    SkipReason reason = SkipReason::None;
+    // An episode deliberately created without a heal (or converted by the liveness transition).
+    bool persistent = false;
 };
 
 constexpr size_t kLedgerCapacity = 256;

@@ -94,13 +94,13 @@ class TraceFilter {
         return filter;
     }
 
-    // Every fire except the kept ones: the `--only-faults=N` repro. Entries that injected nothing
-    // are never withheld — there is no fault in them to withhold.
+    // Every fire and episode start except the kept ones: the `--only-faults=N` repro. Point
+    // entries that injected nothing are never withheld — there is no fault in them to withhold.
     static TraceFilter only_faults(const FaultTrace& source, std::vector<uint64_t> kept_seqs) {
         std::sort(kept_seqs.begin(), kept_seqs.end());
         TraceFilter filter;
         for (const TraceEntry& entry : source) {
-            if (entry.outcome == FaultKind::None) continue;
+            if (entry.outcome == FaultKind::None && !is_event_site(entry.site)) continue;
             if (!std::binary_search(kept_seqs.begin(), kept_seqs.end(), entry.seq)) {
                 filter.withheld_.push_back(entry.seq);
             }

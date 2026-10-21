@@ -68,11 +68,12 @@ PreImage capture_pre_image(cosmos::StorageModel& storage, int fd, off_t at, size
 
 // Records one successful real write: only what the kernel reported moved, and only the matching
 // pre-image prefix, which a native short write leaves untouched.
-void record_success(cosmos::StorageModel& storage, int fd, const PreImage& image, ssize_t ret) {
+void record_success(cosmos::StorageModel& storage, int fd, const PreImage& image, ssize_t ret,
+                    cosmos::NodeId node) {
     if (ret <= 0 || image.offset < 0) return;
     const size_t keep = std::min(image.bytes.size(), static_cast<size_t>(ret));
     storage.record_write(fd, image.offset, std::string_view(image.bytes).substr(0, keep),
-                         static_cast<size_t>(ret));
+                         static_cast<size_t>(ret), node);
 }
 
 // Bytes a writev transfer covers. A null iovec transfers nothing, which keeps it ineligible.
@@ -111,6 +112,13 @@ int storage_fault_errno(cosmos::FaultKind kind) {
     default:
         return 0; // None, or a kind this site cannot emit.
     }
+}
+
+// Registers a tracked file under the opening fiber's node, so a reboot targets its owner.
+void track_open_for_node(cosmos::Simulator* sim, int fd, const char* path, int flags) {
+    // A reader must not steal ownership from the node that writes the file.
+    if ((flags & O_ACCMODE) != O_RDONLY) sim->storage().set_active_node(sim->current_node());
+    sim->storage().track_open(fd, path, (flags & O_TRUNC) != 0);
 }
 
 } // namespace
@@ -169,7 +177,7 @@ int __wrap_open(const char* pathname, int flags, ...) {
     // Only a successful open registers: a faulted open returned above and creates nothing.
     const int fd = __real_open(pathname, flags, mode);
     if (fd >= 0 && cosmos::wrappers::storage_fd_eligible(fd)) {
-        sim->storage().track_open(fd, pathname, (flags & O_TRUNC) != 0);
+        track_open_for_node(sim, fd, pathname, flags);
     }
     return fd;
 }
@@ -210,7 +218,7 @@ int __wrap_open64(const char* pathname, int flags, ...) {
     }
     const int fd = __real_open64(pathname, flags, mode);
     if (fd >= 0 && cosmos::wrappers::storage_fd_eligible(fd)) {
-        sim->storage().track_open(fd, pathname, (flags & O_TRUNC) != 0);
+        track_open_for_node(sim, fd, pathname, flags);
     }
     return fd;
 }
@@ -234,7 +242,7 @@ int __wrap___open_2(const char* pathname, int flags) {
     }
     const int fd = __real___open_2(pathname, flags);
     if (fd >= 0 && cosmos::wrappers::storage_fd_eligible(fd)) {
-        sim->storage().track_open(fd, pathname, (flags & O_TRUNC) != 0);
+        track_open_for_node(sim, fd, pathname, flags);
     }
     return fd;
 }
@@ -258,7 +266,7 @@ int __wrap___open64_2(const char* pathname, int flags) {
     }
     const int fd = __real___open64_2(pathname, flags);
     if (fd >= 0 && cosmos::wrappers::storage_fd_eligible(fd)) {
-        sim->storage().track_open(fd, pathname, (flags & O_TRUNC) != 0);
+        track_open_for_node(sim, fd, pathname, flags);
     }
     return fd;
 }
@@ -340,7 +348,7 @@ ssize_t __wrap_write(int fd, const void* buf, size_t count) {
     // A faulted call has already returned, so only a real write captures the bytes it replaces.
     const PreImage image = capture_pre_image(sim->storage(), fd, -1, count);
     const ssize_t ret = __real_write(fd, buf, write_request(kind, count));
-    record_success(sim->storage(), fd, image, ret);
+    record_success(sim->storage(), fd, image, ret, sim->current_node());
     return ret;
 }
 
@@ -370,7 +378,7 @@ ssize_t __wrap___write_chk(int fd, const void* buf, size_t count, size_t buflen)
 
     const PreImage image = capture_pre_image(sim->storage(), fd, -1, count);
     const ssize_t ret = __real_write(fd, buf, write_request(kind, count));
-    record_success(sim->storage(), fd, image, ret);
+    record_success(sim->storage(), fd, image, ret, sim->current_node());
     return ret;
 }
 
@@ -399,7 +407,7 @@ ssize_t __wrap_pwrite(int fd, const void* buf, size_t count, off_t offset) {
 
     const PreImage image = capture_pre_image(sim->storage(), fd, offset, count);
     const ssize_t ret = __real_pwrite(fd, buf, write_request(kind, count), offset);
-    record_success(sim->storage(), fd, image, ret);
+    record_success(sim->storage(), fd, image, ret, sim->current_node());
     return ret;
 }
 
@@ -426,7 +434,7 @@ ssize_t __wrap_pwrite64(int fd, const void* buf, size_t count, off64_t offset) {
 
     const PreImage image = capture_pre_image(sim->storage(), fd, static_cast<off_t>(offset), count);
     const ssize_t ret = __real_pwrite64(fd, buf, write_request(kind, count), offset);
-    record_success(sim->storage(), fd, image, ret);
+    record_success(sim->storage(), fd, image, ret, sim->current_node());
     return ret;
 }
 
@@ -468,7 +476,7 @@ ssize_t __wrap_writev(int fd, const struct iovec* iov, int count) {
         // No boundary at this cut: a short transfer is not observable, so the call stays whole.
         ret = __real_writev(fd, iov, count);
     }
-    record_success(sim->storage(), fd, image, ret);
+    record_success(sim->storage(), fd, image, ret, sim->current_node());
     return ret;
 }
 
@@ -506,7 +514,7 @@ ssize_t __wrap_pwritev(int fd, const struct iovec* iov, int count, off_t offset)
     } else {
         ret = __real_pwritev(fd, iov, count, offset);
     }
-    record_success(sim->storage(), fd, image, ret);
+    record_success(sim->storage(), fd, image, ret, sim->current_node());
     return ret;
 }
 

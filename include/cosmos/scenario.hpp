@@ -157,7 +157,10 @@ class Scenario {
             report_.active_allocations = sim_->heap().active_count();
             record_lifecycle("quiesce() called without run()");
             auto* early_injector = sim_->injector_or_null();
-            if (early_injector != nullptr) early_injector->push_quiet();
+            if (early_injector != nullptr) {
+                early_injector->begin_quiesce();
+                early_injector->push_quiet();
+            }
             {
                 CurrentGuard guard(*this);
                 sim_->scheduler().run_until_quiescence();
@@ -165,7 +168,10 @@ class Scenario {
             return;
         }
         auto* injector = sim_->injector_or_null();
-        if (injector != nullptr) injector->push_quiet();
+        if (injector != nullptr) {
+            injector->begin_quiesce();
+            injector->push_quiet();
+        }
         bool saw_deadlock = false;
         {
             CurrentGuard guard(*this);
@@ -186,6 +192,9 @@ class Scenario {
         // Outside the guard so the detail string cannot become a tracked block
         // the snapshot above just claimed to describe.
         if (saw_deadlock) record_lifecycle("deadlock detected during quiesce drain");
+        if (injector != nullptr && injector->active_episodes() != 0) {
+            record_lifecycle("active episodes after quiesce");
+        }
     }
 
     // The oracle is deliberately not evaluated out of order: the world has not settled, so its

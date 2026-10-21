@@ -67,6 +67,8 @@ void StorageModel::track_open(int fd, std::string path, bool truncate) {
     auto [entry, inserted] = files_.try_emplace(std::move(path));
     FileState& file = entry->second;
     if (inserted) {
+        // The owner is the opener; every later write re-homes the file to its writer.
+        file.node = active_node_;
         file.durable_size = actual;
     } else if (actual < file.durable_size) {
         // The file shrank behind the model's back (unlink+recreate, external truncate).
@@ -75,7 +77,6 @@ void StorageModel::track_open(int fd, std::string path, bool truncate) {
         file.durable_size = actual;
     }
     // Never raise durable_size here: another fd's un-synced append is not durable.
-    file.node = active_node_;
 
     if (truncate) {
         // O_TRUNC threw the previous contents away, so the durable state is empty too.
@@ -87,7 +88,8 @@ void StorageModel::track_open(int fd, std::string path, bool truncate) {
 
 void StorageModel::forget_fd(int fd) { fd_paths_.erase(fd); }
 
-void StorageModel::record_write(int fd, off_t offset, std::string_view previous, size_t length) {
+void StorageModel::record_write(int fd, off_t offset, std::string_view previous, size_t length,
+                                NodeId node) {
     auto fd_entry = fd_paths_.find(fd);
     if (fd_entry == fd_paths_.end()) return;
     auto file_entry = files_.find(fd_entry->second);
@@ -95,6 +97,7 @@ void StorageModel::record_write(int fd, off_t offset, std::string_view previous,
 
     FileState& file = file_entry->second;
     if (file.degraded) return; // discard is already a no-op for this file
+    file.node = node;          // the writer owns the file from now on
 
     file.unsynced.push_back(WriteRecord{offset, length, std::string(previous)});
     tracked_bytes_ += previous.size();

@@ -176,7 +176,9 @@ inline TrialResult run_trial(const FaultTrace& source, TraceFilter filter, const
 inline std::vector<TraceEntry> candidates_of(const FaultTrace& source) {
     std::vector<TraceEntry> candidates;
     for (const TraceEntry& entry : source) {
-        if (entry.outcome != FaultKind::None) candidates.push_back(entry);
+        if (entry.outcome != FaultKind::None || is_event_site(entry.site)) {
+            candidates.push_back(entry);
+        }
     }
     return candidates;
 }
