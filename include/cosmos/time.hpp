@@ -127,14 +127,12 @@ inline constexpr int64_t kDefaultRealtimeEpochNs = 1767225600000000000LL;
  * @brief Deterministic virtual clock owned by a Simulator universe.
  *
  * Tracks monotonic virtual time (starting at 0ns) and wall-clock realtime (anchored at a
- * deterministic base epoch). In simulation testing builds, clock_gettime, gettimeofday, and
- * the sleep calls read and advance this clock without real-time OS delays.
+ * deterministic base epoch). In simulation testing builds, clock_gettime and gettimeofday
+ * read this clock without real-time OS delays.
  *
- * Interim contract: until the P1 fiber scheduler exists, sleeps advance the universe clock
- * by the full request immediately — nothing suspends. Once the scheduler lands
- * (docs/design.md §3), sleep calls must instead suspend the calling task and register a
- * wake-up event: virtual time only advances when no task is runnable, and one task's sleep
- * must not consume time for others.
+ * Sleeps do not live here: Scheduler::sleep_ns and Scheduler::sleep_clock suspend the calling
+ * task on the timer queue, and virtual time advances only when the scheduler drains the next
+ * timer (docs/design.md §5). One task's sleep never consumes time for another runnable task.
  */
 class VirtualClock {
   public:
@@ -204,8 +202,9 @@ class VirtualClock {
         return 0;
     }
 
-    // Interim semantics: advances the universe clock by the full request. See the class
-    // comment for the scheduler-era contract.
+    // Raw form: advances the clock by the full request without suspending. The nanosleep
+    // entry point goes through Scheduler::sleep_ns, which blocks the caller until its timer
+    // drains; direct callers are tests and engine code that already decided to move time.
     int nanosleep(const struct timespec* req, struct timespec* rem) {
         if (!req) {
             errno = EFAULT;

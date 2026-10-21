@@ -143,9 +143,9 @@ DrawCount run_mixed_decisions(Injector& injector, uint64_t decisions) {
             injector.decide(FaultClass::Network, SiteId::accept); // zero-rate trigger
             break;
         case 9:
-            injector.decide(FaultClass::Storage, SiteId::read);        // site never activated
-            injector.decide(FaultClass::Clock, SiteId::clock_gettime); // class disabled
-            injector.decide(FaultClass::Process, SiteId::crash_node);  // event site
+            injector.decide(FaultClass::Storage, SiteId::read);             // site never activated
+            injector.decide(FaultClass::Clock, SiteId::clock_gettime);      // class disabled
+            injector.decide_event(FaultClass::Process, SiteId::crash_node); // event site
             break;
         default:
             assert(false);
@@ -199,6 +199,7 @@ void test_phase1_gate_zero_rng_leakage_over_a_million_decisions() {
     assert(injector.injections(SiteId::fsync) == 0);
     assert(injector.eligible_calls(SiteId::read) == 0);
     assert(injector.eligible_calls(SiteId::clock_gettime) == 0);
+    // Gated before any counter: the Process class is disabled, so the event site stays uncounted.
     assert(injector.eligible_calls(SiteId::crash_node) == 0);
     assert(injector.eligible_calls(SiteId::recv) > 0);
     assert(injector.eligible_calls(SiteId::fsync) > 0);

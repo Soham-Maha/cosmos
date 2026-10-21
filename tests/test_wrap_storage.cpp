@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 // Every kind a storage wrapper can emit must stay legal for its site (Rule 15); a taxonomy
@@ -648,6 +649,368 @@ void test_disabled_storage_class_stays_passthrough() {
     std::cout << "[PASS] test_disabled_storage_class_stays_passthrough" << std::endl;
 }
 
+// A write that never reached fsync lives only in the page cache: a reboot takes it back, and the
+// file is empty because O_TRUNC started its durable size at zero.
+void test_reboot_discards_unsynced_write() {
+    const std::string path = temp_path("discard");
+    {
+        cosmos::Simulator sim(31);
+        cosmos::Simulator::set_current(&sim);
+        const int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+        assert(fd >= 3);
+        assert(sim.storage().is_tracked(fd));
+        assert(::write(fd, "page-cache-bytes", 16) == 16);
+        assert(sim.crash_node(0));
+        assert(sim.reboot_node(0));
+        assert(::close(fd) == 0);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    assert(fd >= 0);
+    char buf[32] = {};
+    assert(::read(fd, buf, sizeof(buf)) == 0); // the unsynced write was discarded
+    assert(::close(fd) == 0);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_reboot_discards_unsynced_write" << std::endl;
+}
+
+// fsync is the durability boundary: everything it committed survives the same crash and reboot.
+void test_reboot_keeps_synced_write() {
+    const std::string path = temp_path("durable");
+    {
+        cosmos::Simulator sim(32);
+        cosmos::Simulator::set_current(&sim);
+        const int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+        assert(fd >= 3);
+        assert(::write(fd, "durable-bytes", 13) == 13);
+        assert(fsync(fd) == 0);
+        assert(sim.crash_node(0));
+        assert(sim.reboot_node(0));
+        assert(::close(fd) == 0);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    assert(fd >= 0);
+    char buf[32] = {};
+    assert(::read(fd, buf, sizeof(buf)) == 13);
+    assert(memcmp(buf, "durable-bytes", 13) == 0);
+    assert(::close(fd) == 0);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_reboot_keeps_synced_write" << std::endl;
+}
+
+// Only the range written since the last fsync rolls back: the pre-image restores the overwritten
+// bytes, so the file comes back as the synced "AAAA", not empty.
+void test_reboot_restores_pre_image_of_unsynced_overwrite() {
+    const std::string path = temp_path("preimage");
+    {
+        cosmos::Simulator sim(33);
+        cosmos::Simulator::set_current(&sim);
+        const int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+        assert(fd >= 3);
+        assert(::write(fd, "AAAA", 4) == 4);
+        assert(fsync(fd) == 0);
+        assert(lseek(fd, 0, SEEK_SET) == 0);
+        assert(::write(fd, "BB", 2) == 2); // overwrites, never synced
+        assert(sim.crash_node(0));
+        assert(sim.reboot_node(0));
+        assert(::close(fd) == 0);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    assert(fd >= 0);
+    char buf[32] = {};
+    assert(::read(fd, buf, sizeof(buf)) == 4);
+    assert(memcmp(buf, "AAAA", 4) == 0); // the pre-image came back
+    assert(::read(fd, buf, sizeof(buf)) == 0);
+    assert(::close(fd) == 0);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_reboot_restores_pre_image_of_unsynced_overwrite" << std::endl;
+}
+
+// A write-only fd is the common shape for logs. The pre-image cannot be pread through it, so the
+// capture path must borrow a transient read handle; otherwise the overwrite would survive.
+void test_reboot_restores_pre_image_through_write_only_fd() {
+    const std::string path = temp_path("write_only");
+    {
+        cosmos::Simulator sim(36);
+        cosmos::Simulator::set_current(&sim);
+        const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        assert(fd >= 3);
+        assert(sim.storage().is_tracked(fd));
+        assert(::write(fd, "AAAA", 4) == 4);
+        assert(fsync(fd) == 0);
+        assert(lseek(fd, 0, SEEK_SET) == 0);
+        assert(::write(fd, "BB", 2) == 2); // overwrite through the write-only fd, never synced
+        assert(sim.crash_node(0));
+        assert(sim.reboot_node(0));
+        assert(::close(fd) == 0);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    assert(fd >= 0);
+    char buf[32] = {};
+    assert(::read(fd, buf, sizeof(buf)) == 4);
+    assert(memcmp(buf, "AAAA", 4) == 0); // the pre-image came back
+    assert(::read(fd, buf, sizeof(buf)) == 0);
+    assert(::close(fd) == 0);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_reboot_restores_pre_image_through_write_only_fd" << std::endl;
+}
+
+// A faulted write returns before the real call, so it reaches neither the file nor the model:
+// nothing to roll back, and the reboot leaves the synced bytes exactly as they were.
+void test_faulted_write_leaves_the_model_and_file_untouched() {
+    const std::string path = temp_path("faulted_write");
+    {
+        cosmos::Simulator sim(34);
+        cosmos::Simulator::set_current(&sim);
+
+        // Seed and sync before any rule exists, so the file has a known durable image.
+        const int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+        assert(fd >= 3);
+        assert(sim.storage().is_tracked(fd));
+        assert(::write(fd, "seed", 4) == 4);
+        assert(fsync(fd) == 0);
+        must(sim.install_faults(storage_config(cosmos::SiteId::write, cosmos::FaultKind::WriteEio))
+                 .has_value());
+
+        const size_t tracked_before = sim.storage().tracked_bytes();
+        assert(lseek(fd, 0, SEEK_SET) == 0);
+        errno = 0;
+        assert(::write(fd, "XXXX", 4) == -1);
+        assert(errno == EIO);
+        assert(sim.injector_or_null()->injections(cosmos::SiteId::write) == 1);
+        assert(sim.storage().tracked_bytes() == tracked_before); // no pre-image was recorded
+
+        assert(sim.crash_node(0));
+        assert(sim.reboot_node(0));
+        assert(::close(fd) == 0);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    const int host = ::open(path.c_str(), O_RDONLY);
+    assert(host >= 0);
+    char buf[16] = {};
+    assert(::read(host, buf, sizeof(buf)) == 4);
+    assert(memcmp(buf, "seed", 4) == 0); // untouched by the faulted write and the reboot
+    assert(::close(host) == 0);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_faulted_write_leaves_the_model_and_file_untouched" << std::endl;
+}
+
+// An fd opened before any universe existed was never registered, so a reboot has nothing to roll
+// back for it and the host bytes survive even though later writes happened under the sim.
+void test_fd_opened_before_sim_is_not_tracked() {
+    const std::string path = temp_path("pre_sim");
+    const int fd = open_scratch(path);
+    assert(::write(fd, "host-bytes", 10) == 10);
+
+    {
+        cosmos::Simulator sim(35);
+        cosmos::Simulator::set_current(&sim);
+        assert(!sim.storage().is_tracked(fd));
+
+        assert(::write(fd, "-more", 5) == 5);
+        assert(!sim.storage().is_tracked(fd)); // an untracked fd is never registered by a write
+        assert(sim.storage().file_count() == 0);
+
+        assert(sim.crash_node(0));
+        assert(sim.reboot_node(0));
+        assert(::close(fd) == 0);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    const int reopened = ::open(path.c_str(), O_RDONLY);
+    assert(reopened >= 0);
+    char buf[32] = {};
+    assert(::read(reopened, buf, sizeof(buf)) == 15);
+    assert(memcmp(buf, "host-bytes-more", 15) == 0);
+    assert(::close(reopened) == 0);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_fd_opened_before_sim_is_not_tracked" << std::endl;
+}
+
+// An application that syncs with fdatasync has the same durability boundary as fsync: without the
+// wrapper its bytes were never committed and the reboot rolled them back.
+void test_fdatasync_commits() {
+    const std::string path = temp_path("fdatasync");
+    {
+        cosmos::Simulator sim(37);
+        cosmos::Simulator::set_current(&sim);
+        const int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+        assert(fd >= 3);
+        assert(sim.storage().is_tracked(fd));
+        assert(::write(fd, "fdatasync-bytes", 15) == 15);
+        assert(fdatasync(fd) == 0);
+        assert(sim.crash_node(0));
+        assert(sim.reboot_node(0));
+        assert(::close(fd) == 0);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    assert(fd >= 0);
+    char buf[32] = {};
+    assert(::read(fd, buf, sizeof(buf)) == 15);
+    assert(memcmp(buf, "fdatasync-bytes", 15) == 0);
+    assert(::close(fd) == 0);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_fdatasync_commits" << std::endl;
+}
+
+// A cut is a durability event of its own: the reboot must not resurrect the tail the application
+// removed, and the durable size must follow the new end of file.
+void test_app_ftruncate_survives_reboot() {
+    const std::string path = temp_path("ftruncate");
+    {
+        cosmos::Simulator sim(38);
+        cosmos::Simulator::set_current(&sim);
+        const int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+        assert(fd >= 3);
+        assert(sim.storage().is_tracked(fd));
+        assert(::write(fd, "12345678", 8) == 8);
+        assert(fsync(fd) == 0);
+        assert(ftruncate(fd, 4) == 0); // the application cut, never synced afterwards
+        assert(sim.crash_node(0));
+        assert(sim.reboot_node(0));
+        assert(::close(fd) == 0);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    assert(fd >= 0);
+    char buf[32] = {};
+    assert(::read(fd, buf, sizeof(buf)) == 4);
+    assert(memcmp(buf, "1234", 4) == 0); // the removed tail stays removed
+    assert(::read(fd, buf, sizeof(buf)) == 0);
+    assert(::close(fd) == 0);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_app_ftruncate_survives_reboot" << std::endl;
+}
+
+// A positional write is still an unsynced write: the pre-image at its offset has to come back.
+void test_pwrite_un_synced_is_discarded() {
+    const std::string path = temp_path("pwrite");
+    {
+        cosmos::Simulator sim(39);
+        cosmos::Simulator::set_current(&sim);
+        const int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+        assert(fd >= 3);
+        assert(::write(fd, "AAAA", 4) == 4);
+        assert(fsync(fd) == 0);
+        assert(::pwrite(fd, "BB", 2, 0) == 2); // overwrites at 0, never synced
+        assert(sim.crash_node(0));
+        assert(sim.reboot_node(0));
+        assert(::close(fd) == 0);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    assert(fd >= 0);
+    char buf[16] = {};
+    assert(::read(fd, buf, sizeof(buf)) == 4);
+    assert(memcmp(buf, "AAAA", 4) == 0);
+    assert(::close(fd) == 0);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_pwrite_un_synced_is_discarded" << std::endl;
+}
+
+// A gather write appends like write: bytes past the last sync are dropped by the same reboot.
+void test_writev_un_synced_is_discarded() {
+    const std::string path = temp_path("writev");
+    {
+        cosmos::Simulator sim(40);
+        cosmos::Simulator::set_current(&sim);
+        const int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+        assert(fd >= 3);
+        assert(::write(fd, "seed", 4) == 4);
+        assert(fsync(fd) == 0);
+        char first[] = "-no";
+        char second[] = "pe";
+        struct iovec parts[2] = {{first, 3}, {second, 2}};
+        assert(::writev(fd, parts, 2) == 5); // appended after "seed", never synced
+        assert(sim.crash_node(0));
+        assert(sim.reboot_node(0));
+        assert(::close(fd) == 0);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    assert(fd >= 0);
+    char buf[16] = {};
+    assert(::read(fd, buf, sizeof(buf)) == 4);
+    assert(memcmp(buf, "seed", 4) == 0); // only the synced bytes survived
+    assert(::read(fd, buf, sizeof(buf)) == 0);
+    assert(::close(fd) == 0);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_writev_un_synced_is_discarded" << std::endl;
+}
+
+// The fortified alias of write: when the toolchain emits __write_chk, it must record at the same
+// site as write, or the reboot silently keeps what the application overwrote. Called directly
+// because this glibc exposes no such symbol.
+extern "C" ssize_t __wrap___write_chk(int fd, const void* buf, size_t count, size_t buflen);
+
+// pwritev is the gather form of pwrite: same offset-driven capture, same discard.
+void test_pwritev_un_synced_is_discarded() {
+    const std::string path = temp_path("pwritev");
+    {
+        cosmos::Simulator sim(41);
+        cosmos::Simulator::set_current(&sim);
+        const int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+        assert(fd >= 3);
+        assert(::write(fd, "AAAA", 4) == 4);
+        assert(fsync(fd) == 0);
+        struct iovec parts[2] = {{const_cast<char*>("B"), 1}, {const_cast<char*>("B"), 1}};
+        assert(::pwritev(fd, parts, 2, 0) == 2); // overwrites at 0, never synced
+        assert(sim.crash_node(0));
+        assert(sim.reboot_node(0));
+        assert(::close(fd) == 0);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    assert(fd >= 0);
+    char buf[16] = {};
+    assert(::read(fd, buf, sizeof(buf)) == 4);
+    assert(memcmp(buf, "AAAA", 4) == 0);
+    assert(::close(fd) == 0);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_pwritev_un_synced_is_discarded" << std::endl;
+}
+
+void test_fortified_write_alias_records_like_write() {
+    const std::string path = temp_path("writechk");
+    {
+        cosmos::Simulator sim(41);
+        cosmos::Simulator::set_current(&sim);
+        const int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+        assert(fd >= 3);
+        assert(::write(fd, "AAAA", 4) == 4);
+        assert(fsync(fd) == 0);
+        assert(lseek(fd, 0, SEEK_SET) == 0);
+        assert(__wrap___write_chk(fd, "BB", 2, 2) == 2); // overwrite through the alias
+        assert(sim.crash_node(0));
+        assert(sim.reboot_node(0));
+        assert(::close(fd) == 0);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    assert(fd >= 0);
+    char buf[16] = {};
+    assert(::read(fd, buf, sizeof(buf)) == 4);
+    assert(memcmp(buf, "AAAA", 4) == 0); // the alias recorded the pre-image
+    assert(::close(fd) == 0);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_fortified_write_alias_records_like_write" << std::endl;
+}
+
 int main() {
     // Unique 0700 directory: no dependence on a pre-existing path, no cross-user collisions.
     std::string tmpl = "/tmp/cosmos_storage_XXXXXX";
@@ -672,6 +1035,18 @@ int main() {
     test_storage_outcome_matrix();
     test_disabled_storage_class_stays_passthrough();
     test_allocation_inside_wrapper_logic_is_never_faulted();
+    test_reboot_discards_unsynced_write();
+    test_reboot_keeps_synced_write();
+    test_reboot_restores_pre_image_of_unsynced_overwrite();
+    test_reboot_restores_pre_image_through_write_only_fd();
+    test_faulted_write_leaves_the_model_and_file_untouched();
+    test_fd_opened_before_sim_is_not_tracked();
+    test_fdatasync_commits();
+    test_app_ftruncate_survives_reboot();
+    test_pwrite_un_synced_is_discarded();
+    test_writev_un_synced_is_discarded();
+    test_pwritev_un_synced_is_discarded();
+    test_fortified_write_alias_records_like_write();
 
     rmdir(g_temp_dir.c_str()); // best effort; every test unlinks its own files
     std::cout << "All storage wrapper tests passed successfully!" << std::endl;

@@ -113,8 +113,8 @@ struct CampaignReport {
     // Per site: universes whose configuration armed it. Without this, eligible_calls == 0 cannot
     // tell "nothing armed it" from "armed, and the workload never got there" (§11.4).
     SiteCounterMap activated_runs{};
-    // Sites no universe exercised, ascending slot order, wrapper sites only (event sites are inert
-    // until P6 and judging them here would invent vacuity).
+    // Sites no universe exercised, ascending slot order, wrapper sites only: an event site is
+    // invoked by the harness, so judging it here would invent vacuity (§11.4).
     std::vector<VacuousSite> vacuous;
     uint64_t out_of_scope_assertions = 0;
 
@@ -417,7 +417,7 @@ inline std::string serialize_outcome(const UniverseOutcome& outcome) {
         put_field(bytes, count);
     for (uint64_t count : report.injections)
         put_field(bytes, count);
-    // kSiteCount == 17, so the activation set fits one field.
+    // kSiteCount == 18, so the activation set fits one field.
     put_field(bytes, static_cast<uint64_t>(report.activated_sites.to_ullong()));
     put_field(bytes, static_cast<uint64_t>(report.active_allocations));
     put_text(bytes, report.ledger_dump);

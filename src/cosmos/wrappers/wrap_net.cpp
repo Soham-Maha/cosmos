@@ -197,6 +197,10 @@ int __wrap_close(int fd) {
     if (cosmos::Simulator::has_current() && current_net()->state(fd).known) {
         return current_net()->close(fd);
     }
+    // The durability model outlives the descriptor: a stale entry would misroute a later fd.
+    if (cosmos::Simulator::has_current()) {
+        cosmos::Simulator::current()->storage().forget_fd(fd);
+    }
     return __real_close(fd);
 }
 
