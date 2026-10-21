@@ -172,7 +172,7 @@ RNG stream domains: `Schedule=1`, `Fault=2`, `Workload=3`, `User=4`. Splitmix64 
 
 ## 8. Storage Subsystem Reference
 
-**Today (point faults only).** `__wrap_open/read/write/fsync` ask the fault injector for one
+**Point faults.** `__wrap_open/read/write/fsync` ask the fault injector for one
 decision per eligible call and translate it to a legal result — `EIO`/`ENOSPC` failures, or a
 `ShortWrite` that performs a *real* partial transfer of `count / 2` bytes (write() reporting k
 bytes must mean k bytes were transferred; claiming a short count without transferring would be
@@ -183,13 +183,34 @@ empty transfer — so `fire_on_eligible_call` on `SiteId::write` counts only wri
 `count >= 1` to fds `>= 3`. 1-byte writes stay eligible: they can legally fail with
 `EIO`/`ENOSPC` (a single-byte WAL commit marker is a real shape); the one degenerate case is a
 fired `ShortWrite` on a 1-byte write, which has no legal short observable and observably
-degrades to a complete write. The page-cache/durability model below is layered on later.
+degrades to a complete write.
 
-Simulates page-cache buffering, `fsync` durability, and torn writes upon crash-reboot:
+**Durability model.** `StorageModel` simulates page-cache buffering, `fsync` durability, and
+torn writes without moving bytes out of the host file:
 
-- `write()` buffers dirty bytes in simulated un-synced page cache.
-- `fsync()` commits buffered pages to durable storage.
-- On `sim.crash(node)` followed by `sim.reboot(node)`: un-synced pages are discarded, and the last synced region may experience torn writes drawn from the `Storage` class.
+- `write()` buffers its bytes as un-synced and remembers the pre-image it overwrote; `fsync()`
+  is the durability boundary that drops those records and remembers the committed range.
+- `StorageModel` covers the surface `write`, `__write_chk`, `pwrite`, `writev`, `pwritev`,
+  `fsync` and `fdatasync`, plus application `ftruncate` as a durability event
+  (`record_truncate`).
+- `Simulator::crash_node` only marks the node down. `Simulator::reboot_node` discards the
+  node's un-synced bytes and rolls each file back to its durable size, in reverse write order.
+- A torn reboot zeroes the last `min(512, last-written)` bytes of the last synced range.
+  Whether it tears is one `decide_event(FaultClass::Storage, SiteId::torn_write)` decision,
+  with `FaultKind::TornWrite` the only legal outcome.
+- Bytes stay in the host file throughout, so `lseek` and `ftruncate` keep native semantics;
+  the model only remembers what to put back.
+- `StorageModel::set_active_node` attributes each open to a node, so a reboot rolls back only
+  that node's files.
+- Memory is bounded by `StorageModel::kMaxTrackedBytes` of pre-image bytes; a file that outgrows
+  it stops being discard-tracked and `StorageModel::degraded()` reports the gap.
+
+A `TornWrite` goes beyond the fsync contract. It models a device that acknowledged `fsync`
+before the sector reached the media — a lying write cache, or a power loss that drops volatile
+cache the syscall already reported committed. That is legal at the syscall boundary (the call
+returned 0) and impossible for a well-behaved device, and it is the reason a store's CRC check
+exists. It is the one outcome that outlives what `fsync` promised, so a campaign that observes
+it must read it as the modelled hardware lie, not as an ordinary crash.
 
 ---
 
@@ -214,11 +235,22 @@ cfg.set_rule(SiteId::malloc, oom);
 sim.install_faults(std::move(cfg));
 ```
 
+**Swarm sampling (P4).** A campaign does not hand-write that config per universe; it samples one:
+`FaultConfig::sample(sim.swarm_rng())` — or `sample(sim.swarm_rng(), knob_specs)` when the application
+declares tunables — draws which classes are enabled, which sites are activated, each rule's rate,
+weights and magnitude, and the knob values from the universe's `Swarm` stream (`docs/fault-injection.md`
+§6.4). Class and site dimensions that are off are still drawn, on their own sub-streams, so toggling
+one class cannot shift another's rate (Rule 8). Knob delivery is the harness's half of §4.3's
+boundary: `with_knob_env(cfg, specs, body)` sets each declared knob in the environment, runs the body,
+and puts the environment back.
+
 Four composable fault mechanisms:
 1. **Declarative Config**: rates applied automatically via the `fault` RNG stream.
-2. **Imperative Scripting**: `sim.net().partition(...)`, `sim.crash(node)`, `sim.reboot(node)`.
-3. **Scheduled Faults**: `sim.at(10s, [&]{ sim.net().partition(a, b); })`.
-4. **Custom Verdict Hooks**: Programmatic control via `sim.net().on_send`.
+2. **Imperative Scripting**: `Simulator::crash_node(node)` and `Simulator::reboot_node(node)`,
+   delivered: each returns `false` for an unknown node or one already in that state, and the
+   reboot's tear is the `SiteId::torn_write` decision.
+3. **Scheduled Faults**: `sim.at(10s, ...)` — P6.
+4. **Custom Verdict Hooks**: `sim.net().on_send` — P6.
 
 ---
 
@@ -300,25 +332,143 @@ namespace cosmos {
 
 ## 13. Campaign Engine (`campaign.hpp`)
 
+The declarations below are the shipped surface. Three of them differ from the sketch this section
+originally carried, each for a reason recorded here rather than left as drift:
+
+- **`build_fn` returns a `ScenarioReport`.** It was `void`. A `void` return makes the findings
+  unreachable: the report lives in the Scenario the callee owns, and the campaign has no other
+  channel. §17.3's call shape is unchanged.
+- **`Failure` is `Finding`.** `Failure` was declared here and defined nowhere; the glossary (§1) and
+  §15 both call it a Finding.
+- **A universe runs in a worker process, not in the caller's.** That is what makes a crash a finding
+  instead of a dead campaign. The consequence is deliberate and load-bearing: writes to captured
+  variables inside `build_fn` are **not** visible after `run` returns, and its returned
+  `ScenarioReport` is the only channel back. Use `Scenario::on(sim, plan)` (not
+  `Scenario::create`) so the campaign's own Simulator is the one that runs.
+
 ```cpp
 struct CampaignConfig {
     uint64_t trials    = 1000;
     uint64_t base_seed = 0;
     unsigned parallel  = std::thread::hardware_concurrency();
-    bool     verify    = false;   // double-run verification mode
+    uint32_t node_count = 1;
+    bool     verify    = false;   // runs each universe twice; report + trace hash must agree
+    uint64_t trace_capacity = kDefaultTraceCapacity;  // verify only; overflow is reported
+    std::string program;          // named in the repro line, e.g. "myapp_test"
+};
+
+struct Finding {
+    std::string id;               // the assertion id -- the dedup key, never the fault set
+    uint64_t    index, seed;      // (base_seed, index) and the universe seed it derives
+    std::string detail, ledger;   // from the first universe that failed this id
+    Time        at{};
+    uint64_t    universes_failed;
+    bool        rare;             // reproduces in under a third of the runs
 };
 
 struct CampaignReport {
-    uint64_t runs, failed_runs;
-    std::vector<Failure> findings;
-    std::vector<std::string> never_hit;
+    uint64_t runs, failed_runs, crashed_runs;
+    bool     refused;             // the harness declined to run; findings hold the reason
+    std::vector<Finding>     findings;   // sorted by id, so parallel == sequential exactly
+    std::vector<std::string> never_hit;  // its own section, never a flag on a finding
+    SiteCounterMap activated_runs, eligible_calls, injections;  // per site, summed over universes
+    std::vector<VacuousSite> vacuous;    // §11.4: sites nothing exercised, with the reason
+    uint64_t out_of_scope_assertions;
+    uint64_t base_seed;
+    std::string program;
+    bool     verify;              // echoed: the double-run check ran
 };
 
 class Campaign {
 public:
-    static CampaignReport run(CampaignConfig, std::function<void(Simulator&, uint64_t)> build_fn);
+    static CampaignReport run(const CampaignConfig&, const UniverseFn& build_fn);
 };
 ```
+
+`print_campaign_report` renders §17.4's shape plus the repro line; `print_campaign_json` emits the
+machine-readable form the P4 exit gate asks for — findings, `never_hit` in its own group, the
+`vacuous` sites in another, per-site `activated`/`eligible`/`fired` counters and repro seeds — so a
+dashboard consumes the report rather than being a feature to build. Whether a configuration did any
+work is answered by the counters, not by reading a log: `fault_was_injected(report.injections,
+FaultClass::Storage)` for the class-level question, and `report.vacuous` for the site-level one.
+
+**`verify` is the double-run check.** Each universe runs twice from the same seed with tracing on,
+in the same worker process — deliberate, because the hidden global state it exists to catch only
+shows up that way. Two things are compared: the full `ScenarioReport` (checks, coverage notes,
+per-site counters, `activated_sites`, `active_allocations`, `ledger_dump`) and the canonical trace
+hash. A mismatch becomes one `cosmos.campaign.verify` finding whose detail names the first differing
+field, so the diagnosis is a field rather than a bit. Identical throws are deterministic and keep
+their own `cosmos.campaign.threw` finding; a signal kills the worker and is handled by the existing
+crash path. Tracing is turned on by the campaign through `Simulator::set_default_trace_options`, so a
+body that installs its plan with `Scenario::on(sim, plan)` needs no change; a body that bypasses the
+campaign Simulator is reported as "tracing was not enabled". The one up-front refusal left is
+`verify` with `trace_capacity == 0`, which cannot record anything to hash.
+
+---
+
+## 13.1 Minimization (`minimize.hpp`)
+
+`minimize()` is trace-first, not seed-first: the caller records the failing universe (the trace is
+the regenerable artifact, per `SPRINT_PLAN.md` §P5) and passes it in with the body half of a
+universe. A replay cannot be driven through `UniverseFn`: that shape constructs its own Scenario via
+`Scenario::on`, and the replay injector must be installed by `Scenario::replay`.
+
+```cpp
+using ScenarioBody = std::function<void(Scenario&)>; // run, quiesce, check; no Scenario of its own
+
+struct MinimizeConfig {
+    FaultConfig plan;       // the failing run's plan; replay needs the same gate verdicts
+    std::string finding_id; // the check that must keep failing
+    uint32_t node_count = 1;
+    std::string program;    // named in the repro line
+};
+
+MinimizeReport minimize(const FaultTrace& source, const MinimizeConfig&, const ScenarioBody&);
+void print_minimize_report(std::ostream&, const MinimizeReport&);
+```
+
+The loop is greedy one-at-a-time suppression over the trace's fires (`outcome != None`): dropping a
+fault that still reproduces is permanent, and full passes repeat until one drops nothing. That
+final pass *is* the 1-minimal guarantee — every survivor was last tested against the other
+survivors alone and the finding survived only without it. Global (ddmin) minimality is out of scope,
+and the report says `1-minimal`, never `minimal`.
+
+Each trial is a `Scenario::replay` in a forked child, so a crash, a throw, or an exit without a
+report is read as "not reproduction" — the entry is essential — rather than ending the reduction. A
+crash is a different finding id, and keeping a fault because removing it turns a check failure into
+a crash would keep noise in the minimal set. Before any reduction, one baseline replay with
+everything honoured must still reproduce the named finding; otherwise the minimizer refuses rather
+than returning a meaningless set. A truncated trace, a harness finding id (`cosmos.*`), a trace that
+is itself a replay, and a call from inside a live universe are refused for the same reason.
+
+No binary ships. `--minimize` and `--only-faults=` are the harness's flags, and the printer emits
+the exact decision seqs the harness passes to `TraceFilter::only_faults`.
+
+---
+
+## 13.2 Canonical encoding (`trace.hpp`)
+
+```cpp
+inline constexpr uint8_t kTraceSource   = 1;   // ledger = 2 reserved
+inline constexpr size_t  kTraceHeaderBytes = 17;
+inline constexpr size_t  kTraceEntryBytes  = 43;
+
+enum class TraceError : uint8_t { Truncated, BadSource, BadValue, TrailingBytes };
+
+std::string encode_trace(const FaultTrace&);
+std::expected<FaultTrace, TraceError> decode_trace(std::string_view bytes);
+uint64_t trace_hash(const FaultTrace&);        // FNV-1a 64 over the encoding
+```
+
+The bytes are canonical, not the struct: fixed width, declared entry order, little-endian, no
+padding. Header is `u8 source`, `u64 count`, `u64 universe_seed`; each entry is
+`seq u64 · eligible_index u64 · at.ns i64 · site u64 · amount.ns i64 · outcome u8 · drew u8 ·
+status u8`. `sizeof(TraceEntry)` is 48 while the encoding is 43, and `static_assert`s pin both the
+field widths and that gap, so a struct layout change can never silently alter the hash. Capacity is
+buffer size, not schedule, and is not encoded — a decoded trace gets `max(count, 1)`; `dropped` is
+not encoded either, because a truncated trace is not a valid canonical input (`decode_trace` cannot
+recover what was never written, and `--verify` reports overflow instead of hashing a prefix).
+FNV-1a 64 uses offset basis `14695981039346656037` and prime `1099511628211`.
 
 ---
 
@@ -335,6 +485,8 @@ Under `libcosmos`, determinism holds provided that application code:
 ## 15. Error Handling & Tracing
 
 - Findings output a clear repro command: `myapp_test --seed 12345`.
+- After minimization the repro names the kept decision seqs: `myapp_test --seed 12345
+  --only-faults=17,42`.
 - Tracing sink records FNV-1a event hash (`trace_hash`) used by `--verify` double-run validation.
 
 ---

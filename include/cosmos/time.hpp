@@ -7,8 +7,6 @@
 #include <sys/time.h>
 #include <time.h>
 
-#include "cosmos/trace.hpp"
-
 // glibc exposes TIMER_ABSTIME only under feature-test macros; define the POSIX value so the
 // header stays self-contained under strict -std builds.
 #ifndef TIMER_ABSTIME
@@ -129,25 +127,18 @@ inline constexpr int64_t kDefaultRealtimeEpochNs = 1767225600000000000LL;
  * @brief Deterministic virtual clock owned by a Simulator universe.
  *
  * Tracks monotonic virtual time (starting at 0ns) and wall-clock realtime (anchored at a
- * deterministic base epoch). In simulation testing builds, clock_gettime, gettimeofday, and
- * the sleep calls read and advance this clock without real-time OS delays.
+ * deterministic base epoch). In simulation testing builds, clock_gettime and gettimeofday
+ * read this clock without real-time OS delays.
  *
- * Interim contract: until the P1 fiber scheduler exists, sleeps advance the universe clock
- * by the full request immediately — nothing suspends. Once the scheduler lands
- * (docs/design.md §3), sleep calls must instead suspend the calling task and register a
- * wake-up event: virtual time only advances when no task is runnable, and one task's sleep
- * must not consume time for others.
+ * Sleeps do not live here: Scheduler::sleep_ns and Scheduler::sleep_clock suspend the calling
+ * task on the timer queue, and virtual time advances only when the scheduler drains the next
+ * timer (docs/design.md §5). One task's sleep never consumes time for another runnable task.
  */
 class VirtualClock {
   public:
     explicit VirtualClock(Time start_time = Time::zero(),
                           int64_t realtime_epoch_ns = kDefaultRealtimeEpochNs)
         : now_(start_time), realtime_epoch_ns_(realtime_epoch_ns) {}
-
-    // Optional observer fed every clock-advance event (see trace.hpp). Reads never touch it:
-    // a clock read is a pure function of the event stream, not an event itself. The Simulator
-    // attaches its TraceHash here; a bare clock (injector tests) stays observer-free.
-    void attach_trace(TraceHash* trace) { trace_ = trace; }
 
     constexpr Time now() const { return now_; }
     constexpr int64_t now_ns() const { return now_.ns; }
@@ -161,19 +152,11 @@ class VirtualClock {
     void advance(Duration d) {
         if (d.ns <= 0) return;
         now_ = now_ + d;
-        if (trace_ != nullptr) {
-            trace_->absorb_tag(static_cast<uint8_t>(TraceEvent::ClockAdvance));
-            trace_->absorb_i64(d.ns);
-        }
     }
 
     void advance_to(Time target) {
         if (target > now_) {
             now_ = target;
-            if (trace_ != nullptr) {
-                trace_->absorb_tag(static_cast<uint8_t>(TraceEvent::ClockAdvanceTo));
-                trace_->absorb_i64(target.ns);
-            }
         }
     }
 
@@ -219,8 +202,9 @@ class VirtualClock {
         return 0;
     }
 
-    // Interim semantics: advances the universe clock by the full request. See the class
-    // comment for the scheduler-era contract.
+    // Raw form: advances the clock by the full request without suspending. The nanosleep
+    // entry point goes through Scheduler::sleep_ns, which blocks the caller until its timer
+    // drains; direct callers are tests and engine code that already decided to move time.
     int nanosleep(const struct timespec* req, struct timespec* rem) {
         if (!req) {
             errno = EFAULT;
@@ -331,7 +315,6 @@ class VirtualClock {
 
     Time now_{Time::zero()};
     int64_t realtime_epoch_ns_{kDefaultRealtimeEpochNs};
-    TraceHash* trace_{nullptr};
 };
 
 } // namespace cosmos

@@ -418,10 +418,15 @@ value—it only produces results already valid for the wrapped API.
 |---|---|---|---|
 | `__wrap_malloc` | `Memory` / `site::malloc` | `OutOfMemory` | `nullptr`, `errno = ENOMEM` |
 | `__wrap_write` | `Storage` / `site::write` | `WriteEio` | `-1`, `errno = EIO` |
+| `__wrap_fsync` | `Storage` / `site::fsync` | `FsyncEio` | `-1`, `errno = EIO` |
 | `__wrap_send` | `Network` / `site::send` | `ConnectionReset` | `-1`, `errno = ECONNRESET` |
 | `__wrap_clock_gettime` | `Clock` / `site::clock_gettime` | `ClockStep` | A configured, valid clock result |
 
+**The storage adapters' durability model is implemented**, not planned: `write` remembers the bytes it overwrites, `fsync` is the durability boundary, and `reboot_node` discards un-synced bytes and may tear the last synced sector (`docs/design.md` §8).
+
 **Legality includes API invariants, not just return codes.** An injected result must be one the real API could actually produce under *some* real circumstance. `EIO` from `write` is legal. A short write is legal. A forward leap in `CLOCK_MONOTONIC` is legal (suspend/resume produces exactly that). But `CLOCK_MONOTONIC` jumping *backward* is **not** legal — no real kernel does that — so a `ClockStep` outcome on a monotonic clock may only step forward. Similarly a short `send` must report a non-negative byte count, and `open` may not fail with `ECONNRESET`. A fault that violates its API's invariants is not testing the application's error handling; it is testing its reaction to an impossible world, and any resulting finding is a false positive (Rule 15).
+
+The `torn_write` event decision is the one storage outcome judged at the syscall boundary rather than inside it: in that world `fsync` returned 0, and the device may still lose the sector before the media sees it. That is legal because a lying write cache is legal hardware — the call's contract was met, the device's was not. Read such a reboot as the modelled hardware lie, not as an ordinary crash (`docs/design.md` §8).
 
 ### 8.3 What this guarantees
 
@@ -583,14 +588,16 @@ scenario.check("recovers-from-single-crash", replicas_agree_after_recovery());
 
 ### 10.2 Event Sites & Virtual-Time Triggers (Tier 1b)
 
+**Shipped today (P5).** Imperative crash and reboot exist as `Simulator::crash_node` / `Simulator::reboot_node`: a state flip in `NodeRegistry` that returns `false` for an unknown node or one already in that state. There are no fault-model limits, no automatic heal and no episode registry yet, so they write no ledger entry; P6-S2 adds the registry, limits and heals described below. The one event-site decision already running is `SiteId::torn_write`, asked once at reboot through `decide_event`.
+
 Episode faults (crashes, partitions) are not reached by application calls, so neither the gate chain's occurrence counting nor its per-call draw applies to them. They are triggered two ways, both fully deterministic and both **zero-draw** (Rule 11):
 
-1. **Imperative, from the harness**: `injector.crash_node(n2, 2s)` — the scripted style already used for `sim.crash(...)` in `docs/design.md` §9.
+1. **Imperative, from the harness**: `injector.crash_node(n2, 2s)` — the episode form of the shipped `Simulator::crash_node` (`docs/design.md` §9); P6 adds the reboot duration, the limits and the scheduled heal.
 2. **Scheduled, from the config**: `FaultConfig::scheduled_episodes` is a list of `(at, spec, until_heal)` triples. The engine arms one virtual-time event per entry at universe start; when the event fires, the injector attempts the episode start.
 
 The attempt is still subject to the **fault-model limits** (§2) and the **quiesce window** (§9.3): if starting the episode would break the promise, it is refused and recorded as `Skipped` with the limit's reason — a scheduled crash is not exempt from the building code. Because no draw is involved, `drew = no`.
 
-Event sites carry `SiteId`s (`site::crash_node`, `site::partition`) so that swarm activation can disable an entire event site for a universe, and so ledger and trace entries use the same identity scheme as wrapper sites. There is no `rate` on an event site: it fires when invoked or scheduled, subject to limits, or it does not fire at all. Probabilistic *timing* of an episode ("crash at a random moment") is expressed by sampling the `at` field from the `Swarm` stream during config sampling — randomness enters at sampling time, not at fire time, so the runtime decision stays zero-draw.
+Event sites carry `SiteId`s (`site::crash_node`, `site::partition`, `site::torn_write`) so that swarm activation can disable an entire event site for a universe, and so ledger and trace entries use the same identity scheme as wrapper sites. There is no `rate` on an episode site: it fires when invoked or scheduled, subject to limits, or it does not fire at all. `torn_write` is the exception — a point decision at reboot rather than an episode, so it carries a rule and one draw through `decide_event` (`TornWrite` is its only legal outcome). Its outcome is loss *after* a returned `fsync`: the call could have returned 0 in that world, and the device's volatile cache may still drop the last sector — legal at the syscall boundary, impossible for a well-behaved device, and the reason a store checks its CRCs. Probabilistic *timing* of an episode ("crash at a random moment") is expressed by sampling the `at` field from the `Swarm` stream during config sampling — randomness enters at sampling time, not at fire time, so the runtime decision stays zero-draw.
 
 ---
 
@@ -600,7 +607,7 @@ Event sites carry `SiteId`s (`site::crash_node`, `site::partition`) so that swar
 
 The ledger is the **diagnostic** record: it exists so a human (and the coverage checks of §11.4) can see what the application was subjected to. It records every **fired** fault, every heal, and every **limit-refused** episode start. Routine gate rejections (class disabled, site inactive, warmup, `skip_first`, budget spent) are **not** recorded as entries — a malloc-heavy run makes millions of eligible calls, and a ledger of skips would drown the signal in noise and tax every run for data it never reads. They advance per-site counters (`eligible_calls`, `outcomes_fired`) instead, and the counters are what the coverage checks read.
 
-(The complete every-decision record needed for replay is a separate artifact — the **decision trace** of §11.2, introduced at sprint F5. Keeping the two apart is deliberate: the ledger answers "what happened?", the trace answers "how do I re-run it?". Conflating them forces every pre-F5 run to pay trace-recording cost it cannot use.)
+(The complete every-decision record needed for replay is a separate artifact — the **decision trace** of §11.2. Keeping the two apart is deliberate: the ledger answers "what happened?", the trace answers "how do I re-run it?". Conflating them forces every pre-F5 run to pay trace-recording cost it cannot use.)
 
 Each entry carries an explicit status:
 
@@ -608,9 +615,11 @@ Each entry carries an explicit status:
 |---|---|
 | `Fired` | The fault was injected (or an episode healed) and the application observed it. |
 | `Skipped` | An episode start was **refused by a fault-model limit** (§2) or landed inside the quiesce window — the promise would have been exceeded. Routine gate rejections are *counted*, not recorded. |
-| `Suppressed` | A replay deliberately withheld a fault that the original run fired (§11.2). Appears in trace-driven replay runs only, from sprint F5. |
+| `Suppressed` | A replay deliberately withheld a fault that the original run fired (§11.2). Appears in trace-driven replay runs only. |
 
 Each entry also records **whether a random draw was consumed** (`drew: yes/no`) — `yes` for probabilistic fires, `no` for deterministic-trigger fires, heals, and refusals. The flag becomes load-bearing in the decision trace (§11.2), where a replay cannot tell a "returned early, stream untouched" decision from a "drew and lost the coin flip" decision without it — and those leave the RNG in different states.
+
+(The rendered status column is sized to the longest token — `SUPPRESSED` — so the samples below, drawn when only `FIRED` existed, are one field narrower than the printer's output.)
 
 ```text
 Run 8421 (FAILED: "no split-brain") — fault ledger:
@@ -639,19 +648,21 @@ The obvious identity is `(class, site_id, occurrence_index)`, where `occurrence_
 
 The identity must therefore come from the **recorded decision schedule**, not from live execution. The trace is **one globally ordered list**, not per-site queues:
 
-- The original run writes a **decision trace**: an ordered list of `(seq, virtual_time, site_id, eligible_index, outcome, drew)` entries, in the order the decisions happened. `seq` is a strictly increasing sequence number; `eligible_index` is the eligible-call count at record time — informational only, never recomputed during replay.
+- The original run writes a **decision trace**: an ordered list of `(seq, virtual_time, site_id, eligible_index, outcome, amount, drew, status)` entries, in the order the decisions happened. `seq` is a strictly increasing sequence number; `eligible_index` is the eligible-call count at record time — informational only, never recomputed during replay. `amount` is the rule's magnitude, which a replayed `PacketDelay`/`ClockStep`/`SleepInterrupted` needs to reproduce; `status` is §11.1's status, which Rule 9 requires on every recorded decision.
 - A replay walks the trace with a **single cursor**. At each live decision point it peeks at the cursor entry:
   - **Same site** → consume the entry and honour it: apply its outcome (or withhold it, if the entry was rewritten to `Suppressed`), and if `drew = yes`, consume exactly one draw from that class's sub-stream *even when the outcome is suppressed* — the stream must advance exactly as the original run's did, or every later honoured entry receives a different random value.
   - **Different site, or trace exhausted** → control flow has diverged from the original run (or run past its end). The call **passes through with no draw and no fault** (Rule 12). Replay never invents faults that were not in the original trace — otherwise a minimization re-run could "still fail" because of a fault that never existed in the failing run, and the reduction would prove nothing.
-- Suppression rewrites one entry's outcome to `Suppressed` and leaves every other entry untouched.
+- Suppression rewrites one entry's **status** to `Suppressed` and leaves every other field — and every other entry — untouched. The outcome is kept rather than blanked, so a reader can still see what was withheld; a withheld entry is one whose status is not `Fired`.
 
 **Why global order, and not a per-site queue:** sites within one fault class *share* the class sub-stream (Rule 2). The original run's draws from e.g. the `Memory` stream are interleaved across `malloc`/`calloc`/`realloc` in one specific order, and that order is part of the stream's state. Consuming entries per-site could hand a draw intended for a `calloc` decision to a `malloc` decision. The single cursor preserves the original per-class draw order exactly, for as long as the replayed execution tracks the original one.
 
 **What replay guarantees, stated honestly:**
 
-1. **Replay is deterministic.** `replay(trace, seed)` is a pure function: cursor position, stream positions, and application behaviour are all fully determined by the trace and the seed. Two replays of the same trace produce bit-identical traces.
+1. **Replay is deterministic.** `replay(trace, filter, plan)` is a pure function: cursor position, stream positions, and application behaviour are all fully determined by the trace, the filter and the config. The seed travels *in* the trace, so a replay cannot be seeded against a different run. Two replays of the same trace produce bit-identical traces.
 2. **Pre-divergence, replay is identical to the original run** — same decisions, same draws, same outcomes.
-3. **Post-divergence, alignment is best-effort.** Once suppression changes control flow, later trace entries may no longer line up with live calls. The no-novel-faults rule keeps the replay honest; it does not pretend to reconstruct the original run's RNG alignment, because no scheme can.
+3. **Post-divergence, alignment is best-effort.** Once suppression changes control flow, later trace entries may no longer line up with live calls. The no-novel-faults rule keeps the replay honest; it does not pretend to reconstruct the original run's RNG alignment, because no scheme can. The cursor is a **peek, not a skip**: a mismatch passes the call through and leaves the cursor where it is, so an execution that later re-converges to the original's shape picks the schedule up again, and one that never re-converges passes through for the rest of the run.
+
+A replay run **records its own trace**, so the exit gate's "suppressing one fault leaves every other honoured entry bit-identical" is an entry-by-entry comparison rather than an inference from counters. Its ledger records the withheld faults too, with `status = Suppressed` (§11.1): what the application was spared is as much a part of the report as what it endured.
 
 This makes identity a property of the *recorded schedule*, which suppression edits deliberately, rather than of the *replayed execution*, which suppression perturbs as a side effect. Episode triggers (§10.2) are recorded in the trace as zero-draw entries at their virtual timestamps; since scheduled episodes are armed at universe start, they re-fire at the same virtual times in replay, as long as the replayed run's clock reaches them — one of the few things divergence cannot easily move.
 
@@ -660,6 +671,15 @@ This makes identity a property of the *recorded schedule*, which suppression edi
 One-at-a-time reduction yields a **1-minimal** set: no *single* remaining fault can be removed without losing the failure. It is **not** necessarily the globally smallest set. When faults interact — say the bug needs *either* (A and B) *or* (C and D) — removing any one of the four still reproduces via the other pair, so all four survive the reduction.
 
 Reporting a 1-minimal set is the honest and standard outcome; a genuinely minimal set requires searching subsets (delta debugging's `ddmin`), which is a later optimisation. The report should say which guarantee it is offering.
+
+**The shipped loop** is `minimize()` in `include/cosmos/minimize.hpp`: it takes the recorded trace, the
+plan, the finding id and a `ScenarioBody` (the body half of a universe — run, quiesce, check), replays
+in forked children so a crashing suppression reads as "essential" rather than ending the loop, and
+prints the kept entries with the exact `--only-faults=<seqs>` repro. One baseline replay with
+everything honoured must still reproduce the finding first, and the report header says `1-minimal`,
+never `minimal` (`docs/design.md` §13.1). Antithesis's causality analysis is not adapted here: it
+relies on hypervisor snapshots, which this tool does not have; a regenerable `(build, seed, trace)`
+is what replaces them.
 
 ### 11.3 As a determinism check
 
@@ -679,9 +699,38 @@ The decision trace feeds the FNV-1a trace hash used by `--verify` double-run val
 
 Records are hashed in trace order (`seq` ascending), each field appended in that fixed encoding.
 
+**The shipped codec** (`trace.hpp`) writes a `u8 source` (trace = 1; ledger = 2 reserved), `u64
+count` and `u64 universe_seed` header, then each entry as `seq u64 · eligible_index u64 · at.ns i64
+· site u64 · amount.ns i64 · outcome u8 · drew u8 · status u8` — 43 bytes, little-endian, no
+padding, whatever `sizeof(TraceEntry)` is. Capacity and `dropped` are not canonical: they are buffer
+facts, not schedule. `trace_hash` is FNV-1a 64 over those bytes, and `--verify` compares two runs'
+hashes alongside their full reports (`docs/design.md` §13).
+
 ### 11.4 As proof the faults actually fired
 
 If a configured fault rate is `0.001` and a run reaches only 200 eligible sites, most runs inject nothing at all and the test is silently vacuous. A campaign-level coverage check such as `sometimes(fault_was_injected(FaultClass::Storage), "storage fault path exercised")` proves the configuration is genuinely doing work — and it is backed by the per-site counters of §11.1, not by manual log inspection. This is Antithesis's primary recommended use for `sometimes`.
+
+**The campaign report carries the same guarantee as data.** `CampaignReport::vacuous` names every
+wrapper site no universe exercised, with the counters that say which way it never happened:
+
+| `reason` | counters | what it means |
+|---|---|---|
+| `never_activated` | `activated_runs == 0` | the configuration never armed the site |
+| `never_reached` | armed, `eligible_calls == 0` | the config asked for it and the workload never got there |
+| `never_fired` | reached, `injections == 0` | the rate was too low for the workload's depth |
+
+Per-site `activated_runs`, `eligible_calls` and `injections` travel with it, so a report says
+"activated in 400 universes, reached 0" rather than leaving three numbers to be compared by hand.
+
+It is a **separate group, never a finding**: a finding's identity is the assertion id (that is the
+dedup key), and vacuity is a fact about the configuration rather than a violated application
+property, so it must not enter `findings` or `failed_runs`. In the text report it prints after the
+`NEVER HIT` lines as `NOT EXERCISED: "<site>"  (<reason>)`; in `campaign.json` it is its own
+`"vacuous"` array, so a dashboard keys on the reason token. Event sites stay outside the guard until
+episodes exist (F6): their activation is inert before then, and judging it would invent vacuity.
+
+`fault_was_injected(injections, FaultClass)` is the one call the idiom above needs, for a universe's
+counters or a whole campaign's — both hold the same `SiteCounterMap`.
 
 ---
 
@@ -704,8 +753,11 @@ enum class SiteId : uint64_t {
     connect, accept, send, recv,
     clock_gettime, nanosleep,
     getrandom,
-    // Event sites (episode faults, §10.2) — never passed to decide()
+    // Event sites (no wrapper call) — never passed to decide(); torn_write is
+    // decided through decide_event(), the episode sites fire only when invoked
+    // or scheduled (§10.2).
     crash_node = 1000, partition, pause_node,
+    torn_write,  // Storage; decided at reboot, legal outcome TornWrite
 };
 
 /// What the wrapper should make the call do. `None` = pass through unchanged.
@@ -719,6 +771,7 @@ enum class FaultKind : uint8_t {
     PacketDrop, PacketDelay, PacketReorder, PacketCorrupt,
     ClockStep, SleepInterrupted,
     RandomEagain,
+    TornWrite,
     _Count,          // sentinel; new kinds append before it
 };
 
@@ -759,12 +812,31 @@ using NodeId            = uint32_t;
 using NodeSet           = std::vector<NodeId>;
 using EpisodeId         = uint64_t;
 using KnobId            = uint64_t;   // named per app tunable; append-only, like SiteId
+
+/// A sampled tuning value (§4.3). The id names the tunable; only the harness knows what it means.
+struct Knob { KnobId id; int64_t value; };
+
+/// How a knob's value spreads over its legal range: a timeout wants Logarithmic (every order of
+/// magnitude equally likely), a retry budget wants Linear.
+enum class KnobScale : uint8_t { Linear, Logarithmic };
+
+/// A tunable the harness lets the sampler choose (§4.3). The legal range is application knowledge —
+/// the engine cannot invent it — and `env` is the name the application reads the value from
+/// (harness-mediated delivery). A knob that is not declared here is never sampled.
+struct KnobSpec {
+    KnobId      id;
+    int64_t     low;
+    int64_t     high;
+    KnobScale   scale;   // Logarithmic requires low > 0
+    const char* env;     // nullptr: this harness delivers the value some other way
+};
+
 /// Every site occupies a pinned slot: wrapper sites fill [0, kWrapperSiteCount), event sites
 /// follow. site_slot() is written out rather than derived from the enum value, so retiring a site
 /// never shifts the slots after it (Rule 13). Slot order — not hash order — is what the swarm
 /// sampler iterates and draws against.
 constexpr size_t kWrapperSiteCount = 14;
-constexpr size_t kEventSiteCount   = 3;
+constexpr size_t kEventSiteCount   = 4;
 constexpr size_t kSiteCount        = kWrapperSiteCount + kEventSiteCount;
 constexpr size_t site_slot(SiteId);              // total; kNoSite for an unknown value
 
@@ -843,11 +915,25 @@ struct FaultConfig {
     Time warmup_until  = Time::zero();
     Time quiesce_after = Time::max();
 
-    /// Level 1 swarm sampler. Draws from the dedicated `Swarm` stream, using a
-    /// fixed class-indexed draw schedule that covers disabled classes too
-    /// (§6.4), so the swarm dimensions stay independent.
+    /// Level 1 swarm sampler. Draws from the dedicated `Swarm` stream with one sub-stream per fault
+    /// class and one per knob position, so no dimension can shift another (§6.4, Rule 8).
+    /// The ranges are the sampler's, not the caller's: class enable and site activation 0.5, rule
+    /// rates log-uniform in [1e-5, 1e-2], outcome weights log-uniform in [1e-2, 1], rule magnitudes
+    /// log-uniform in [1us, 10ms].
     /// Postcondition: validate() passes.
+    ///
+    /// `sample(rng)` samples no knobs — an application that declares none. The `knobs` overload
+    /// samples the declared menu. `sample_with` takes the class enable bits instead of drawing
+    /// them: Rule 8's direct test needs to flip one class and prove nothing else moved, and this is
+    /// the only input that can.
     static FaultConfig sample(Rng& swarm_rng);
+    static FaultConfig sample(Rng& swarm_rng, std::span<const KnobSpec> knobs);
+    static FaultConfig sample_with(Rng& swarm_rng, std::bitset<kFaultClassCount> enabled,
+                                   std::span<const KnobSpec> knobs = {});
+
+    /// The sampled value of one knob, or nullopt when this universe did not sample it. A scan:
+    /// `knobs` is strictly ascending.
+    std::optional<int64_t> knob_value(KnobId id) const;
 
     /// Rejects configs that would silently misbehave:
     ///   - every rule rate must be finite and in [0, 1];
@@ -892,15 +978,20 @@ class FaultInjector {
     FaultInjector(FaultConfig cfg,
                   Rng fault_stream,
                   const VirtualClock& clock,   // read virtual now
-                  EventQueue& events,          // schedule automatic heals
+                  Scheduler& timers,           // schedule automatic heals (timer queue)
                   const NodeRegistry& nodes);  // query live/crashed state for limits
 
     // ---- Point faults: one gate chain, at most one draw (§10). ----
-    // Wrapper sites only — event sites fire via scheduled_episodes and the
+    // Wrapper sites only — event sites go through decide_event() and the
     // episode API below, never through decide(). Non-const: drawing mutates.
     // FaultKind::None means pass the original call through unchanged. Otherwise
     // the caller's wrapper translates the result to its API-specific failure.
     FaultKind decide(FaultClass cls, SiteId site);
+
+    // Event sites have no wrapper call, so the harness reaches them here: one
+    // draw through the same gate chain. Reboot asks it for SiteId::torn_write;
+    // episode sites are armed through the episode API instead.
+    FaultKind decide_event(FaultClass cls, SiteId site);
 
     // ---- Episode faults ----
     // Checks the fault-model limits against live node state, starts the episode,
@@ -935,7 +1026,7 @@ class FaultInjector {
     std::array<Rng, static_cast<size_t>(FaultClass::_Count)> streams_;  // Rule 2
 
     const VirtualClock& clock_;      // borrowed, outlives the injector
-    EventQueue&         events_;
+    Scheduler&          timers_;     // owns push_timer/advance_to_next_timer
     const NodeRegistry& nodes_;
 
     ActiveEpisodeMap active_;        // what is currently broken
@@ -1022,9 +1113,11 @@ heap's `active_allocations` — §11.4's
 vacuous-coverage guard reads counters, so a campaign must not have to reach back into a finished
 universe's injector for them.
 
-> **Stale spelling in §17.** §17.2 and §17.3 write `Scenario scenario{.faults = plan}`. That form
-> cannot coexist with a user-declared constructor or factory, and predates `create()`. Read those
-> two lines as `auto scenario = Scenario::create(seed, plan);`.
+> **Stale spelling in §17.** §17.2 writes `Scenario scenario{.faults = plan}`. That form cannot
+> coexist with a user-declared constructor or factory, and predates `create()`. Read that line as
+> `auto scenario = Scenario::create(seed, plan);`. §17.3's campaign sketch carried the same form and
+> a `void`-returning `build_fn`; both are corrected in place there, and `design.md` §13 now declares
+> the shipped surface.
 
 `cosmos::run` (the §17 teaser) is pure sugar over the pieces above: `cosmos::run({.seed = S, .oom = {.fail_on_call = K}}, workload, oracle)` builds a `FaultConfig` whose only rule is `SiteId::malloc → { outcomes = {OutOfMemory}, fire_on_eligible_call = K }`, runs warmup → workload → quiesce → oracle in one universe, and returns a `ScenarioReport`. On failure the report carries `ledger_dump`, the §11.1 ledger rendered **before** the universe is destroyed — otherwise no caller could ever print it, since the sugar owns the injector and destroys it on return. `print_report` appends the dump when it is present. It exists so the smallest useful test is one expression; anything richer drops down to `Scenario` or `Campaign`. `RunSpec::check_id` names the oracle's check so a failing report is self-describing. The universe is destroyed when `run` returns, so any block the workload hands back outlives its heap and is released through the orphan path — nothing can count those blocks afterwards, which is why a universe-end leak check can never fire for the sugar. `fail_on_call` is an **eligible-call** index at `SiteId::malloc` (§10) and counts every allocation that reaches the wrapped symbol, the harness's own included. It does **not** count what never reaches it, and which allocations do is **linkage-dependent**. Under the default shared-`libstdc++` link, `operator new` — and therefore every `std::` container — is not interposed, because it lives in `libstdc++.so` whose internal `malloc` binding `--wrap` does not rewrite. Under `-static-libstdc++` it is; `tests/CMakeLists.txt` links the scenario suite a second time that way as `test_scenario_static` so both sides are pinned rather than assumed (that target is probed for and skipped on toolchains without a static `libstdc++`, which includes this repository's clang). Do not rely on either behaviour: a test needing an exact eligible count must use the raw allocator, which is why the worked example's fixture allocates into a stack array. The oracle is a bool-returning callable; the teaser's `CHECK(...)` spelling arrives with `assert.hpp` in F4.
 
@@ -1038,12 +1131,14 @@ The declarations in §12 describe the **F6-complete** injector. Phases 1–5 shi
 
 | §12 reference | What the code has today | Closed by |
 |---|---|---|
-| `FaultInjector(cfg, Rng, VirtualClock&, EventQueue&, NodeRegistry&)` | `BasicFaultInjector<ClockLike>`, built by `create(cfg, fault_stream_seed, node_count, clock)` | F6: event queue + node registry |
+| `FaultInjector(cfg, Rng, VirtualClock&, Scheduler&, NodeRegistry&)` | `BasicFaultInjector<ClockLike>`, built by `create(cfg, fault_stream_seed, node_count, clock, trace_options)` | F6: scheduler timers + node registry |
 | Constructor enforces `validate()` | `create()` returns `std::expected<BasicFaultInjector, ConfigProblem>`; the constructor is private, so there is no unchecked path | — the factory is the permanent shape |
 | `const VirtualClock&` | Templated on a `ClockLike` concept (anything answering `now()`). `include/cosmos/virtual_clock.hpp` is a placeholder pending the runtime clock | F6: replacing that header, with no change to the injector |
 | Categorical walk shown inline in `decide()` | Split into a pure `constexpr FaultKind select_outcome(double, const FaultRule&)`; `decide()` still takes exactly one `uniform()` per call | — permanent; see below |
-| Ledger | Records fires only, in fixed non-allocating storage (Rule 7), with the §11.1 printer. No `Status` field yet: `Fired` is the only status P1 can produce, so the printer emits it as a literal in that column | F6 adds `Status` with episodes and heals; F5 adds the decision trace (§11.2) |
+| Ledger | Records fires in fixed non-allocating storage (Rule 7), with the §11.1 printer. `LedgerEntry` carries `DecisionStatus`: a replay run's withheld fires are rows with `Suppressed`. Nothing yet produces `Skipped` | F6: episodes and heals produce `Skipped` |
 | Episodes, `begin_quiesce()`, mode transitions | Absent | F6 (episodes, limits, mode) |
+
+**`Scheduler` is the event queue.** There is no separate `EventQueue` type: `Scheduler` owns the timer queue (`push_timer`, `advance_to_next_timer`, `run_until_quiescence`), so an episode heal is a timer entry exactly like a sleeping task's wake-up.
 
 **Why `select_outcome` is a separate function.** `uniform()` returns multiples of 2⁻⁵³, so a draw landing exactly on a rate or on a cumulative-weight boundary is a 1-in-2⁵³ event that no seed will produce. Those boundaries are precisely where an off-by-one hides, and they cannot be reached by sampling. Extracting the value-to-outcome half as a pure function lets the boundaries be pinned with `static_assert` at exact values, which makes a regression a compile error rather than a test that may never fire. The behaviour is unchanged and the one-draw-per-call rule of §6.5 is untouched — `decide()` still owns the draw and the injection counter.
 
@@ -1091,7 +1186,8 @@ The injector is the one component where a silent bug invalidates **every** resul
 | **Trigger/budget interplay** — an exhausted budget blocks even a matched trigger; `validate()` rejects `fire_on_eligible_call ≤ skip_first` | §10's counter semantics are exact, not approximate |
 | **Legality** — a `ClockStep` on `CLOCK_MONOTONIC` never moves time backward; every mapped `FaultKind` produces a documented API result | Rule 15; no impossible-world findings |
 | **Quiesce completeness** — after `begin_quiesce()`, no fault fires, every episode (persistent ones included) is healed, and the ledger shows the heals | §9.3; final invariants observe a recovered system |
-| **Replay exhaustion** (F5) — consuming a trace past its end or at a mismatched site passes through with no draw and no new faults; two replays of one trace are bit-identical | Rule 12; minimization is trustworthy |
+| **Replay exhaustion** — consuming a trace past its end or at a mismatched site passes through with no draw and no new faults; two replays of one trace are bit-identical, and a replay of a replay keeps its suppressions | Rule 12; minimization is trustworthy |
+| **Double-run verify** — one seed run twice in the same process yields the same report and the same canonical trace hash; a body whose second run differs is reported as a `cosmos.campaign.verify` finding | The determinism contract holds within one campaign, not only across builds |
 
 The stream-isolation and replay-with-suppression tests are the non-obvious ones, and they are the two that pay off most later.
 
@@ -1108,8 +1204,8 @@ The order below is deliberately MVP-first: prove that one real fault, injected d
 | **F2** | First adapter plus correctness-oracle surface (§17): `__wrap_malloc` → `OutOfMemory`; a minimal `Scenario`/`FaultPlan` harness with `quiesce()` and `check()`; `FaultProfile` deleted (§12.2) | A single seed reproducibly fails a deliberately broken example app, and passes once the break is fixed — proves one fault, one adapter, and one oracle end to end |
 | **F3** | Generic wrapper-surface expansion, one call at a time: `calloc`/`realloc`; `open`/`read`/`write`/`fsync` (`EIO`, short write, `ENOSPC`); `send`/`recv`/`connect` (`ECONNRESET`, 0-byte close, delayed delivery); clock reads — each reusing F1's decision engine unchanged | Every newly wrapped call maps a named `FaultKind` to a documented legal API result and is independently tested |
 | **F4** | Campaign runner (many seeds, `never_hit` tracking); swarm sampler (`FaultConfig::sample`) with fixed class-indexed draws + per-site activation; mutually-exclusive categorical draw for multi-outcome sites (§6.5) | Stream-isolation and swarm-coverage tests pass; a multi-outcome site never produces more than one outcome per call |
-| **F5** | Decision trace recording; replay with suppression (no novel faults after divergence — Rule 12); 1-minimal minimization; canonical trace encoding + FNV-1a trace hash | Suppressing one fault leaves every other honoured trace entry bit-identical; two replays of one trace are bit-identical; `--verify` stable across compilers |
-| **F6** | Distributed faults: virtual clock, event queue, node registry, episode lifecycle (every episode schedules its own heal — Rule 5), persistent faults, scheduled episode triggers (§10.2), fault-model limits with recorded refusals, `Liveness` mode transition | Every episode heals or is explicitly persistent; liveness assertions expressible on the distributed example |
+| **F5** ✅ | Decision trace recording (S1); replay with suppression (S2, no novel faults after divergence — Rule 12); 1-minimal minimization (S3); canonical trace encoding + FNV-1a trace hash (S4) | Suppressing one fault leaves every other honoured trace entry bit-identical; two replays of one trace are bit-identical; `--verify` stable across compilers |
+| **F6** | Distributed faults: virtual clock, scheduler timer queue, node registry, episode lifecycle (every episode schedules its own heal — Rule 5), persistent faults, scheduled episode triggers (§10.2), fault-model limits with recorded refusals, `Liveness` mode transition | Every episode heals or is explicitly persistent; liveness assertions expressible on the distributed example |
 
 **Not planned:** automatically inserting faults into application logic without the application author writing anything (§8.3) — this isn't a later sprint, it's a capability this design deliberately doesn't claim.
 
@@ -1240,7 +1336,7 @@ scenario.note_covered("node-crash-path-exercised", a_process_fault_fired_this_ru
 
 ### 17.3 Step 3 — Run the campaign
 
-The scenario from §17.2 runs once per seed, unchanged — a campaign is just this same harness repeated:
+The scenario from §17.2 runs once per seed, unchanged — a campaign is just this same harness repeated. The two call forms the sketch got wrong are corrected here: a scenario is built by a factory, never by brace-initialising a `faults` member, and `build_fn` returns the universe's report, because a `void` return would leave the findings unreachable.
 
 ```cpp
 CampaignConfig ccfg;
@@ -1248,12 +1344,12 @@ ccfg.trials    = 5000;
 ccfg.base_seed = 1;
 
 CampaignReport report = Campaign::run(ccfg, [&](Simulator& sim, uint64_t universe_index) {
-    Scenario scenario{.faults = FaultConfig::sample(sim.swarm_rng())};
-    run_replicated_kv_scenario(scenario);   // the exact harness from §17.2, one seed at a time
+    auto scenario = Scenario::on(sim, FaultConfig::sample(sim.swarm_rng()));
+    return run_replicated_kv_scenario(*scenario);   // the exact harness from §17.2, one seed at a time
 });
 ```
 
-Each of the 5000 universes gets its own seed (§6.4), its own swarm-sampled rates (§6), and runs the full lifecycle from §9. The user does not watch any of this run — they read `report` afterward:
+Each of the 5000 universes gets its own seed (§6.4), its own swarm-sampled rates (§6), and runs the full lifecycle from §9. `build_fn` runs in a worker process, not in the caller's: that is what turns a crashing universe into a finding instead of a dead campaign, and it means the returned report is the only channel back. The user does not watch any of this run — they read `report` afterward:
 
 ```text
 report.runs        = 5000
@@ -1291,7 +1387,7 @@ That is a hypothesis, not proof. With only 4 faults in this short ledger it is e
 cosmos --seed 8421 --minimize
 ```
 
-This replays seed 8421 repeatedly, each time suppressing one ledger entry (§11.2) and checking whether `"no-committed-data-loss"` still fails:
+This replays seed 8421 repeatedly, each time suppressing one decision-trace entry (§11.2) and checking whether `"no-committed-data-loss"` still fails:
 
 ```text
 suppress t=12ms (malloc OOM)         → still FAILS → OOM was irrelevant, drop it
@@ -1302,12 +1398,16 @@ suppress t=61ms (n2 crash)           → PASSES      → this fault was essentia
 Result — a 1-minimal reproduction (§11.2):
 
 ```text
-Minimal fault set for "no-committed-data-loss":
-  t=30ms   Network   partition {n1} isolated from {n0,n2}
-  t=61ms   Process   n2 crashed while still isolated
+Minimal fault set for "no-committed-data-loss"  (1-minimal, 4 replays, seed 8421):
+  seq=17  t=30ms   Network   partition {n1} isolated from {n0,n2}
+  seq=42  t=61ms   Process   n2 crashed while still isolated
 
-Repro: cosmos --seed 8421 --only-faults=2   (the two entries above, nothing else)
+Repro: cosmos --seed 8421 --only-faults=17,42   (2 entries, nothing else)
 ```
+
+The printed `--only-faults` list is the exact decision seqs the harness passes to
+`TraceFilter::only_faults`; the minimizer is trace-first, so the harness owns the recording step and
+the `--minimize`/`--only-faults` flags (no `cosmos` binary ships).
 
 This is the actual bug report a developer acts on: *"if `n1` is partitioned away from the cluster right when `n2`, the only other holder of a given write, crashes, the write is lost — even though only 1 of 3 nodes ever died, which the fault model says should be survivable."* That is a genuine violation of the promise from §2, not a false positive — the injector never exceeded `max_crashed_nodes = 1`, so this finding is real.
 

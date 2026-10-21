@@ -6,10 +6,12 @@
 #include "cosmos/simulator.hpp"
 #include <concepts>
 #include <cstdint>
+#include <cstdlib>
 #include <expected>
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <span>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -34,11 +36,15 @@ struct CheckResult {
     std::string detail;
     bool passed = false;
     Time at{};
+
+    bool operator==(const CheckResult&) const = default;
 };
 
 struct CoverageNote {
     std::string id;
     bool hit = false;
+
+    bool operator==(const CoverageNote&) const = default;
 };
 
 struct ScenarioReport {
@@ -50,12 +56,17 @@ struct ScenarioReport {
     // and the campaign must not have to reach back into a finished universe's injector.
     SiteCounterMap eligible_calls{};
     SiteCounterMap injections{};
+    // What this universe's configuration armed, so a campaign can tell "never activated" from
+    // "activated everywhere and the workload never called it".
+    SiteActivationSet activated_sites{};
     // Snapshotted rather than read live: an oracle reading the count inside check()'s CurrentGuard
     // would include its own allocations wherever operator new reaches the wrappers.
     size_t active_allocations = 0;
     // Rendered before the universe dies, because the sugar returns the report by value and the
     // ledger would otherwise be unreachable. Empty on a pass, and for a Scenario used directly.
     std::string ledger_dump{};
+
+    bool operator==(const ScenarioReport&) const = default;
 
     bool vacuous() const { return checks.empty(); }
 
@@ -73,12 +84,44 @@ inline bool failed(const ScenarioReport& report) { return !report.no_check_faile
 class Scenario {
   public:
     [[nodiscard]] static std::expected<Scenario, ConfigProblem>
-    create(uint64_t seed, FaultPlan plan, uint32_t node_count = 1) {
+    create(uint64_t seed, FaultPlan plan, uint32_t node_count = 1,
+           TraceOptions trace_options = {}) {
         auto sim = std::make_unique<Simulator>(seed);
-        if (auto installed = sim->install_faults(std::move(plan), node_count); !installed) {
+        if (auto installed = sim->install_faults(std::move(plan), node_count, trace_options);
+            !installed) {
             return std::unexpected(installed.error());
         }
         return Scenario(seed, std::move(sim));
+    }
+
+    // A scenario over a universe the caller owns and outlives: the campaign runner builds one
+    // Simulator per universe and must not hand its ownership to the harness.
+    [[nodiscard]] static std::expected<Scenario, ConfigProblem>
+    on(Simulator& sim, FaultPlan plan, uint32_t node_count = 1, TraceOptions trace_options = {}) {
+        if (auto installed = sim.install_faults(std::move(plan), node_count, trace_options);
+            !installed) {
+            return std::unexpected(installed.error());
+        }
+        return Scenario(sim);
+    }
+
+    // §11.2's replay: the same universe and the same config, driven by a recorded decision
+    // schedule. The seed travels with the trace, so a replay cannot be seeded against another run.
+    [[nodiscard]] static std::expected<Scenario, ConfigProblem>
+    replay(const FaultTrace& trace, TraceFilter filter, FaultPlan plan, uint32_t node_count = 1) {
+        // A trace that lost entries would replay its first N and pass the rest through, which
+        // Rule 12 makes indistinguishable from a run that simply had no more faults.
+        if (trace.dropped() > 0) {
+            return std::unexpected(ConfigProblem{ConfigError::TruncatedTrace, std::nullopt});
+        }
+
+        auto scenario = create(trace.universe_seed(), std::move(plan), node_count,
+                               TraceOptions{.enabled = true, .capacity = trace.capacity()});
+        if (!scenario) return std::unexpected(scenario.error());
+
+        // create() installed the injector; a scenario without one is not reachable from here.
+        scenario->simulator().injector_or_null()->replay_from(trace, std::move(filter));
+        return scenario;
     }
 
     template <Workload F> void run(F&& workload) {
@@ -93,7 +136,7 @@ class Scenario {
             return;
         }
         ran_ = true;
-        CurrentGuard guard(*sim_);
+        CurrentGuard guard(*this);
         workload();
     }
 
@@ -116,7 +159,7 @@ class Scenario {
             auto* early_injector = sim_->injector_or_null();
             if (early_injector != nullptr) early_injector->push_quiet();
             {
-                CurrentGuard guard(*sim_);
+                CurrentGuard guard(*this);
                 sim_->scheduler().run_until_quiescence();
             }
             return;
@@ -125,7 +168,7 @@ class Scenario {
         if (injector != nullptr) injector->push_quiet();
         bool saw_deadlock = false;
         {
-            CurrentGuard guard(*sim_);
+            CurrentGuard guard(*this);
             sim_->scheduler().run_until_quiescence();
             saw_deadlock = sim_->scheduler().deadlocked();
             // Snapshot under guard but drain itself uses __real_malloc only, so
@@ -137,6 +180,7 @@ class Scenario {
                     report_.eligible_calls[slot] = injector->eligible_calls(site);
                     report_.injections[slot] = injector->injections(site);
                 }
+                report_.activated_sites = injector->config().activated_sites;
             }
         }
         // Outside the guard so the detail string cannot become a tracked block
@@ -158,7 +202,7 @@ class Scenario {
         bool ok = false;
         Time at{};
         {
-            CurrentGuard guard(*sim_);
+            CurrentGuard guard(*this);
             ok = static_cast<bool>(oracle());
             at = sim_->now();
         }
@@ -187,6 +231,27 @@ class Scenario {
         report_.coverage.push_back(CoverageNote{std::move(id), hit});
     }
 
+    // The scenario a wrapped assertion on this thread reports to; null when no universe is active.
+    static Scenario* current() { return current_; }
+
+    // Mid-run invariant violations land here: unlike check(), this needs no preceding quiesce, so
+    // an `always` inside the workload is recorded the moment it fails.
+    void record_violation(std::string id, std::string detail = "") {
+        report_.checks.push_back(CheckResult{std::move(id), std::move(detail), false, sim_->now()});
+        report_.no_check_failed = false;
+    }
+
+    // Coalesced by id: a workload may call this in a loop, and only the OR across calls matters.
+    void record_sometimes(std::string id, bool hit) {
+        for (CoverageNote& note : report_.coverage) {
+            if (note.id == id) {
+                note.hit = note.hit || hit;
+                return;
+            }
+        }
+        report_.coverage.push_back(CoverageNote{std::move(id), hit});
+    }
+
     bool passed() const { return report_.passed(); }
 
     const ScenarioReport& report() const { return report_; }
@@ -194,34 +259,47 @@ class Scenario {
     const Simulator& simulator() const { return *sim_; }
 
   private:
-    // Restores the previous universe rather than clearing it, so a nested or sequential scenario
-    // cannot strand an outer one.
+    // Restores both previous bindings rather than clearing them, so a nested or sequential
+    // scenario cannot strand an outer one.
     struct CurrentGuard {
-        explicit CurrentGuard(Simulator& sim) : previous_(Simulator::current()) {
-            Simulator::set_current(&sim);
+        explicit CurrentGuard(Scenario& scenario)
+            : previous_universe_(Simulator::current()), previous_scenario_(Scenario::current()) {
+            Simulator::set_current(scenario.sim_);
+            Scenario::current_ = &scenario;
         }
-        ~CurrentGuard() { Simulator::set_current(previous_); }
+        ~CurrentGuard() {
+            Simulator::set_current(previous_universe_);
+            Scenario::current_ = previous_scenario_;
+        }
 
         CurrentGuard(const CurrentGuard&) = delete;
         CurrentGuard& operator=(const CurrentGuard&) = delete;
 
       private:
-        Simulator* previous_;
+        Simulator* previous_universe_;
+        Scenario* previous_scenario_;
     };
 
-    Scenario(uint64_t seed, std::unique_ptr<Simulator> sim) : sim_(std::move(sim)) {
+    Scenario(uint64_t seed, std::unique_ptr<Simulator> sim)
+        : owned_(std::move(sim)), sim_(owned_.get()) {
         report_.seed = seed;
     }
+
+    explicit Scenario(Simulator& sim) : sim_(&sim) { report_.seed = sim.seed(); }
 
     void record_lifecycle(std::string detail) {
         report_.checks.push_back(CheckResult{kLifecycleId, std::move(detail), false, sim_->now()});
         report_.no_check_failed = false;
     }
 
-    std::unique_ptr<Simulator> sim_;
+    // Empty when the universe is the caller's (Scenario::on); sim_ is non-owning either way.
+    std::unique_ptr<Simulator> owned_;
+    Simulator* sim_ = nullptr;
     ScenarioReport report_{};
     bool ran_ = false;
     bool quiesced_ = false;
+    // thread_local on purpose, like the universe slot: a scenario belongs to the thread driving it.
+    inline static thread_local Scenario* current_{nullptr};
 };
 
 // §17.4's shape. The ledger is dumped only on failure, because that is the one time a human reads
@@ -268,6 +346,37 @@ struct RunSpec {
     uint32_t node_count = 1;
     std::string check_id = "oracle";
 };
+
+// What an environment variable held before delivery, so it can be put back.
+struct SavedEnv {
+    std::string name;
+    std::string value;
+    bool existed = false;
+};
+
+// Knob delivery (§4.3): set each declared knob in the environment, run the body, put back what was
+// there. Call before the universe becomes current: setenv allocates, and that allocation would be
+// counted as the application's own.
+template <typename Body>
+void with_knob_env(const FaultConfig& config, std::span<const KnobSpec> specs, Body&& body) {
+    std::vector<SavedEnv> saved;
+    for (const KnobSpec& spec : specs) {
+        const auto value = spec.env != nullptr ? config.knob_value(spec.id) : std::nullopt;
+        if (!value) continue;
+        const char* previous = std::getenv(spec.env);
+        saved.push_back(
+            SavedEnv{spec.env, previous != nullptr ? previous : "", previous != nullptr});
+        setenv(spec.env, std::to_string(*value).c_str(), 1);
+    }
+    body();
+    for (const SavedEnv& entry : saved) {
+        if (entry.existed) {
+            setenv(entry.name.c_str(), entry.value.c_str(), 1);
+        } else {
+            unsetenv(entry.name.c_str());
+        }
+    }
+}
 
 // fail_on_call is the K-th *eligible* call at SiteId::malloc (§10), counting every allocation that
 // reaches the wrapped symbol. Which ones do is linkage-dependent: under the default shared

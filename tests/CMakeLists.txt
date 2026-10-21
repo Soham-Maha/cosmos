@@ -3,9 +3,6 @@
 # so a prior Release configure would otherwise leak NDEBUG into the test binaries.
 add_compile_options(-UNDEBUG)
 
-# The campaign worker pool runs on std::thread; the platform pthread flag must reach it.
-find_package(Threads REQUIRED)
-
 add_executable(test_wrap_malloc test_wrap_malloc.cpp)
 target_link_libraries(test_wrap_malloc PRIVATE cosmos)
 # White-box test: pins the internal memory eligibility policy from wrapper_fault.hpp.
@@ -67,6 +64,24 @@ add_executable(test_faults test_faults.cpp)
 target_link_libraries(test_faults PRIVATE cosmos)
 add_test(NAME test_faults COMMAND test_faults)
 
+add_executable(test_swarm test_swarm.cpp)
+target_link_libraries(test_swarm PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # Touches Simulator, whose scheduler allocates, so the memory family must be wrapped.
+    target_compile_options(test_swarm PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+    )
+    target_link_options(test_swarm PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+    )
+endif()
+
+add_test(NAME test_swarm COMMAND test_swarm)
+
 add_executable(test_faultinjection_phase1_gate test_faultinjection_phase1_gate.cpp)
 target_link_libraries(test_faultinjection_phase1_gate PRIVATE cosmos)
 add_test(NAME test_faultinjection_phase1_gate COMMAND test_faultinjection_phase1_gate)
@@ -88,63 +103,18 @@ target_link_libraries(test_simulator PRIVATE cosmos)
 
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # Same reason as test_wrap_malloc above: the wrapped symbols must stay opaque calls.
-    # calloc/realloc are wrapped too: the simulator verify-shape test exercises all four
-    # allocators, and an unwrapped realloc would hand a tracked (header-offset) pointer to the
-    # host allocator and abort.
     target_compile_options(test_simulator PRIVATE
         "-fno-builtin-malloc"
         "-fno-builtin-free"
-        "-fno-builtin-calloc"
-        "-fno-builtin-realloc"
     )
     target_link_options(test_simulator PRIVATE
         "-Wl,--gc-sections"
         "-Wl,--wrap=malloc"
         "-Wl,--wrap=free"
-        "-Wl,--wrap=calloc"
-        "-Wl,--wrap=realloc"
     )
 endif()
 
 add_test(NAME test_simulator COMMAND test_simulator)
-
-add_executable(test_assert test_assert.cpp)
-target_link_libraries(test_assert PRIVATE cosmos)
-
-if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    # record_finding materializes std::strings through the wrapped heap when a universe is
-    # current, so the wrapped symbols must stay opaque calls.
-    target_compile_options(test_assert PRIVATE
-        "-fno-builtin-malloc"
-        "-fno-builtin-free"
-    )
-    target_link_options(test_assert PRIVATE
-        "-Wl,--gc-sections"
-        "-Wl,--wrap=malloc"
-        "-Wl,--wrap=free"
-    )
-endif()
-
-add_test(NAME test_assert COMMAND test_assert)
-
-add_executable(test_campaign test_campaign.cpp)
-target_link_libraries(test_campaign PRIVATE cosmos Threads::Threads)
-
-if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    # Same opaque-call reason as test_wrap_malloc: record_finding and the flush paths allocate
-    # through the wrapped heap when a universe is current.
-    target_compile_options(test_campaign PRIVATE
-        "-fno-builtin-malloc"
-        "-fno-builtin-free"
-    )
-    target_link_options(test_campaign PRIVATE
-        "-Wl,--gc-sections"
-        "-Wl,--wrap=malloc"
-        "-Wl,--wrap=free"
-    )
-endif()
-
-add_test(NAME test_campaign COMMAND test_campaign)
 
 add_executable(test_wrap_random test_wrap_random.cpp)
 target_link_libraries(test_wrap_random PRIVATE cosmos)
@@ -209,7 +179,16 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=read"
         "-Wl,--wrap=__read_chk"
         "-Wl,--wrap=write"
+        "-Wl,--wrap=__write_chk"
+        "-Wl,--wrap=pwrite"
+        "-Wl,--wrap=pwrite64"
+        "-Wl,--wrap=writev"
+        "-Wl,--wrap=pwritev"
         "-Wl,--wrap=fsync"
+        "-Wl,--wrap=fdatasync"
+        "-Wl,--wrap=ftruncate"
+        "-Wl,--wrap=ftruncate64"
+        "-Wl,--wrap=close"
     )
 endif()
 
@@ -338,6 +317,29 @@ endif()
 
 add_test(NAME test_scenario COMMAND test_scenario)
 
+add_executable(test_assert test_assert.cpp)
+target_link_libraries(test_assert PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # Same link shape as test_scenario: assertions allocate through the harness's own bookkeeping.
+    target_compile_options(test_assert PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_assert PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+endif()
+
+add_test(NAME test_assert COMMAND test_assert)
+
 add_executable(test_scheduler test_scheduler.cpp)
 target_link_libraries(test_scheduler PRIVATE cosmos)
 # White-box test: pins the engine-context passthrough contract from wrapper_fault.hpp.
@@ -418,6 +420,31 @@ else()
     message(STATUS "test_scenario_static skipped: no static libstdc++ for this toolchain")
 endif()
 
+# Second link of the assertion suite, for the same reason: operator new reaches the wrappers only
+# here, so test_passing_check_does_not_allocate can only actually measure anything in this link.
+if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(test_assert_static test_assert.cpp)
+    target_link_libraries(test_assert_static PRIVATE cosmos)
+    target_compile_options(test_assert_static PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_assert_static PRIVATE
+        "-static-libstdc++"
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+    add_test(NAME test_assert_static COMMAND test_assert_static)
+else()
+    message(STATUS "test_assert_static skipped: no static libstdc++ for this toolchain")
+endif()
+
 # The P2-S3 end-to-end fixture: a plain C application that knows nothing about libcosmos, driven by
 # the Scenario harness. Compiled twice from one source -- the fix is the -D, so the two targets
 # differ only by the nullptr check -- and both run under ctest.
@@ -479,3 +506,196 @@ if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     )
     add_test(NAME test_broken_app_static COMMAND test_broken_app_static)
 endif()
+
+# The campaign runner drives the same deliberately-broken application across many seeds, so it needs
+# the same fixture source and the same wrapped allocator channel.
+add_executable(test_campaign
+    test_campaign.cpp
+    ${CMAKE_SOURCE_DIR}/examples/single_node/broken_cache.c
+)
+target_link_libraries(test_campaign PRIVATE cosmos)
+target_include_directories(test_campaign PRIVATE ${CMAKE_SOURCE_DIR}/examples/single_node)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_campaign PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_campaign PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+endif()
+
+add_test(NAME test_campaign COMMAND test_campaign)
+
+# The decision trace is recorded inside decide(), so its tests need the same allocator channel the
+# wrappers use for the heap-invisibility case.
+add_executable(test_trace test_trace.cpp)
+target_link_libraries(test_trace PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_trace PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_trace PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+    )
+endif()
+
+add_test(NAME test_trace COMMAND test_trace)
+
+# The replay engine drives the same wrapped allocator channel the trace does, and needs calloc for
+# the two-site fixture that makes divergence observable.
+add_executable(test_replay test_replay.cpp)
+target_link_libraries(test_replay PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_replay PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_replay PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+    )
+endif()
+
+add_test(NAME test_replay COMMAND test_replay)
+
+# The minimizer replays a recorded trace in forked children over the same deliberately-broken
+# application the campaign uses, so it needs the same fixture and allocator channel.
+add_executable(test_minimize
+    test_minimize.cpp
+    ${CMAKE_SOURCE_DIR}/examples/single_node/broken_cache.c
+)
+target_link_libraries(test_minimize PRIVATE cosmos)
+target_include_directories(test_minimize PRIVATE ${CMAKE_SOURCE_DIR}/examples/single_node)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_minimize PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_minimize PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+endif()
+
+add_test(NAME test_minimize COMMAND test_minimize)
+
+# Second link of the trace suite. std:: allocations only reach the wrappers under a static
+# libstdc++, so the preallocation claim in test_recording_never_allocates_with_a_universe_current
+# is only measurable here.
+if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(test_trace_static test_trace.cpp)
+    target_link_libraries(test_trace_static PRIVATE cosmos)
+    target_compile_options(test_trace_static PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_trace_static PRIVATE
+        "-static-libstdc++"
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+    )
+    add_test(NAME test_trace_static COMMAND test_trace_static)
+else()
+    message(STATUS "test_trace_static skipped: no static libstdc++ for this toolchain")
+endif()
+
+# Durability model: page-cache buffering, fsync commit, crash discard and torn sectors.
+add_executable(test_storage_model test_storage_model.cpp)
+target_link_libraries(test_storage_model PRIVATE cosmos)
+add_test(NAME test_storage_model COMMAND test_storage_model)
+
+# Node live/crashed state: refusals rather than UB, and counts that cannot drift.
+add_executable(test_node_registry test_node_registry.cpp)
+target_link_libraries(test_node_registry PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # A Simulator pulls in the scheduler, whose __real_malloc/free need the wrap aliases.
+    target_compile_options(test_node_registry PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+    )
+    target_link_options(test_node_registry PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+    )
+endif()
+
+add_test(NAME test_node_registry COMMAND test_node_registry)
+
+# The roadmap's Phase-4 exit criterion: a WAL store loses an acked write it never fsynced.
+add_executable(test_kv_store
+    test_kv_store.cpp
+    ${CMAKE_SOURCE_DIR}/examples/single_node/kv_store.c
+)
+target_link_libraries(test_kv_store PRIVATE cosmos)
+target_compile_definitions(test_kv_store PRIVATE COSMOS_KV_NO_MAIN)
+target_include_directories(test_kv_store PRIVATE ${CMAKE_SOURCE_DIR}/examples/single_node)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_kv_store PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_kv_store PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+        "-Wl,--wrap=open"
+        "-Wl,--wrap=open64"
+        "-Wl,--wrap=read"
+        "-Wl,--wrap=write"
+        "-Wl,--wrap=__write_chk"
+        "-Wl,--wrap=pwrite"
+        "-Wl,--wrap=pwrite64"
+        "-Wl,--wrap=writev"
+        "-Wl,--wrap=pwritev"
+        "-Wl,--wrap=fsync"
+        "-Wl,--wrap=fdatasync"
+        "-Wl,--wrap=ftruncate"
+        "-Wl,--wrap=ftruncate64"
+        "-Wl,--wrap=close"
+    )
+endif()
+
+add_test(NAME test_kv_store COMMAND test_kv_store)

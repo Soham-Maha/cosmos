@@ -19,6 +19,14 @@ Use the standard task commands for routine work:
 - `nix develop -c just build` — build production binaries.
 - `nix develop -c just all` — build all targets.
 
+The second toolchain is a separate shell, and the wrappers are linker
+interposition, so the same suite runs there too (the static libstdc++ twins
+skip by design):
+
+```sh
+nix develop .#clang -c just test
+```
+
 `make` provides equivalent targets when needed; invoke it through Nix as
 `nix develop -c make <target>`.
 

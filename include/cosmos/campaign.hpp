@@ -1,340 +1,840 @@
 #pragma once
 
+// The campaign runner (docs/design.md §13): many universes from one base seed, each with its own
+// fault configuration, aggregated into a single findings report.
+//
+// A universe runs in a worker process, not in the caller's. A crashing universe must become a
+// finding rather than take the campaign with it, and only a process boundary can contain a signal.
+// The consequence is deliberate: writes to captured variables inside the body are not visible here,
+// and its returned ScenarioReport is the only channel back.
+
 #include "cosmos/assert.hpp"
-#include "cosmos/finding.hpp"
+#include "cosmos/ledger_print.hpp"
+#include "cosmos/scenario.hpp"
 #include "cosmos/simulator.hpp"
+
 #include <algorithm>
-#include <atomic>
+#include <bitset>
 #include <cstdint>
 #include <cstdio>
-#include <filesystem>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
 #include <functional>
 #include <map>
-#include <mutex>
+#include <ostream>
+#include <sstream>
 #include <string>
-#include <string_view>
+#include <sys/wait.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace cosmos {
 
-// Controls the campaign run (state-exploration.md §4).
+// Reserved ids: the harness's own findings, never an application's (scenario.hpp's convention).
+inline constexpr const char* kCrashedUniverseId = "cosmos.campaign.crash";
+inline constexpr const char* kThrewUniverseId = "cosmos.campaign.threw";
+inline constexpr const char* kVerifyFailedId = "cosmos.campaign.verify";
+inline constexpr const char* kForkFailedId = "cosmos.campaign.fork";
+
+// True for the harness's own findings, which carry no universe and so no repro line.
+inline bool is_harness_id(const std::string& id) { return id.rfind("cosmos.", 0) == 0; }
+
+// Runs one universe. The campaign owns the Simulator; the callee drives a Scenario over it, so its
+// report comes back as the universe's result.
+using UniverseFn = std::function<ScenarioReport(Simulator&, uint64_t universe_index)>;
+
 struct CampaignConfig {
-    uint64_t trials = 1'000;
+    uint64_t trials = 1000;
     uint64_t base_seed = 0;
     unsigned parallel = std::thread::hardware_concurrency();
-    bool verify = false; // double-run each seed, compare trace hashes (§8 determinism gate)
-
-    // Reporting cap: per assertion_id, the printed report lists at most this many distinct
-    // seeds. The full list always remains in CampaignReport::findings.
-    uint64_t max_seeds_per_finding = 10;
-
-    // Incremental flushing (Crash Containment item 2): the merged report is written to
-    // report_path (if non-empty) every flush_every completed runs, immediately after any run
-    // that produced findings, and once more after the pool shuts down. A crash then loses at
-    // most the current universe — never the campaign, and never an already-found finding.
-    std::string report_path;
-    uint64_t flush_every = 100;
-
-    // On-disk per-worker seed markers (Crash Containment item 1): before running a universe
-    // each worker writes worker-<id>.seed into marker_dir and deletes it on clean completion.
-    // After a crash, the surviving files name the in-flight seeds — those seeds ARE the
-    // findings; read them back with crash_attributed_seeds(). Empty disables marker files.
-    std::string marker_dir;
+    uint32_t node_count = 1;
+    // Runs each universe twice and compares the full report and the canonical trace hash.
+    // Implies tracing; a mismatch becomes a cosmos.campaign.verify finding.
+    bool verify = false;
+    // Trace buffer per run while verifying; overflow is reported, never hashed as if complete.
+    uint64_t trace_capacity = kDefaultTraceCapacity;
+    // Named in the repro line so a finding can be re-run verbatim, e.g. "myapp_test".
+    std::string program;
 };
 
-// Aggregated result of the full campaign. failed_runs counts universes (one run can produce
-// several findings); findings counts violations. Output is made order-independent before
-// printing: findings sorted by seed, never_hit sorted by id — the same campaign produces
-// byte-identical output regardless of worker interleaving.
+// One violated assertion, deduplicated by id -- never by fault set, which is not globally minimal
+// (plan §P4, "do not key findings dedup on the minimal fault set").
+struct Finding {
+    std::string id;
+    uint64_t index = 0; // universe index, half of the (base_seed, index) repro identity
+    uint64_t seed = 0;  // universe_seed(base_seed, index)
+    std::string detail;
+    Time at{};
+    uint64_t universes_failed = 0;
+    bool rare = false;  // reproduces in under a third of the runs
+    std::string ledger; // rendered ledger of the first universe that failed this id
+};
+
+// Why a site the configuration armed was never exercised (§11.4). Never a finding: a finding is a
+// violated assertion, and vacuity is a fact about the configuration, not about the application.
+enum class VacuityReason : uint8_t { NeverActivated, NeverReached, NeverFired };
+
+// Stable tokens, so a dashboard can key on a reason without parsing prose.
+constexpr const char* name_of(VacuityReason reason) {
+    switch (reason) {
+    case VacuityReason::NeverActivated:
+        return "never_activated";
+    case VacuityReason::NeverReached:
+        return "never_reached";
+    case VacuityReason::NeverFired:
+        return "never_fired";
+    }
+    return "?";
+}
+
+// One site the campaign never exercised, with the counters that say which way it never happened.
+struct VacuousSite {
+    SiteId site = SiteId::malloc;
+    uint64_t activated_runs = 0;
+    uint64_t eligible_calls = 0;
+    uint64_t injections = 0;
+    VacuityReason reason = VacuityReason::NeverActivated;
+
+    constexpr bool operator==(const VacuousSite&) const = default;
+};
+
 struct CampaignReport {
-    uint64_t runs = 0;        // universes executed
-    uint64_t failed_runs = 0; // universes with >= 1 Failure (or a crash)
-    std::vector<Failure> findings;
-    std::vector<std::string> never_hit; // sometimes() ids registered but never satisfied
+    uint64_t runs = 0;
+    uint64_t failed_runs = 0;
+    // Universes that produced no report at all: killed by a signal, or exited without one.
+    uint64_t crashed_runs = 0;
+    bool refused = false; // the harness declined to run; findings hold the reason
+    std::vector<Finding> findings;
+    std::vector<std::string> never_hit; // ids no universe reported as hit, kept apart from findings
+    SiteCounterMap eligible_calls{};
+    SiteCounterMap injections{};
+    // Per site: universes whose configuration armed it. Without this, eligible_calls == 0 cannot
+    // tell "nothing armed it" from "armed, and the workload never got there" (§11.4).
+    SiteCounterMap activated_runs{};
+    // Sites no universe exercised, ascending slot order, wrapper sites only: an event site is
+    // invoked by the harness, so judging it here would invent vacuity (§11.4).
+    std::vector<VacuousSite> vacuous;
+    uint64_t out_of_scope_assertions = 0;
 
-    // Ids registered with the SometimesRegistry but satisfied in no universe, sorted.
-    void compute_never_hit() { never_hit = sometimes_registry().never_hit_ids(); }
-
-    void sort_for_stable_output() {
-        std::sort(findings.begin(), findings.end(), [](const Failure& a, const Failure& b) {
-            if (a.seed != b.seed) return a.seed < b.seed;
-            if (a.assertion_id != b.assertion_id) return a.assertion_id < b.assertion_id;
-            return a.detail < b.detail;
-        });
-        std::sort(never_hit.begin(), never_hit.end());
-    }
-
-    // Findings grouped by assertion_id, each group's seed list capped at
-    // CampaignConfig::max_seeds_per_finding. One bug hit by 4,000 of 10,000 seeds is still one
-    // bug; this is the grouping the printed report uses.
-    std::map<std::string, std::vector<uint64_t>> grouped_findings(uint64_t cap) const {
-        std::map<std::string, std::vector<uint64_t>> groups;
-        for (const Failure& f : findings) {
-            std::vector<uint64_t>& seeds = groups[f.assertion_id];
-            if (seeds.size() < cap) {
-                seeds.push_back(f.seed);
-            }
-        }
-        return groups;
-    }
-
-    // Byte-stable text rendering (findings already sorted; groups keyed by sorted map order).
-    std::string to_string(uint64_t max_seeds_per_finding) const {
-        std::string out;
-        const auto append = [&out](std::string_view text) { out.append(text); };
-        for (const auto& [id, seeds] : grouped_findings(max_seeds_per_finding)) {
-            append("FINDING: ");
-            out.append(id);
-            append(" (seeds:");
-            for (uint64_t seed : seeds) {
-                append(" --seed ");
-                out.append(std::to_string(seed));
-            }
-            append(seeds.size() >= max_seeds_per_finding ? " ...)" : ")");
-            append("\n");
-        }
-        for (const std::string& id : never_hit) {
-            append("NEVER HIT: ");
-            out.append(id);
-            append("\n");
-        }
-        return out;
-    }
-};
-
-// The campaign-wide context (state-exploration.md §4): the sometimes() registry lives here, so
-// every worker thread reports into one shared state. Delegates to the singleton the
-// SometimesRegistry owns; per-worker findings shards merge into the report under run()'s mutex.
-class Campaign {
-  public:
-    static SometimesRegistry& current() { return sometimes_registry(); }
-};
-
-// Crash Containment item 1 (§4): a per-worker marker naming the seed the worker is currently
-// running. If the process dies, the marker identifies the crashing seed — that seed IS the
-// finding. The in-memory slot is the live copy; the on-disk twin (below) is what survives the
-// process. Signal handling and fork-per-seed subprocess isolation are deferred until Phase 2's
-// Process fault class makes crashing universes reproducible enough to exercise them.
-class WorkerSeedMarker {
-  public:
-    void publish(uint64_t seed) {
-        seed_.store(seed, std::memory_order_release);
-        active_.store(true, std::memory_order_release);
-    }
-    void clear() { active_.store(false, std::memory_order_release); }
-    bool active() const { return active_.load(std::memory_order_acquire); }
-    uint64_t seed() const { return seed_.load(std::memory_order_acquire); }
-
-  private:
-    std::atomic<uint64_t> seed_{0};
-    std::atomic<bool> active_{false};
+    // Echoed from the config so a report prints its own repro line without the caller's help.
+    uint64_t base_seed = 0;
+    std::string program;
+    bool verify = false;
 };
 
 namespace detail {
 
-// The on-disk twin of WorkerSeedMarker: worker-<id>.seed holds the seed of the universe the
-// worker is currently running. Survives the process, which is the point. All I/O is
-// best-effort — a failed marker write must never abort the campaign.
-inline std::filesystem::path seed_marker_path(const std::string& dir, unsigned worker_id) {
-    return std::filesystem::path(dir) / ("worker-" + std::to_string(worker_id) + ".seed");
-}
-
-inline void write_seed_marker(const std::string& dir, unsigned worker_id, uint64_t seed) {
-    if (dir.empty()) return;
-    std::FILE* file = std::fopen(seed_marker_path(dir, worker_id).c_str(), "w");
-    if (file == nullptr) return;
-    std::fprintf(file, "%llu\n", static_cast<unsigned long long>(seed));
-    std::fclose(file);
-}
-
-inline void remove_seed_marker(const std::string& dir, unsigned worker_id) {
-    if (dir.empty()) return;
-    std::error_code ignored;
-    std::filesystem::remove(seed_marker_path(dir, worker_id), ignored);
-}
-
-// Crash attribution: every marker file left in dir names a seed that was in flight when the
-// process died. Those seeds ARE the findings. Sorted for stable output; files are left in
-// place — the caller decides what to do with them.
-inline std::vector<uint64_t> crash_attributed_seeds(const std::string& dir) {
-    std::vector<uint64_t> seeds;
-    std::error_code error;
-    for (const std::filesystem::directory_entry& entry :
-         std::filesystem::directory_iterator(dir, error)) {
-        std::FILE* file = std::fopen(entry.path().c_str(), "r");
-        if (file == nullptr) continue;
-        unsigned long long seed = 0;
-        if (std::fscanf(file, "%llu", &seed) == 1) {
-            seeds.push_back(seed);
-        }
-        std::fclose(file);
-    }
-    std::sort(seeds.begin(), seeds.end());
-    return seeds;
-}
-
-// One worker's shard: findings accumulate locally; the merge under a single mutex happens per
-// universe (and the flush cadence rides the same lock). record_finding is per-universe state,
-// so this is where per-run results become campaign state.
-struct WorkerShard {
-    std::vector<Failure> findings;
-    bool failed_run = false;
+// One universe's result, in the form a parent process can fold after the universe is gone.
+struct UniverseOutcome {
+    uint64_t index = 0;
+    uint64_t seed = 0;
+    bool died = false; // produced no report: a signal, or an exit without one
+    int signal = 0;    // WTERMSIG when it died on a signal
+    std::string threw; // nonempty when the universe's body threw instead of reporting
+    uint64_t out_of_scope = 0;
+    bool traced = false;         // the injector recorded a trace for this universe
+    uint64_t trace_hash = 0;     // canonical trace hash, valid only when traced
+    uint64_t trace_dropped = 0;  // entries the trace buffer could not hold
+    std::string verify_mismatch; // verify's first difference, empty on a deterministic run
+    ScenarioReport report{};
 };
 
-// Crash Containment item 2: write the merged report snapshot to disk. Best-effort — a failed
-// flush must not abort the campaign; the in-memory report remains authoritative.
-inline void flush_report_to_disk(const std::string& path, const CampaignReport& report,
-                                 uint64_t max_seeds_per_finding) {
-    if (path.empty()) return;
-    if (FILE* file = std::fopen(path.c_str(), "w")) {
-        const std::string text = report.to_string(max_seeds_per_finding);
-        std::fwrite(text.data(), 1, text.size(), file);
-        std::fclose(file);
+// What one universe run is asked for: verify traces every run and doubles it.
+struct UniverseOptions {
+    TraceOptions trace{};
+    bool verify = false;
+};
+
+// Runs one universe in this process: the Simulator is per universe, so no state crosses between
+// them.
+inline UniverseOutcome run_one_universe(uint64_t index, uint64_t seed, const UniverseFn& build_fn,
+                                        const UniverseOptions& options = {}) {
+    UniverseOutcome outcome;
+    outcome.index = index;
+    outcome.seed = seed;
+    const uint64_t out_of_scope_before = out_of_scope_assertions().count;
+    {
+        Simulator sim(seed);
+        sim.set_default_trace_options(options.trace);
+        try {
+            outcome.report = build_fn(sim, index);
+        } catch (const std::exception& error) {
+            outcome.threw = error.what();
+        } catch (...) {
+            outcome.threw = "unknown exception";
+        }
+        // Rendered here because the injector dies with the Simulator, and a finding needs its
+        // ledger.
+        if (!outcome.report.no_check_failed) {
+            if (const auto* injector = sim.injector_or_null()) {
+                std::ostringstream dump;
+                print_ledger(dump, *injector);
+                outcome.report.ledger_dump = dump.str();
+            }
+        }
+        // Hashed here for the same reason: the trace dies with the Simulator.
+        if (const auto* injector = sim.injector_or_null()) {
+            const FaultTrace& trace = injector->trace();
+            outcome.traced = trace.enabled();
+            if (outcome.traced) {
+                outcome.trace_hash = trace_hash(trace);
+                outcome.trace_dropped = trace.dropped();
+            }
+        }
+    }
+    outcome.out_of_scope = out_of_scope_assertions().count - out_of_scope_before;
+    return outcome;
+}
+
+// Names the first field that differs, so a determinism bug arrives with a diagnosis.
+inline std::string first_report_difference(const ScenarioReport& first,
+                                           const ScenarioReport& second) {
+    if (first.seed != second.seed) return "seed";
+    if (first.checks.size() != second.checks.size()) return "checks.size";
+    for (size_t index = 0; index < first.checks.size(); ++index) {
+        const CheckResult& a = first.checks[index];
+        const CheckResult& b = second.checks[index];
+        const std::string where = "checks[" + std::to_string(index) + "]";
+        if (a.id != b.id) return where + ".id";
+        if (a.detail != b.detail) return where + ".detail";
+        if (a.passed != b.passed) return where + ".passed";
+        if (a.at.ns != b.at.ns) return where + ".at";
+    }
+    if (first.coverage.size() != second.coverage.size()) return "coverage.size";
+    for (size_t index = 0; index < first.coverage.size(); ++index) {
+        const CoverageNote& a = first.coverage[index];
+        const CoverageNote& b = second.coverage[index];
+        const std::string where = "coverage[" + std::to_string(index) + "]";
+        if (a.id != b.id) return where + ".id";
+        if (a.hit != b.hit) return where + ".hit";
+    }
+    for (size_t slot = 0; slot < kSiteCount; ++slot) {
+        const std::string site = name_of(site_at_slot(slot));
+        if (first.eligible_calls[slot] != second.eligible_calls[slot]) {
+            return "eligible_calls[" + site + "]";
+        }
+        if (first.injections[slot] != second.injections[slot]) return "injections[" + site + "]";
+        if (first.activated_sites.test(slot) != second.activated_sites.test(slot)) {
+            return "activated_sites[" + site + "]";
+        }
+    }
+    if (first.active_allocations != second.active_allocations) return "active_allocations";
+    if (first.no_check_failed != second.no_check_failed) return "no_check_failed";
+    if (first.ledger_dump != second.ledger_dump) return "ledger_dump";
+    return {};
+}
+
+inline std::string verify_difference(const UniverseOutcome& first, const UniverseOutcome& second) {
+    if (first.threw != second.threw) {
+        return "threw: first=\"" + first.threw + "\" second=\"" + second.threw + "\"";
+    }
+    // The same throw twice is deterministic; the kernel-level finding already reports it.
+    if (!first.threw.empty()) return {};
+    if (!first.traced || !second.traced) {
+        return "tracing was not enabled; use Scenario::on(sim, plan) inside the campaign body";
+    }
+    const std::string difference = first_report_difference(first.report, second.report);
+    if (!difference.empty()) return difference;
+    if (first.trace_dropped != 0 || second.trace_dropped != 0) {
+        return "trace overflowed (first=" + std::to_string(first.trace_dropped) +
+               ", second=" + std::to_string(second.trace_dropped) + " entries dropped)";
+    }
+    if (first.trace_hash != second.trace_hash) return "trace hash";
+    return {};
+}
+
+// One universe, run twice from the same seed; the first run is the report, the second is evidence.
+inline UniverseOutcome run_verified_universe(uint64_t index, uint64_t seed,
+                                             const UniverseFn& build_fn,
+                                             const UniverseOptions& options) {
+    UniverseOutcome first = run_one_universe(index, seed, build_fn, options);
+    UniverseOutcome second = run_one_universe(index, seed, build_fn, options);
+    first.verify_mismatch = verify_difference(first, second);
+    return first;
+}
+
+inline UniverseOutcome run_universe(uint64_t index, uint64_t seed, const UniverseFn& build_fn,
+                                    const UniverseOptions& options) {
+    return options.verify ? run_verified_universe(index, seed, build_fn, options)
+                          : run_one_universe(index, seed, build_fn, options);
+}
+
+// The only place a finding is created or merged, so sequential and parallel runs cannot diverge.
+class CampaignAccumulator {
+  public:
+    // Outcomes must arrive in ascending index so the "first universe" evidence is the lowest one.
+    void add(const UniverseOutcome& outcome) {
+        ++report_.runs;
+        if (outcome.died) {
+            ++report_.crashed_runs;
+            ++report_.failed_runs;
+            Finding& finding = find_or_add(kCrashedUniverseId, outcome);
+            if (finding.universes_failed == 0) {
+                finding.detail = outcome.signal != 0
+                                     ? "killed by signal " + std::to_string(outcome.signal)
+                                     : "exited without reporting";
+            }
+            ++finding.universes_failed;
+            return;
+        }
+        if (!outcome.threw.empty()) {
+            ++report_.failed_runs;
+            Finding& finding = find_or_add(kThrewUniverseId, outcome);
+            if (finding.universes_failed == 0) finding.detail = outcome.threw;
+            ++finding.universes_failed;
+            return;
+        }
+
+        const ScenarioReport& universe = outcome.report;
+        const bool verify_failed = !outcome.verify_mismatch.empty();
+        if (!universe.no_check_failed || verify_failed) ++report_.failed_runs;
+        if (verify_failed) {
+            Finding& finding = find_or_add(kVerifyFailedId, outcome);
+            if (finding.universes_failed == 0) finding.detail = outcome.verify_mismatch;
+            ++finding.universes_failed;
+        }
+        for (const CheckResult& check : universe.checks) {
+            if (check.passed) continue;
+            Finding& finding = find_or_add(check.id, outcome);
+            if (finding.universes_failed == 0) {
+                finding.detail = check.detail;
+                finding.at = check.at;
+                finding.ledger = universe.ledger_dump;
+            }
+            ++finding.universes_failed;
+        }
+        // Coalesced by id, because a hit anywhere outweighs a miss everywhere.
+        for (const CoverageNote& note : universe.coverage) {
+            covered_[note.id] = covered_[note.id] || note.hit;
+        }
+        for (size_t slot = 0; slot < kSiteCount; ++slot) {
+            report_.eligible_calls[slot] += universe.eligible_calls[slot];
+            report_.injections[slot] += universe.injections[slot];
+            report_.activated_runs[slot] += universe.activated_sites.test(slot) ? 1 : 0;
+        }
+        report_.out_of_scope_assertions += outcome.out_of_scope;
+    }
+
+    // A complaint about the campaign itself, belonging to no single universe.
+    void add_harness_finding(const char* id, std::string detail) {
+        Finding& finding = find_or_add(id, UniverseOutcome{});
+        finding.detail = std::move(detail);
+        ++finding.universes_failed;
+    }
+
+    // std::map's ordering makes the findings and never_hit sequences a function of the universe set
+    // alone, which is what lets a parallel run match a sequential one exactly.
+    [[nodiscard]] CampaignReport finish() const {
+        CampaignReport report = report_;
+        report.findings.reserve(findings_.size());
+        for (const auto& [id, finding] : findings_) {
+            Finding copy = finding;
+            copy.rare = copy.universes_failed * 3 < report.runs;
+            report.findings.push_back(std::move(copy));
+        }
+        for (const auto& [id, hit] : covered_) {
+            if (!hit) report.never_hit.push_back(id);
+        }
+        for (size_t slot = 0; slot < kWrapperSiteCount; ++slot) {
+            VacuousSite site;
+            site.site = site_at_slot(slot);
+            site.activated_runs = report.activated_runs[slot];
+            site.eligible_calls = report.eligible_calls[slot];
+            site.injections = report.injections[slot];
+            if (site.activated_runs == 0) {
+                site.reason = VacuityReason::NeverActivated;
+            } else if (site.eligible_calls == 0) {
+                site.reason = VacuityReason::NeverReached;
+            } else if (site.injections == 0) {
+                site.reason = VacuityReason::NeverFired;
+            } else {
+                continue; // reached and fired: the site did work
+            }
+            report.vacuous.push_back(site);
+        }
+        return report;
+    }
+
+  private:
+    Finding& find_or_add(const std::string& id, const UniverseOutcome& outcome) {
+        auto [position, inserted] = findings_.try_emplace(id);
+        if (inserted) {
+            position->second.id = id;
+            position->second.index = outcome.index;
+            position->second.seed = outcome.seed;
+        }
+        return position->second;
+    }
+
+    std::map<std::string, Finding> findings_;
+    std::map<std::string, bool> covered_;
+    CampaignReport report_{};
+};
+
+// ---- the worker channel ----------------------------------------------------
+//
+// Both ends are the same binary, so fields are written as raw host-order bytes and the payload is
+// length-prefixed. An anonymous file rather than a pipe: a regular file cannot fill up, so a worker
+// never blocks on a reader that is still waiting for it, and unlinking up front means nothing to
+// clean up even when a worker dies mid-write.
+
+template <typename T> void put_field(std::string& bytes, const T& value) {
+    bytes.append(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+inline void put_text(std::string& bytes, const std::string& text) {
+    put_field(bytes, static_cast<uint64_t>(text.size()));
+    bytes.append(text);
+}
+
+inline std::string serialize_outcome(const UniverseOutcome& outcome) {
+    std::string bytes;
+    put_field(bytes, outcome.index);
+    put_field(bytes, outcome.seed);
+    put_field(bytes, static_cast<uint8_t>(outcome.died ? 1 : 0));
+    put_field(bytes, static_cast<int32_t>(outcome.signal));
+    put_text(bytes, outcome.threw);
+    put_field(bytes, outcome.out_of_scope);
+
+    const ScenarioReport& report = outcome.report;
+    put_field(bytes, report.seed);
+    put_field(bytes, static_cast<uint8_t>(report.no_check_failed ? 1 : 0));
+    put_field(bytes, static_cast<uint64_t>(report.checks.size()));
+    for (const CheckResult& check : report.checks) {
+        put_text(bytes, check.id);
+        put_text(bytes, check.detail);
+        put_field(bytes, static_cast<uint8_t>(check.passed ? 1 : 0));
+        put_field(bytes, check.at.ns);
+    }
+    put_field(bytes, static_cast<uint64_t>(report.coverage.size()));
+    for (const CoverageNote& note : report.coverage) {
+        put_text(bytes, note.id);
+        put_field(bytes, static_cast<uint8_t>(note.hit ? 1 : 0));
+    }
+    for (uint64_t count : report.eligible_calls)
+        put_field(bytes, count);
+    for (uint64_t count : report.injections)
+        put_field(bytes, count);
+    // kSiteCount == 18, so the activation set fits one field.
+    put_field(bytes, static_cast<uint64_t>(report.activated_sites.to_ullong()));
+    put_field(bytes, static_cast<uint64_t>(report.active_allocations));
+    put_text(bytes, report.ledger_dump);
+    put_field(bytes, static_cast<uint8_t>(outcome.traced ? 1 : 0));
+    put_field(bytes, outcome.trace_hash);
+    put_field(bytes, outcome.trace_dropped);
+    put_text(bytes, outcome.verify_mismatch);
+    return bytes;
+}
+
+// Walks a worker's bytes, stopping at a clean end or a half-written record.
+class OutcomeReader {
+  public:
+    explicit OutcomeReader(std::string bytes) : bytes_(std::move(bytes)) {}
+
+    bool next(UniverseOutcome& outcome) {
+        if (offset_ >= bytes_.size()) return false;
+        UniverseOutcome parsed;
+        uint8_t flag = 0;
+        int32_t signal = 0;
+        uint64_t count = 0;
+
+        if (!take(parsed.index) || !take(parsed.seed) || !take(flag) || !take(signal)) return false;
+        parsed.died = flag != 0;
+        parsed.signal = signal;
+        if (!take_text(parsed.threw) || !take(parsed.out_of_scope)) return false;
+        if (!take(parsed.report.seed) || !take(flag)) return false;
+        parsed.report.no_check_failed = flag != 0;
+        if (!take(count)) return false;
+        for (uint64_t i = 0; i < count; ++i) {
+            CheckResult check;
+            if (!take_text(check.id) || !take_text(check.detail) || !take(flag)) return false;
+            check.passed = flag != 0;
+            if (!take(check.at.ns)) return false;
+            parsed.report.checks.push_back(std::move(check));
+        }
+        if (!take(count)) return false;
+        for (uint64_t i = 0; i < count; ++i) {
+            CoverageNote note;
+            if (!take_text(note.id) || !take(flag)) return false;
+            note.hit = flag != 0;
+            parsed.report.coverage.push_back(std::move(note));
+        }
+        for (uint64_t& value : parsed.report.eligible_calls) {
+            if (!take(value)) return false;
+        }
+        for (uint64_t& value : parsed.report.injections) {
+            if (!take(value)) return false;
+        }
+        uint64_t activation_mask = 0;
+        if (!take(activation_mask)) return false;
+        parsed.report.activated_sites = std::bitset<kSiteCount>(activation_mask);
+        if (!take(parsed.report.active_allocations)) return false;
+        if (!take_text(parsed.report.ledger_dump)) return false;
+        uint8_t traced = 0;
+        if (!take(traced) || !take(parsed.trace_hash) || !take(parsed.trace_dropped) ||
+            !take_text(parsed.verify_mismatch)) {
+            return false;
+        }
+        parsed.traced = traced != 0;
+
+        outcome = std::move(parsed);
+        return true;
+    }
+
+  private:
+    template <typename T> bool take(T& value) {
+        if (offset_ + sizeof(T) > bytes_.size()) return false;
+        std::memcpy(&value, bytes_.data() + offset_, sizeof(T));
+        offset_ += sizeof(T);
+        return true;
+    }
+
+    bool take_text(std::string& text) {
+        uint64_t length = 0;
+        if (!take(length)) return false;
+        if (offset_ + length > bytes_.size()) return false;
+        text.assign(bytes_, offset_, static_cast<size_t>(length));
+        offset_ += static_cast<size_t>(length);
+        return true;
+    }
+
+    std::string bytes_;
+    size_t offset_ = 0;
+};
+
+// Unlinked on creation: the worker's death leaves nothing behind, and no reader can be blocked.
+inline int open_scratch_file() {
+    const char* tmpdir = std::getenv("TMPDIR");
+    std::string path = std::string(tmpdir != nullptr ? tmpdir : "/tmp") + "/cosmos-campaign-XXXXXX";
+    const int fd = ::mkstemp(path.data());
+    if (fd >= 0) ::unlink(path.c_str());
+    return fd;
+}
+
+// Read after the worker is reaped; the child shares the file offset, so seeking first is required.
+inline std::string read_scratch_file(int fd) {
+    std::string bytes;
+    if (::lseek(fd, 0, SEEK_SET) < 0) return bytes;
+    char chunk[4096];
+    for (;;) {
+        const ssize_t got = ::read(fd, chunk, sizeof(chunk));
+        if (got <= 0) break;
+        bytes.append(chunk, static_cast<size_t>(got));
+    }
+    return bytes;
+}
+
+// Contiguous, so folding workers in order folds universes in order.
+struct Slice {
+    uint64_t begin = 0;
+    uint64_t end = 0;
+};
+
+inline Slice slice_for(uint64_t trials, unsigned workers, unsigned worker) {
+    return Slice{trials * worker / workers, trials * (worker + 1) / workers};
+}
+
+inline void run_slice_into(const Slice& slice, uint64_t base_seed, const UniverseFn& build_fn,
+                           const UniverseOptions& options, CampaignAccumulator& accumulator) {
+    for (uint64_t index = slice.begin; index < slice.end; ++index) {
+        accumulator.add(run_universe(index, universe_seed(base_seed, index), build_fn, options));
+    }
+}
+
+// The child's whole job. Nothing here may touch the parent's memory and expect it to survive.
+inline void run_slice_to_file(const Slice& slice, uint64_t base_seed, const UniverseFn& build_fn,
+                              const UniverseOptions& options, int fd) {
+    std::string bytes;
+    for (uint64_t index = slice.begin; index < slice.end; ++index) {
+        bytes += serialize_outcome(
+            run_universe(index, universe_seed(base_seed, index), build_fn, options));
+        if (bytes.size() >= 1u << 20) {
+            const ssize_t written = ::write(fd, bytes.data(), bytes.size());
+            if (written != static_cast<ssize_t>(bytes.size())) return;
+            bytes.clear();
+        }
+    }
+    size_t done = 0;
+    while (done < bytes.size()) {
+        const ssize_t written = ::write(fd, bytes.data() + done, bytes.size() - done);
+        if (written <= 0) return;
+        done += static_cast<size_t>(written);
+    }
+}
+
+// One universe per worker for the tail of a slice whose worker died. A universe that dies again is
+// attributed to its own seed, which is the whole point of paying for a second fork.
+inline void recover_slice(uint64_t from, uint64_t to, uint64_t base_seed,
+                          const UniverseFn& build_fn, const UniverseOptions& options,
+                          CampaignAccumulator& accumulator) {
+    for (uint64_t index = from; index < to; ++index) {
+        UniverseOutcome outcome;
+        const int fd = open_scratch_file();
+        const pid_t pid = fd < 0 ? -1 : ::fork();
+        if (pid == 0) {
+            run_slice_to_file(Slice{index, index + 1}, base_seed, build_fn, options, fd);
+            ::_exit(0);
+        }
+        if (pid < 0) {
+            if (fd >= 0) ::close(fd);
+            accumulator.add(
+                run_universe(index, universe_seed(base_seed, index), build_fn, options));
+            continue;
+        }
+        int status = 0;
+        ::waitpid(pid, &status, 0);
+        OutcomeReader reader(read_scratch_file(fd));
+        if (!reader.next(outcome)) {
+            outcome.index = index;
+            outcome.seed = universe_seed(base_seed, index);
+            outcome.died = true;
+            outcome.signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+        }
+        ::close(fd);
+        accumulator.add(outcome);
     }
 }
 
 } // namespace detail
 
-// The campaign loop (state-exploration.md §4). Builds the seed list once (base_seed,
-// base_seed+1, ... base_seed+trials), then starts a FIXED pool of config.parallel workers
-// draining it through an atomic cursor — never one thread per trial. Each universe is pure
-// function of its seed, so OS scheduling cannot change any universe's outcome; only the
-// distribution across workers varies.
-//
-// Worker loop per seed:
-//   1. publish the seed to this worker's marker, memory + disk (crash attribution; surviving
-//      worker-<id>.seed files after a crash are readable via crash_attributed_seeds())
-//   2. Scope scope(sim) — RAII context install, never manual set_current()
-//   3. build_fn(sim, seed) — the user workload + assertions (the IDENTICAL build_fn that
-//      run_single receives; factor it into a named function, or repro runs will diverge)
-//   4. sim.scheduler().run_until_quiescence()
-//   5. verify mode: run sim2 through a second Scope on the same thread with the same seed and
-//      compare live trace hashes; a mismatch is itself a finding ("determinism.violation"),
-//      recorded and kept campaigning — never an abort
-//   6. merge this worker's shard into the shared report (one mutex), flush on cadence
-//
-// never_hit is computed from the campaign-wide registry after the pool shuts down; the report
-// is then sorted for stable output. The registry is NOT reset by run() — a campaign composes
-// with whatever ids were registered before it.
-//
-// Deferred (Phase 2): signal handlers (SIGSEGV/SIGABRT → marker + report flush + re-raise) and
-// fork-per-seed subprocess isolation. Both need the Process fault class to make crashing
-// universes reproducible enough to exercise; until then a hard crash is attributed by the
-// surviving on-disk markers alone.
-template <typename BuildFn> CampaignReport run(CampaignConfig cfg, BuildFn build_fn) {
+// Refusing costs nothing and says so; running anyway would hand back a green campaign that never
+// checked what the flag names.
+inline CampaignReport refused_report(const CampaignConfig& config, const char* detail) {
     CampaignReport report;
-    if (cfg.parallel == 0) cfg.parallel = 1;
-
-    std::atomic<uint64_t> next_seed_index{0};
-    std::mutex report_mutex;
-    std::vector<detail::WorkerShard> shards(cfg.parallel);
-    std::vector<WorkerSeedMarker> markers(cfg.parallel);
-
-    if (!cfg.marker_dir.empty()) {
-        std::error_code ignored;
-        std::filesystem::create_directories(cfg.marker_dir, ignored);
-    }
-
-    const auto merge_and_maybe_flush = [&](unsigned worker_id, bool run_failed) {
-        detail::WorkerShard& shard = shards[worker_id];
-        std::lock_guard<std::mutex> lock(report_mutex);
-        for (Failure& failure : shard.findings) {
-            report.findings.push_back(std::move(failure));
-        }
-        if (shard.failed_run) ++report.failed_runs;
-        const bool merged_run_failed = shard.failed_run;
-        shard.findings.clear();
-        shard.failed_run = false;
-        ++report.runs;
-        // Failure-triggered flush: a finding reaches disk the moment its universe merges, so a
-        // later crash cannot lose it — not just on the periodic cadence.
-        if (!cfg.report_path.empty() &&
-            (run_failed || merged_run_failed ||
-             (cfg.flush_every != 0 && report.runs % cfg.flush_every == 0))) {
-            detail::flush_report_to_disk(cfg.report_path, report, cfg.max_seeds_per_finding);
-        }
-    };
-
-    const auto worker_loop = [&](unsigned worker_id) {
-        WorkerSeedMarker& marker = markers[worker_id];
-        for (;;) {
-            const uint64_t index = next_seed_index.fetch_add(1);
-            if (index >= cfg.trials) return;
-            const uint64_t seed = cfg.base_seed + index;
-            marker.publish(seed);
-            detail::write_seed_marker(cfg.marker_dir, worker_id, seed);
-
-            {
-                Simulator sim(seed);
-                Simulator::Scope scope(sim);
-                build_fn(sim, seed);
-                sim.scheduler().run_until_quiescence();
-
-                for (const Failure& failure : sim.findings()) {
-                    shards[worker_id].findings.push_back(failure);
-                }
-                if (!sim.findings().empty()) shards[worker_id].failed_run = true;
-
-                if (cfg.verify) {
-                    Simulator sim2(seed);
-                    Simulator::Scope scope2(sim2);
-                    build_fn(sim2, seed);
-                    sim2.scheduler().run_until_quiescence();
-                    if (sim.trace_hash() != sim2.trace_hash()) {
-                        // A determinism-contract violation is itself a finding (§8). The
-                        // diverging hash pair goes in the detail so the report names it.
-                        shards[worker_id].findings.push_back(
-                            Failure{.seed = seed,
-                                    .assertion_id = "determinism.violation",
-                                    .detail = "trace hash diverged on re-run: " +
-                                              std::to_string(sim.trace_hash()) +
-                                              " != " + std::to_string(sim2.trace_hash())});
-                        shards[worker_id].failed_run = true;
-                    }
-                }
-            } // Scopes restored, sims destroyed: the markers still name the seed until cleared.
-
-            marker.clear();
-            detail::remove_seed_marker(cfg.marker_dir, worker_id);
-            const bool run_failed = !shards[worker_id].findings.empty();
-            merge_and_maybe_flush(worker_id, run_failed);
-        }
-    };
-
-    std::vector<std::thread> workers;
-    workers.reserve(cfg.parallel);
-    for (unsigned worker_id = 0; worker_id < cfg.parallel; ++worker_id) {
-        workers.emplace_back(worker_loop, worker_id);
-    }
-    for (std::thread& worker : workers) {
-        worker.join();
-    }
-
-    report.compute_never_hit();
-    report.sort_for_stable_output();
-    // Final flush: the periodic cadence may not have landed since the last merge.
-    detail::flush_report_to_disk(cfg.report_path, report, cfg.max_seeds_per_finding);
+    report.refused = true;
+    report.base_seed = config.base_seed;
+    report.program = config.program;
+    report.verify = config.verify;
+    Finding finding;
+    finding.id = kVerifyFailedId;
+    finding.detail = detail;
+    report.findings.push_back(std::move(finding));
     return report;
 }
 
-// Run exactly one universe with the given seed, using the same build_fn the campaign used
-// (harness contract, §4: factor build_fn into a named function, not an inline lambda, or
-// repro runs silently diverge from campaign runs). Prints any findings to stderr. Returns 0
-// on a clean run, 1 if the universe produced a finding — so CI can pin a regression to a
-// single seed. The repro execution must be bit-identical to the failing campaign execution
-// (same binary, same seed — §8); any difference is itself a determinism bug.
-template <typename BuildFn> int run_single(uint64_t seed, BuildFn build_fn) {
-    Simulator sim(seed);
-    Simulator::Scope scope(sim);
-    build_fn(sim, seed);
-    sim.scheduler().run_until_quiescence();
-
-    for (const Failure& failure : sim.findings()) {
-        std::fprintf(stderr, "FINDING: %s (seed %llu): %s\n", failure.assertion_id.c_str(),
-                     static_cast<unsigned long long>(failure.seed), failure.detail.c_str());
+// §11.4's sentence for one site: which way the campaign failed to exercise it.
+inline std::string vacuity_detail(const VacuousSite& site) {
+    switch (site.reason) {
+    case VacuityReason::NeverActivated:
+        return "never activated";
+    case VacuityReason::NeverReached:
+        return "activated in " + std::to_string(site.activated_runs) + " universes, never reached";
+    case VacuityReason::NeverFired:
+        return "activated in " + std::to_string(site.activated_runs) + " universes, reached " +
+               std::to_string(site.eligible_calls) + " eligible calls, never fired";
     }
-    return sim.findings().empty() ? 0 : 1;
+    return "?";
 }
+
+// §17.4's shape, plus the repro line §15 promises. Findings, never_hit and the sites nothing
+// exercised print in a fixed order, all three as separate sections.
+inline void print_campaign_report(std::ostream& out, const CampaignReport& report) {
+    if (report.refused) {
+        out << "REFUSED (" << report.runs << " universes run)\n";
+    } else {
+        out << "Campaign: " << report.runs << " universes, " << report.failed_runs << " failed, "
+            << report.crashed_runs << " crashed";
+        if (report.verify) out << "  (verify: double-run)";
+        out << "\n";
+    }
+    for (const Finding& finding : report.findings) {
+        out << "FINDING \"" << finding.id << "\"";
+        if (!is_harness_id(finding.id)) {
+            out << (finding.rare ? "  rare" : "") << "  universes = " << finding.universes_failed;
+        }
+        out << "\n";
+        if (!finding.detail.empty()) out << "  detail  = \"" << finding.detail << "\"\n";
+        if (finding.seed != 0) {
+            out << "  t       = " << detail::format_ms(finding.at) << "\n";
+            out << "  repro   = ";
+            if (!report.program.empty()) out << report.program << " ";
+            out << "--seed " << finding.seed << "   (base_seed " << report.base_seed << ", index "
+                << finding.index << ")\n";
+        }
+        if (!finding.ledger.empty()) out << finding.ledger;
+    }
+    for (const std::string& id : report.never_hit) {
+        out << "NEVER HIT: \"" << id << "\"\n";
+    }
+    for (const VacuousSite& site : report.vacuous) {
+        out << "NOT EXERCISED: \"" << name_of(site.site) << "\"  (" << vacuity_detail(site)
+            << ")\n";
+    }
+    if (report.out_of_scope_assertions > 0) {
+        out << "OUT OF SCOPE: " << report.out_of_scope_assertions
+            << " assertion(s) with no universe bound\n";
+    }
+}
+
+namespace detail {
+
+inline void json_escape(std::ostream& out, const std::string& text) {
+    out << '"';
+    for (const char raw : text) {
+        const unsigned char byte = static_cast<unsigned char>(raw);
+        switch (byte) {
+        case '"':
+            out << "\\\"";
+            break;
+        case '\\':
+            out << "\\\\";
+            break;
+        case '\n':
+            out << "\\n";
+            break;
+        case '\r':
+            out << "\\r";
+            break;
+        case '\t':
+            out << "\\t";
+            break;
+        default:
+            if (byte < 0x20) {
+                char escaped[8];
+                std::snprintf(escaped, sizeof(escaped), "\\u%04x", byte);
+                out << escaped;
+            } else {
+                out << raw;
+            }
+        }
+    }
+    out << '"';
+}
+
+// A site's counts only mean something together: activated but never reached is §11.4's vacuity,
+// reached but never fired is a rate that never got its chance.
+inline void json_sites(std::ostream& out, const CampaignReport& report) {
+    out << "  \"sites\": {";
+    for (size_t slot = 0; slot < kSiteCount; ++slot) {
+        if (slot != 0) out << ", ";
+        out << '"' << name_of(site_at_slot(slot))
+            << "\": {\"activated\": " << report.activated_runs[slot]
+            << ", \"eligible\": " << report.eligible_calls[slot]
+            << ", \"fired\": " << report.injections[slot] << '}';
+    }
+    out << "},\n";
+}
+
+} // namespace detail
+
+// The dashboard's input (plan §P4): findings, never_hit kept in its own section, per-site counters
+// and the repro seeds. Written to a stream, so the caller decides what to do with it.
+inline void print_campaign_json(std::ostream& out, const CampaignReport& report) {
+    out << "{\n";
+    out << "  \"runs\": " << report.runs << ",\n";
+    out << "  \"failed_runs\": " << report.failed_runs << ",\n";
+    out << "  \"crashed_runs\": " << report.crashed_runs << ",\n";
+    out << "  \"refused\": " << (report.refused ? "true" : "false") << ",\n";
+    out << "  \"verify\": " << (report.verify ? "true" : "false") << ",\n";
+    out << "  \"base_seed\": " << report.base_seed << ",\n";
+    out << "  \"findings\": [";
+    for (size_t i = 0; i < report.findings.size(); ++i) {
+        const Finding& finding = report.findings[i];
+        out << (i == 0 ? "\n    " : ",\n    ");
+        out << "{\"id\": ";
+        detail::json_escape(out, finding.id);
+        out << ", \"index\": " << finding.index << ", \"seed\": " << finding.seed
+            << ", \"universes_failed\": " << finding.universes_failed
+            << ", \"rare\": " << (finding.rare ? "true" : "false") << ", \"detail\": ";
+        detail::json_escape(out, finding.detail);
+        out << ", \"ledger\": ";
+        detail::json_escape(out, finding.ledger);
+        out << '}';
+    }
+    out << (report.findings.empty() ? "],\n" : "\n  ],\n");
+
+    out << "  \"never_hit\": [";
+    for (size_t i = 0; i < report.never_hit.size(); ++i) {
+        out << (i == 0 ? "\n    " : ",\n    ");
+        detail::json_escape(out, report.never_hit[i]);
+    }
+    out << (report.never_hit.empty() ? "],\n" : "\n  ],\n");
+
+    // Its own group, never a flag on a finding: the Antithesis note under plan §P4 is explicit that
+    // "properties that trivially failed by never being reached" are reported apart from failures.
+    out << "  \"vacuous\": [";
+    for (size_t i = 0; i < report.vacuous.size(); ++i) {
+        const VacuousSite& site = report.vacuous[i];
+        out << (i == 0 ? "\n    " : ",\n    ");
+        out << "{\"site\": \"" << name_of(site.site) << "\", \"reason\": \"" << name_of(site.reason)
+            << "\", \"activated_runs\": " << site.activated_runs
+            << ", \"eligible\": " << site.eligible_calls << ", \"fired\": " << site.injections
+            << '}';
+    }
+    out << (report.vacuous.empty() ? "],\n" : "\n  ],\n");
+
+    detail::json_sites(out, report);
+    out << "  \"out_of_scope_assertions\": " << report.out_of_scope_assertions << "\n";
+    out << "}\n";
+}
+
+class Campaign {
+  public:
+    static CampaignReport run(const CampaignConfig& config, const UniverseFn& build_fn) {
+        // A zero-capacity trace cannot record, so verify would have nothing to hash.
+        if (config.verify && config.trace_capacity == 0) {
+            return refused_report(config, "CampaignConfig::verify needs trace_capacity > 0");
+        }
+        const detail::UniverseOptions options{
+            .trace = {.enabled = config.verify, .capacity = config.trace_capacity},
+            .verify = config.verify,
+        };
+
+        const unsigned workers = std::max(1u, config.parallel);
+        struct LaunchedWorker {
+            detail::Slice slice;
+            int fd = -1;
+            pid_t pid = -1;
+        };
+        std::vector<LaunchedWorker> launched;
+        for (unsigned worker = 0; worker < workers; ++worker) {
+            const detail::Slice slice = detail::slice_for(config.trials, workers, worker);
+            if (slice.begin == slice.end) continue;
+            const int fd = detail::open_scratch_file();
+            const pid_t pid = fd < 0 ? -1 : ::fork();
+            // The child runs its slice and leaves; _exit skips inherited stdio and atexit handlers.
+            if (pid == 0) {
+                detail::run_slice_to_file(slice, config.base_seed, build_fn, options, fd);
+                ::_exit(0);
+            }
+            launched.push_back(LaunchedWorker{slice, fd, pid});
+        }
+
+        detail::CampaignAccumulator accumulator;
+        for (const LaunchedWorker& worker : launched) {
+            if (worker.pid > 0) {
+                int status = 0;
+                ::waitpid(worker.pid, &status, 0);
+                detail::OutcomeReader reader(detail::read_scratch_file(worker.fd));
+                uint64_t next = worker.slice.begin;
+                detail::UniverseOutcome outcome;
+                while (reader.next(outcome)) {
+                    accumulator.add(outcome);
+                    ++next;
+                }
+                // Shorter than the slice means the worker died or wrote short: recover the rest.
+                if (next < worker.slice.end) {
+                    detail::recover_slice(next, worker.slice.end, config.base_seed, build_fn,
+                                          options, accumulator);
+                }
+            } else {
+                accumulator.add_harness_finding(
+                    kForkFailedId,
+                    "fork() failed; that slice ran in-process and is not crash-contained");
+                detail::run_slice_into(worker.slice, config.base_seed, build_fn, options,
+                                       accumulator);
+            }
+            if (worker.fd >= 0) ::close(worker.fd);
+        }
+
+        CampaignReport report = accumulator.finish();
+        report.base_seed = config.base_seed;
+        report.program = config.program;
+        report.verify = config.verify;
+        return report;
+    }
+};
 
 } // namespace cosmos

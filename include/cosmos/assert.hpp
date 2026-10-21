@@ -1,128 +1,90 @@
 #pragma once
 
-#include "cosmos/finding.hpp"
-#include "cosmos/simulator.hpp"
+// Application-facing property checks (docs/design.md §12). They report into the thread's current
+// Scenario, so an app never has to thread a harness object through its own code.
+
+#include "cosmos/scenario.hpp"
+#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-#include <map>
 #include <mutex>
 #include <string>
-#include <string_view>
 #include <utility>
-#include <vector>
 
 namespace cosmos {
+namespace detail {
 
-// Invariant: checked every time it is called within a universe (state-exploration.md §4). A
-// single violation = one Failure recorded into the current universe's findings. The happy path
-// allocates nothing: id and detail are views, and std::strings materialize only on violation.
-//
-// detail defaults to empty; COSMOS_ALWAYS captures file:line at compile time instead.
-inline void always(bool cond, std::string_view id, std::string_view detail = {}) {
-    if (cond) {
-        return;
-    }
-    if (!Simulator::has_current()) {
-        // A violation with no universe to record it into is a harness bug: the finding would be
-        // silently lost. Loudly refuse rather than drop it.
-        std::fputs("cosmos::always violation outside any Simulator context (id: ", stderr);
-        std::fwrite(id.data(), 1, id.size(), stderr);
-        std::fputs(")\n", stderr);
-        std::abort();
-    }
-    Simulator& sim = *Simulator::current();
-    sim.record_finding(Failure{
-        .seed = sim.seed(),
-        .assertion_id = std::string(id),
-        .detail = std::string(detail),
-    });
-}
-
-#define COSMOS_STR2(x) #x
-#define COSMOS_STR(x) COSMOS_STR2(x)
-
-// Preferred call form: file:line is captured at compile time — zero runtime cost, no per-call
-// formatting. This is what harness code should use.
-#define COSMOS_ALWAYS(cond, id) ::cosmos::always((cond), (id), __FILE__ ":" COSMOS_STR(__LINE__))
-
-// Campaign-wide liveness registry behind sometimes() (state-exploration.md §4). Thread-safe:
-// worker threads register ids and mark hits concurrently; a single mutex is acceptable because
-// these calls are rare relative to simulation work.
-//
-// The id is REGISTERED on every call and marked hit only when cond is true. Registration on
-// every call is what makes never_hit work: if the assertion is never satisfied anywhere, the
-// campaign still knows the id exists and reports it. A version that records only on success
-// can never discover an unsatisfied id.
-class SometimesRegistry {
-  public:
-    void record(std::string_view id, bool hit) {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        Entry& entry = entries_[std::string(id)];
-        ++entry.registrations;
-        if (hit) {
-            ++entry.hits;
-        }
-    }
-
-    void reset() {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        entries_.clear();
-    }
-
-    // Ids registered but never satisfied anywhere, sorted for stable output.
-    std::vector<std::string> never_hit_ids() const {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<std::string> never_hit;
-        for (const auto& [id, entry] : entries_) {
-            if (entry.hits == 0) {
-                never_hit.push_back(id);
-            }
-        }
-        return never_hit;
-    }
-
-    // Every registered id, sorted for stable output.
-    std::vector<std::string> registered_ids() const {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<std::string> ids;
-        ids.reserve(entries_.size());
-        for (const auto& [id, entry] : entries_) {
-            ids.push_back(id);
-        }
-        return ids;
-    }
-
-    uint64_t registrations(std::string_view id) const {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        const auto found = entries_.find(std::string(id));
-        return found == entries_.end() ? 0 : found->second.registrations;
-    }
-
-    uint64_t hits(std::string_view id) const {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        const auto found = entries_.find(std::string(id));
-        return found == entries_.end() ? 0 : found->second.hits;
-    }
-
-  private:
-    struct Entry {
-        uint64_t registrations = 0;
-        uint64_t hits = 0;
-    };
-
-    mutable std::mutex mutex_;
-    std::map<std::string, Entry> entries_; // std::map: sorted iteration without a second sort
+// Where an assertion goes when no universe is bound to the calling thread. Counted and echoed
+// rather than asserted (or silently dropped): the lifecycle rule in scenario.hpp is that a release
+// build must not pass by ignoring one, while a build with no simulation running must not be killed
+// by one either. S1's campaign surfaces `count` in its report.
+struct OutOfScopeAssertions {
+    uint64_t count = 0;
+    std::string first_id;
+    std::string first_detail;
 };
 
-// Campaign-wide singleton. When Campaign::run() lands (campaign.hpp), Campaign::current()
-// delegates to this.
-inline SometimesRegistry& sometimes_registry() {
-    static SometimesRegistry registry;
-    return registry;
+inline OutOfScopeAssertions& out_of_scope_assertions() {
+    static OutOfScopeAssertions state;
+    return state;
 }
 
-// Liveness: evaluated campaign-wide. Must be satisfied (cond == true) in at least ONE universe.
-// See SometimesRegistry for why registration happens on every call.
-inline void sometimes(bool cond, std::string_view id) { sometimes_registry().record(id, cond); }
+// One lock covers record-and-echo, so a parallel campaign cannot interleave two reports.
+inline std::mutex& out_of_scope_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline void record_out_of_scope(const char* caller, const std::string& id,
+                                const std::string& detail) {
+    std::lock_guard<std::mutex> lock(out_of_scope_mutex());
+    OutOfScopeAssertions& state = out_of_scope_assertions();
+    if (state.count == 0) {
+        state.first_id = id;
+        state.first_detail = detail;
+        std::fprintf(stderr, "[cosmos] %s(\"%s\") outside a Scenario: %s\n", caller, id.c_str(),
+                     detail.c_str());
+    }
+    ++state.count;
+}
+
+} // namespace detail
+
+// An invariant of this universe: a violation is recorded at once, a pass is silent.
+// Valid inside Scenario::run(), Scenario::check() and the quiesce drain; use Scenario::check()
+// for anything that must be judged after the world has settled.
+inline void always(bool cond, std::string id, std::string detail = "") {
+    if (cond) return;
+    Scenario* scenario = Scenario::current();
+    if (scenario == nullptr) {
+        ::cosmos::detail::record_out_of_scope("always", id, detail);
+        return;
+    }
+    scenario->record_violation(std::move(id), std::move(detail));
+}
+
+// COSMOS_CHECK's arm: the call site is materialized only once the check has already failed, so a
+// passing check allocates nothing and cannot shift a universe's own accounting.
+inline void always(bool cond, std::string id, const char* file, int line) {
+    if (cond) return;
+    always(false, std::move(id), std::string(file) + ":" + std::to_string(line));
+}
+
+// A liveness property that must hold in at least one universe: the ids no universe reports are the
+// campaign's never_hit list. A universe that reported only hits registers no check, so it still
+// reads as vacuous() -- sometimes() is a campaign-level fact, not this universe's verdict.
+inline void sometimes(bool cond, std::string id) {
+    Scenario* scenario = Scenario::current();
+    if (scenario == nullptr) {
+        ::cosmos::detail::record_out_of_scope("sometimes", id, cond ? "hit" : "not hit");
+        return;
+    }
+    scenario->record_sometimes(std::move(id), cond);
+}
+
+// Marks a path as exercised, without naming a condition.
+inline void reachable(std::string id) { sometimes(true, std::move(id)); }
 
 } // namespace cosmos
+
+// The call site is the detail, so an unnamed check still says where it failed.
+#define COSMOS_CHECK(cond, id) ::cosmos::always((cond), (id), __FILE__, __LINE__)

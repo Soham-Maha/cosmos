@@ -39,17 +39,20 @@ static_assert(static_cast<uint64_t>(SiteId::getrandom) == 14);
 static_assert(static_cast<uint64_t>(SiteId::crash_node) == 1000);
 static_assert(static_cast<uint64_t>(SiteId::partition) == 1001);
 static_assert(static_cast<uint64_t>(SiteId::pause_node) == 1002);
+static_assert(static_cast<uint64_t>(SiteId::torn_write) == 1003);
 
 static_assert(cosmos::kWrapperSiteCount == 14);
-static_assert(cosmos::kEventSiteCount == 3);
+static_assert(cosmos::kEventSiteCount == 4);
 static_assert(cosmos::site_slot(SiteId::malloc) == 0);
 static_assert(cosmos::site_slot(SiteId::getrandom) == 13);
 static_assert(cosmos::site_slot(SiteId::crash_node) == 14);
 static_assert(cosmos::site_slot(SiteId::pause_node) == 16);
+static_assert(cosmos::site_slot(SiteId::torn_write) == 17);
 static_assert(cosmos::site_slot(static_cast<SiteId>(9999)) == cosmos::kNoSite);
 
 static_assert(!cosmos::is_event_site(SiteId::malloc));
 static_assert(cosmos::is_event_site(SiteId::crash_node));
+static_assert(cosmos::is_event_site(SiteId::torn_write));
 static_assert(cosmos::class_of(SiteId::malloc) == FaultClass::Memory);
 static_assert(cosmos::class_of(SiteId::write) == FaultClass::Storage);
 static_assert(cosmos::class_of(SiteId::send) == FaultClass::Network);
@@ -206,6 +209,36 @@ void test_event_sites_reject_rules_and_triggers() {
     assert_rejects(with_rate, ConfigError::RuleOnEventSite);
 
     std::cout << "[PASS] test_event_sites_reject_rules_and_triggers" << std::endl;
+}
+
+// torn_write is the one event site with a legal menu: the reboot decision needs a rule (§10.2).
+void test_torn_write_is_the_one_rule_bearing_event_site() {
+    FaultConfig cfg = valid_config();
+    cfg.enable_class(FaultClass::Storage);
+    must(cfg.activate_site(SiteId::torn_write));
+    FaultRule tear;
+    tear.rate = 1.0;
+    must(tear.outcomes.add(FaultKind::TornWrite, 1.0));
+    must(cfg.set_rule(SiteId::torn_write, tear));
+    assert(cfg.validate(kNodes).has_value());
+
+    // Still an event site: there is no 1-based eligible-call index to trigger on.
+    FaultRule triggered = tear;
+    triggered.fire_on_eligible_call = 3;
+    must(cfg.set_rule(SiteId::torn_write, triggered));
+    assert_rejects(cfg, ConfigError::TriggerOnEventSite);
+
+    // And the menu is its own: a wrapper outcome is not legal at this site.
+    FaultRule wrong = tear;
+    wrong.outcomes = {};
+    must(wrong.outcomes.add(FaultKind::WriteEio, 1.0));
+    FaultConfig illegal = valid_config();
+    illegal.enable_class(FaultClass::Storage);
+    must(illegal.activate_site(SiteId::torn_write));
+    must(illegal.set_rule(SiteId::torn_write, wrong));
+    assert_rejects(illegal, ConfigError::IllegalOutcome);
+
+    std::cout << "[PASS] test_torn_write_is_the_one_rule_bearing_event_site" << std::endl;
 }
 
 void test_rule_on_disabled_class_is_rejected() {
@@ -531,6 +564,8 @@ bool legal_per_man_page(SiteId site, FaultKind kind) {
     case SiteId::partition:
     case SiteId::pause_node:
         return false;
+    case SiteId::torn_write:
+        return kind == FaultKind::TornWrite;
     }
     return false;
 }
@@ -579,6 +614,7 @@ int main() {
     test_bad_outcome_tables_are_rejected();
     test_trigger_must_exceed_skip_first();
     test_event_sites_reject_rules_and_triggers();
+    test_torn_write_is_the_one_rule_bearing_event_site();
     test_rule_on_disabled_class_is_rejected();
     test_windows_and_quorum_are_checked();
     test_weight_normalization_is_scale_invariant();

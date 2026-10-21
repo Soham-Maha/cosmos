@@ -39,6 +39,11 @@ format-check:
 # Lint codebase (alias for format-check)
 lint: format-check
 
+# Same suite on the second toolchain: --wrap is linker interposition, so lld parity is a real
+# check. This flake's clang has no static libstdc++, so the static twins skip by design.
+test-clang:
+    nix develop .#clang -c just test
+
 # Remove this shell's build directory
 clean:
     rm -rf {{build_dir}}
