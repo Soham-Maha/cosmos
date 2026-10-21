@@ -614,21 +614,21 @@ void test_trigger_below_skip_first_is_rejected() {
     std::cout << "[PASS] test_trigger_below_skip_first_is_rejected" << std::endl;
 }
 
-void test_event_sites_decide_nothing() {
+void test_event_sites_without_a_rule_count_but_decide_nothing() {
     VirtualClock clock;
     FaultConfig cfg = probe_config();
     cfg.enable_class(FaultClass::Process);
     must(cfg.activate_site(SiteId::crash_node));
     Injector injector = make_injector(std::move(cfg), clock);
 
-    // Episodes have no wrapper call to count or decide for; they fire via scheduled_episodes.
+    // Event sites are invoked by the harness; with no rule they are counted and decide nothing.
     for (int i = 0; i < 16; ++i) {
-        assert(injector.decide(FaultClass::Process, SiteId::crash_node) == FaultKind::None);
+        assert(injector.decide_event(FaultClass::Process, SiteId::crash_node) == FaultKind::None);
     }
-    assert(injector.eligible_calls(SiteId::crash_node) == 0);
+    assert(injector.eligible_calls(SiteId::crash_node) == 16);
     assert(injector.injections(SiteId::crash_node) == 0);
 
-    std::cout << "[PASS] test_event_sites_decide_nothing" << std::endl;
+    std::cout << "[PASS] test_event_sites_without_a_rule_count_but_decide_nothing" << std::endl;
 }
 
 void test_same_seed_replays_identically() {
@@ -678,7 +678,7 @@ int main() {
     test_trigger_fire_exhausts_the_budget_for_later_calls();
     test_trigger_consumes_no_draw_mid_run();
     test_trigger_below_skip_first_is_rejected();
-    test_event_sites_decide_nothing();
+    test_event_sites_without_a_rule_count_but_decide_nothing();
     test_same_seed_replays_identically();
     std::cout << "All fault injector tests passed successfully!" << std::endl;
     return 0;

@@ -58,7 +58,7 @@ void* __wrap_malloc(size_t size) {
 Every simulation binary declares its own subset: `-Wl,--wrap` is per-symbol, so a binary only
 reaches the wrappers it lists. Listing a site's *fortified alias* next to the site is not optional
 — `-D_FORTIFY_SOURCE` rewrites the call before the linker sees it, and the alias is a different
-symbol (`__read_chk`, `__open_2`, `__recv_chk`, `__poll_chk`).
+symbol (`__read_chk`, `__write_chk`, `__open_2`, `__recv_chk`, `__poll_chk`).
 
 The authoritative full list is [`examples/single_node/CMakeLists.txt`](../../examples/single_node/CMakeLists.txt)
 (the distributed example wraps the memory, pthread and network families; the test suites wrap more,
@@ -100,7 +100,7 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=gettimeofday"
         "-Wl,--wrap=nanosleep"
         "-Wl,--wrap=clock_nanosleep"
-        # Storage (SiteId::open / read / write / fsync), with the fortified read alias
+        # Storage (SiteId::open / read / write / fsync), with the fortified aliases
         "-Wl,--wrap=open"
         "-Wl,--wrap=open64"
         "-Wl,--wrap=__open_2"
@@ -108,7 +108,18 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=read"
         "-Wl,--wrap=__read_chk"
         "-Wl,--wrap=write"
+        "-Wl,--wrap=__write_chk"
+        # Same write site in its other shapes: positional, gather, and the 64-bit aliases.
+        "-Wl,--wrap=pwrite"
+        "-Wl,--wrap=pwrite64"
+        "-Wl,--wrap=writev"
+        "-Wl,--wrap=pwritev"
         "-Wl,--wrap=fsync"
+        # fdatasync shares fsync's site; ftruncate is not a site, but its durability event must
+        # reach the model so a reboot cannot resurrect the tail an application removed.
+        "-Wl,--wrap=fdatasync"
+        "-Wl,--wrap=ftruncate"
+        "-Wl,--wrap=ftruncate64"
         # Random (SiteId::getrandom)
         "-Wl,--wrap=getrandom"
         "-Wl,--wrap=random"

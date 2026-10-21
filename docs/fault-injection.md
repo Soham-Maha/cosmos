@@ -418,10 +418,15 @@ value—it only produces results already valid for the wrapped API.
 |---|---|---|---|
 | `__wrap_malloc` | `Memory` / `site::malloc` | `OutOfMemory` | `nullptr`, `errno = ENOMEM` |
 | `__wrap_write` | `Storage` / `site::write` | `WriteEio` | `-1`, `errno = EIO` |
+| `__wrap_fsync` | `Storage` / `site::fsync` | `FsyncEio` | `-1`, `errno = EIO` |
 | `__wrap_send` | `Network` / `site::send` | `ConnectionReset` | `-1`, `errno = ECONNRESET` |
 | `__wrap_clock_gettime` | `Clock` / `site::clock_gettime` | `ClockStep` | A configured, valid clock result |
 
+**The storage adapters' durability model is implemented**, not planned: `write` remembers the bytes it overwrites, `fsync` is the durability boundary, and `reboot_node` discards un-synced bytes and may tear the last synced sector (`docs/design.md` §8).
+
 **Legality includes API invariants, not just return codes.** An injected result must be one the real API could actually produce under *some* real circumstance. `EIO` from `write` is legal. A short write is legal. A forward leap in `CLOCK_MONOTONIC` is legal (suspend/resume produces exactly that). But `CLOCK_MONOTONIC` jumping *backward* is **not** legal — no real kernel does that — so a `ClockStep` outcome on a monotonic clock may only step forward. Similarly a short `send` must report a non-negative byte count, and `open` may not fail with `ECONNRESET`. A fault that violates its API's invariants is not testing the application's error handling; it is testing its reaction to an impossible world, and any resulting finding is a false positive (Rule 15).
+
+The `torn_write` event decision is the one storage outcome judged at the syscall boundary rather than inside it: in that world `fsync` returned 0, and the device may still lose the sector before the media sees it. That is legal because a lying write cache is legal hardware — the call's contract was met, the device's was not. Read such a reboot as the modelled hardware lie, not as an ordinary crash (`docs/design.md` §8).
 
 ### 8.3 What this guarantees
 
@@ -583,14 +588,16 @@ scenario.check("recovers-from-single-crash", replicas_agree_after_recovery());
 
 ### 10.2 Event Sites & Virtual-Time Triggers (Tier 1b)
 
+**Shipped today (P5).** Imperative crash and reboot exist as `Simulator::crash_node` / `Simulator::reboot_node`: a state flip in `NodeRegistry` that returns `false` for an unknown node or one already in that state. There are no fault-model limits, no automatic heal and no episode registry yet, so they write no ledger entry; P6-S2 adds the registry, limits and heals described below. The one event-site decision already running is `SiteId::torn_write`, asked once at reboot through `decide_event`.
+
 Episode faults (crashes, partitions) are not reached by application calls, so neither the gate chain's occurrence counting nor its per-call draw applies to them. They are triggered two ways, both fully deterministic and both **zero-draw** (Rule 11):
 
-1. **Imperative, from the harness**: `injector.crash_node(n2, 2s)` — the scripted style already used for `sim.crash(...)` in `docs/design.md` §9.
+1. **Imperative, from the harness**: `injector.crash_node(n2, 2s)` — the episode form of the shipped `Simulator::crash_node` (`docs/design.md` §9); P6 adds the reboot duration, the limits and the scheduled heal.
 2. **Scheduled, from the config**: `FaultConfig::scheduled_episodes` is a list of `(at, spec, until_heal)` triples. The engine arms one virtual-time event per entry at universe start; when the event fires, the injector attempts the episode start.
 
 The attempt is still subject to the **fault-model limits** (§2) and the **quiesce window** (§9.3): if starting the episode would break the promise, it is refused and recorded as `Skipped` with the limit's reason — a scheduled crash is not exempt from the building code. Because no draw is involved, `drew = no`.
 
-Event sites carry `SiteId`s (`site::crash_node`, `site::partition`) so that swarm activation can disable an entire event site for a universe, and so ledger and trace entries use the same identity scheme as wrapper sites. There is no `rate` on an event site: it fires when invoked or scheduled, subject to limits, or it does not fire at all. Probabilistic *timing* of an episode ("crash at a random moment") is expressed by sampling the `at` field from the `Swarm` stream during config sampling — randomness enters at sampling time, not at fire time, so the runtime decision stays zero-draw.
+Event sites carry `SiteId`s (`site::crash_node`, `site::partition`, `site::torn_write`) so that swarm activation can disable an entire event site for a universe, and so ledger and trace entries use the same identity scheme as wrapper sites. There is no `rate` on an episode site: it fires when invoked or scheduled, subject to limits, or it does not fire at all. `torn_write` is the exception — a point decision at reboot rather than an episode, so it carries a rule and one draw through `decide_event` (`TornWrite` is its only legal outcome). Its outcome is loss *after* a returned `fsync`: the call could have returned 0 in that world, and the device's volatile cache may still drop the last sector — legal at the syscall boundary, impossible for a well-behaved device, and the reason a store checks its CRCs. Probabilistic *timing* of an episode ("crash at a random moment") is expressed by sampling the `at` field from the `Swarm` stream during config sampling — randomness enters at sampling time, not at fire time, so the runtime decision stays zero-draw.
 
 ---
 
@@ -746,8 +753,11 @@ enum class SiteId : uint64_t {
     connect, accept, send, recv,
     clock_gettime, nanosleep,
     getrandom,
-    // Event sites (episode faults, §10.2) — never passed to decide()
+    // Event sites (no wrapper call) — never passed to decide(); torn_write is
+    // decided through decide_event(), the episode sites fire only when invoked
+    // or scheduled (§10.2).
     crash_node = 1000, partition, pause_node,
+    torn_write,  // Storage; decided at reboot, legal outcome TornWrite
 };
 
 /// What the wrapper should make the call do. `None` = pass through unchanged.
@@ -761,6 +771,7 @@ enum class FaultKind : uint8_t {
     PacketDrop, PacketDelay, PacketReorder, PacketCorrupt,
     ClockStep, SleepInterrupted,
     RandomEagain,
+    TornWrite,
     _Count,          // sentinel; new kinds append before it
 };
 
@@ -825,7 +836,7 @@ struct KnobSpec {
 /// never shifts the slots after it (Rule 13). Slot order — not hash order — is what the swarm
 /// sampler iterates and draws against.
 constexpr size_t kWrapperSiteCount = 14;
-constexpr size_t kEventSiteCount   = 3;
+constexpr size_t kEventSiteCount   = 4;
 constexpr size_t kSiteCount        = kWrapperSiteCount + kEventSiteCount;
 constexpr size_t site_slot(SiteId);              // total; kNoSite for an unknown value
 
@@ -967,15 +978,20 @@ class FaultInjector {
     FaultInjector(FaultConfig cfg,
                   Rng fault_stream,
                   const VirtualClock& clock,   // read virtual now
-                  EventQueue& events,          // schedule automatic heals
+                  Scheduler& timers,           // schedule automatic heals (timer queue)
                   const NodeRegistry& nodes);  // query live/crashed state for limits
 
     // ---- Point faults: one gate chain, at most one draw (§10). ----
-    // Wrapper sites only — event sites fire via scheduled_episodes and the
+    // Wrapper sites only — event sites go through decide_event() and the
     // episode API below, never through decide(). Non-const: drawing mutates.
     // FaultKind::None means pass the original call through unchanged. Otherwise
     // the caller's wrapper translates the result to its API-specific failure.
     FaultKind decide(FaultClass cls, SiteId site);
+
+    // Event sites have no wrapper call, so the harness reaches them here: one
+    // draw through the same gate chain. Reboot asks it for SiteId::torn_write;
+    // episode sites are armed through the episode API instead.
+    FaultKind decide_event(FaultClass cls, SiteId site);
 
     // ---- Episode faults ----
     // Checks the fault-model limits against live node state, starts the episode,
@@ -1010,7 +1026,7 @@ class FaultInjector {
     std::array<Rng, static_cast<size_t>(FaultClass::_Count)> streams_;  // Rule 2
 
     const VirtualClock& clock_;      // borrowed, outlives the injector
-    EventQueue&         events_;
+    Scheduler&          timers_;     // owns push_timer/advance_to_next_timer
     const NodeRegistry& nodes_;
 
     ActiveEpisodeMap active_;        // what is currently broken
@@ -1115,12 +1131,14 @@ The declarations in §12 describe the **F6-complete** injector. Phases 1–5 shi
 
 | §12 reference | What the code has today | Closed by |
 |---|---|---|
-| `FaultInjector(cfg, Rng, VirtualClock&, EventQueue&, NodeRegistry&)` | `BasicFaultInjector<ClockLike>`, built by `create(cfg, fault_stream_seed, node_count, clock, trace_options)` | F6: event queue + node registry |
+| `FaultInjector(cfg, Rng, VirtualClock&, Scheduler&, NodeRegistry&)` | `BasicFaultInjector<ClockLike>`, built by `create(cfg, fault_stream_seed, node_count, clock, trace_options)` | F6: scheduler timers + node registry |
 | Constructor enforces `validate()` | `create()` returns `std::expected<BasicFaultInjector, ConfigProblem>`; the constructor is private, so there is no unchecked path | — the factory is the permanent shape |
 | `const VirtualClock&` | Templated on a `ClockLike` concept (anything answering `now()`). `include/cosmos/virtual_clock.hpp` is a placeholder pending the runtime clock | F6: replacing that header, with no change to the injector |
 | Categorical walk shown inline in `decide()` | Split into a pure `constexpr FaultKind select_outcome(double, const FaultRule&)`; `decide()` still takes exactly one `uniform()` per call | — permanent; see below |
 | Ledger | Records fires in fixed non-allocating storage (Rule 7), with the §11.1 printer. `LedgerEntry` carries `DecisionStatus`: a replay run's withheld fires are rows with `Suppressed`. Nothing yet produces `Skipped` | F6: episodes and heals produce `Skipped` |
 | Episodes, `begin_quiesce()`, mode transitions | Absent | F6 (episodes, limits, mode) |
+
+**`Scheduler` is the event queue.** There is no separate `EventQueue` type: `Scheduler` owns the timer queue (`push_timer`, `advance_to_next_timer`, `run_until_quiescence`), so an episode heal is a timer entry exactly like a sleeping task's wake-up.
 
 **Why `select_outcome` is a separate function.** `uniform()` returns multiples of 2⁻⁵³, so a draw landing exactly on a rate or on a cumulative-weight boundary is a 1-in-2⁵³ event that no seed will produce. Those boundaries are precisely where an off-by-one hides, and they cannot be reached by sampling. Extracting the value-to-outcome half as a pure function lets the boundaries be pinned with `static_assert` at exact values, which makes a regression a compile error rather than a test that may never fire. The behaviour is unchanged and the one-draw-per-call rule of §6.5 is untouched — `decide()` still owns the draw and the injection counter.
 
@@ -1187,7 +1205,7 @@ The order below is deliberately MVP-first: prove that one real fault, injected d
 | **F3** | Generic wrapper-surface expansion, one call at a time: `calloc`/`realloc`; `open`/`read`/`write`/`fsync` (`EIO`, short write, `ENOSPC`); `send`/`recv`/`connect` (`ECONNRESET`, 0-byte close, delayed delivery); clock reads — each reusing F1's decision engine unchanged | Every newly wrapped call maps a named `FaultKind` to a documented legal API result and is independently tested |
 | **F4** | Campaign runner (many seeds, `never_hit` tracking); swarm sampler (`FaultConfig::sample`) with fixed class-indexed draws + per-site activation; mutually-exclusive categorical draw for multi-outcome sites (§6.5) | Stream-isolation and swarm-coverage tests pass; a multi-outcome site never produces more than one outcome per call |
 | **F5** ✅ | Decision trace recording (S1); replay with suppression (S2, no novel faults after divergence — Rule 12); 1-minimal minimization (S3); canonical trace encoding + FNV-1a trace hash (S4) | Suppressing one fault leaves every other honoured trace entry bit-identical; two replays of one trace are bit-identical; `--verify` stable across compilers |
-| **F6** | Distributed faults: virtual clock, event queue, node registry, episode lifecycle (every episode schedules its own heal — Rule 5), persistent faults, scheduled episode triggers (§10.2), fault-model limits with recorded refusals, `Liveness` mode transition | Every episode heals or is explicitly persistent; liveness assertions expressible on the distributed example |
+| **F6** | Distributed faults: virtual clock, scheduler timer queue, node registry, episode lifecycle (every episode schedules its own heal — Rule 5), persistent faults, scheduled episode triggers (§10.2), fault-model limits with recorded refusals, `Liveness` mode transition | Every episode heals or is explicitly persistent; liveness assertions expressible on the distributed example |
 
 **Not planned:** automatically inserting faults into application logic without the application author writing anything (§8.3) — this isn't a later sprint, it's a capability this design deliberately doesn't claim.
 

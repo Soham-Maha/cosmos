@@ -211,13 +211,13 @@ void test_gate_blocked_calls_are_not_recorded() {
         assert(injector.trace().size() == 0);
         assert(injector.eligible_calls(SiteId::open) == 0);
     }
-    // A disabled class, and an event site, which has no wrapper call to decide at all.
+    // A disabled class, and an event site gated by it: neither reaches a decision record.
     {
         VirtualClock clock;
         Injector injector = make_injector(
             one_site(SiteId::open, rule_with(1.0, FaultKind::OpenEio)), clock, recording());
         assert(injector.decide(FaultClass::Memory, SiteId::malloc) == FaultKind::None);
-        assert(injector.decide(FaultClass::Process, SiteId::crash_node) == FaultKind::None);
+        assert(injector.decide_event(FaultClass::Process, SiteId::crash_node) == FaultKind::None);
         assert(injector.trace().size() == 0);
     }
     // The class is on but this site was never armed: gated, and not even eligible.

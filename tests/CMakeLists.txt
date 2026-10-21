@@ -179,7 +179,16 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=read"
         "-Wl,--wrap=__read_chk"
         "-Wl,--wrap=write"
+        "-Wl,--wrap=__write_chk"
+        "-Wl,--wrap=pwrite"
+        "-Wl,--wrap=pwrite64"
+        "-Wl,--wrap=writev"
+        "-Wl,--wrap=pwritev"
         "-Wl,--wrap=fsync"
+        "-Wl,--wrap=fdatasync"
+        "-Wl,--wrap=ftruncate"
+        "-Wl,--wrap=ftruncate64"
+        "-Wl,--wrap=close"
     )
 endif()
 
@@ -624,3 +633,69 @@ if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 else()
     message(STATUS "test_trace_static skipped: no static libstdc++ for this toolchain")
 endif()
+
+# Durability model: page-cache buffering, fsync commit, crash discard and torn sectors.
+add_executable(test_storage_model test_storage_model.cpp)
+target_link_libraries(test_storage_model PRIVATE cosmos)
+add_test(NAME test_storage_model COMMAND test_storage_model)
+
+# Node live/crashed state: refusals rather than UB, and counts that cannot drift.
+add_executable(test_node_registry test_node_registry.cpp)
+target_link_libraries(test_node_registry PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # A Simulator pulls in the scheduler, whose __real_malloc/free need the wrap aliases.
+    target_compile_options(test_node_registry PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+    )
+    target_link_options(test_node_registry PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+    )
+endif()
+
+add_test(NAME test_node_registry COMMAND test_node_registry)
+
+# The roadmap's Phase-4 exit criterion: a WAL store loses an acked write it never fsynced.
+add_executable(test_kv_store
+    test_kv_store.cpp
+    ${CMAKE_SOURCE_DIR}/examples/single_node/kv_store.c
+)
+target_link_libraries(test_kv_store PRIVATE cosmos)
+target_compile_definitions(test_kv_store PRIVATE COSMOS_KV_NO_MAIN)
+target_include_directories(test_kv_store PRIVATE ${CMAKE_SOURCE_DIR}/examples/single_node)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_kv_store PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_kv_store PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+        "-Wl,--wrap=open"
+        "-Wl,--wrap=open64"
+        "-Wl,--wrap=read"
+        "-Wl,--wrap=write"
+        "-Wl,--wrap=__write_chk"
+        "-Wl,--wrap=pwrite"
+        "-Wl,--wrap=pwrite64"
+        "-Wl,--wrap=writev"
+        "-Wl,--wrap=pwritev"
+        "-Wl,--wrap=fsync"
+        "-Wl,--wrap=fdatasync"
+        "-Wl,--wrap=ftruncate"
+        "-Wl,--wrap=ftruncate64"
+        "-Wl,--wrap=close"
+    )
+endif()
+
+add_test(NAME test_kv_store COMMAND test_kv_store)

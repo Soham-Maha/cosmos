@@ -172,7 +172,7 @@ RNG stream domains: `Schedule=1`, `Fault=2`, `Workload=3`, `User=4`. Splitmix64 
 
 ## 8. Storage Subsystem Reference
 
-**Today (point faults only).** `__wrap_open/read/write/fsync` ask the fault injector for one
+**Point faults.** `__wrap_open/read/write/fsync` ask the fault injector for one
 decision per eligible call and translate it to a legal result — `EIO`/`ENOSPC` failures, or a
 `ShortWrite` that performs a *real* partial transfer of `count / 2` bytes (write() reporting k
 bytes must mean k bytes were transferred; claiming a short count without transferring would be
@@ -183,13 +183,34 @@ empty transfer — so `fire_on_eligible_call` on `SiteId::write` counts only wri
 `count >= 1` to fds `>= 3`. 1-byte writes stay eligible: they can legally fail with
 `EIO`/`ENOSPC` (a single-byte WAL commit marker is a real shape); the one degenerate case is a
 fired `ShortWrite` on a 1-byte write, which has no legal short observable and observably
-degrades to a complete write. The page-cache/durability model below is layered on later.
+degrades to a complete write.
 
-Simulates page-cache buffering, `fsync` durability, and torn writes upon crash-reboot:
+**Durability model.** `StorageModel` simulates page-cache buffering, `fsync` durability, and
+torn writes without moving bytes out of the host file:
 
-- `write()` buffers dirty bytes in simulated un-synced page cache.
-- `fsync()` commits buffered pages to durable storage.
-- On `sim.crash(node)` followed by `sim.reboot(node)`: un-synced pages are discarded, and the last synced region may experience torn writes drawn from the `Storage` class.
+- `write()` buffers its bytes as un-synced and remembers the pre-image it overwrote; `fsync()`
+  is the durability boundary that drops those records and remembers the committed range.
+- `StorageModel` covers the surface `write`, `__write_chk`, `pwrite`, `writev`, `pwritev`,
+  `fsync` and `fdatasync`, plus application `ftruncate` as a durability event
+  (`record_truncate`).
+- `Simulator::crash_node` only marks the node down. `Simulator::reboot_node` discards the
+  node's un-synced bytes and rolls each file back to its durable size, in reverse write order.
+- A torn reboot zeroes the last `min(512, last-written)` bytes of the last synced range.
+  Whether it tears is one `decide_event(FaultClass::Storage, SiteId::torn_write)` decision,
+  with `FaultKind::TornWrite` the only legal outcome.
+- Bytes stay in the host file throughout, so `lseek` and `ftruncate` keep native semantics;
+  the model only remembers what to put back.
+- `StorageModel::set_active_node` attributes each open to a node, so a reboot rolls back only
+  that node's files.
+- Memory is bounded by `StorageModel::kMaxTrackedBytes` of pre-image bytes; a file that outgrows
+  it stops being discard-tracked and `StorageModel::degraded()` reports the gap.
+
+A `TornWrite` goes beyond the fsync contract. It models a device that acknowledged `fsync`
+before the sector reached the media — a lying write cache, or a power loss that drops volatile
+cache the syscall already reported committed. That is legal at the syscall boundary (the call
+returned 0) and impossible for a well-behaved device, and it is the reason a store's CRC check
+exists. It is the one outcome that outlives what `fsync` promised, so a campaign that observes
+it must read it as the modelled hardware lie, not as an ordinary crash.
 
 ---
 
@@ -225,9 +246,11 @@ and puts the environment back.
 
 Four composable fault mechanisms:
 1. **Declarative Config**: rates applied automatically via the `fault` RNG stream.
-2. **Imperative Scripting**: `sim.net().partition(...)`, `sim.crash(node)`, `sim.reboot(node)`.
-3. **Scheduled Faults**: `sim.at(10s, [&]{ sim.net().partition(a, b); })`.
-4. **Custom Verdict Hooks**: Programmatic control via `sim.net().on_send`.
+2. **Imperative Scripting**: `Simulator::crash_node(node)` and `Simulator::reboot_node(node)`,
+   delivered: each returns `false` for an unknown node or one already in that state, and the
+   reboot's tear is the `SiteId::torn_write` decision.
+3. **Scheduled Faults**: `sim.at(10s, ...)` — P6.
+4. **Custom Verdict Hooks**: `sim.net().on_send` — P6.
 
 ---
 

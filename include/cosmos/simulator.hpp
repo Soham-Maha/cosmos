@@ -4,7 +4,9 @@
 #include "cosmos/faults.hpp"
 #include "cosmos/memory.hpp"
 #include "cosmos/net.hpp"
+#include "cosmos/node_registry.hpp"
 #include "cosmos/random.hpp"
+#include "cosmos/storage.hpp"
 #include "cosmos/task.hpp"
 #include "cosmos/time.hpp"
 #include <expected>
@@ -61,6 +63,31 @@ template <typename Injector> class BasicSimulator {
     VirtualClock& clock() { return clock_; }
     const VirtualClock& clock() const { return clock_; }
 
+    NodeRegistry& nodes() { return nodes_; }
+    const NodeRegistry& nodes() const { return nodes_; }
+
+    StorageModel& storage() { return storage_; }
+    const StorageModel& storage() const { return storage_; }
+
+    // State only: the storage effect lands at reboot, which is when the application observes it.
+    bool crash_node(NodeId node) { return nodes_.crash(node); }
+
+    // Discards un-synced storage, then asks the injector whether the last synced sector tears.
+    bool reboot_node(NodeId node) {
+        if (!nodes_.reboot(node)) return false;
+        bool torn = false;
+        if (injector_.has_value()) {
+            if constexpr (requires {
+                              injector_->decide_event(FaultClass::Storage, SiteId::torn_write);
+                          }) {
+                torn = injector_->decide_event(FaultClass::Storage, SiteId::torn_write) ==
+                       FaultKind::TornWrite;
+            }
+        }
+        storage_.reboot(node, torn);
+        return true;
+    }
+
     Time now() const { return clock_.now(); }
     void advance_time(Duration d) { clock_.advance(d); }
 
@@ -88,6 +115,8 @@ template <typename Injector> class BasicSimulator {
         injector_.emplace(std::move(*made));
         // The trace names its own universe, so Scenario::replay needs no seed argument.
         injector_->set_universe_seed(seed_);
+        // Nothing is crashed before the first install, so the growth path is the only one taken.
+        (void)nodes_.set_node_count(node_count);
         return {};
     }
 
@@ -135,6 +164,10 @@ template <typename Injector> class BasicSimulator {
     Scheduler scheduler_;
     // After scheduler_ and clock_, both of which it borrows.
     Net net_;
+    // Node state and the durability model are independent of the injector: declared before it so
+    // they outlive it, since a reboot decision reads the injector while storage rollback runs.
+    NodeRegistry nodes_{};
+    StorageModel storage_{};
     // Declared after clock_ on purpose: the injector borrows it, and destruction is reverse order.
     std::optional<Injector> injector_{};
     TraceOptions default_trace_options_{};

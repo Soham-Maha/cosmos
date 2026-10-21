@@ -45,10 +45,11 @@ enum class SiteId : uint64_t {
     crash_node = 1000,
     partition = 1001,
     pause_node = 1002,
+    torn_write = 1003,
 };
 
 constexpr size_t kWrapperSiteCount = 14;
-constexpr size_t kEventSiteCount = 3;
+constexpr size_t kEventSiteCount = 4;
 constexpr size_t kSiteCount = kWrapperSiteCount + kEventSiteCount;
 constexpr size_t kNoSite = static_cast<size_t>(-1);
 
@@ -92,16 +93,18 @@ constexpr size_t site_slot(SiteId site) {
         return 15;
     case SiteId::pause_node:
         return 16;
+    case SiteId::torn_write:
+        return 17;
     }
     return kNoSite;
 }
 
 constexpr std::array<SiteId, kSiteCount> kAllSites{
-    SiteId::malloc,     SiteId::calloc,    SiteId::realloc,    SiteId::open,
-    SiteId::read,       SiteId::write,     SiteId::fsync,      SiteId::connect,
-    SiteId::accept,     SiteId::send,      SiteId::recv,       SiteId::clock_gettime,
-    SiteId::nanosleep,  SiteId::getrandom, SiteId::crash_node, SiteId::partition,
-    SiteId::pause_node,
+    SiteId::malloc,     SiteId::calloc,     SiteId::realloc,    SiteId::open,
+    SiteId::read,       SiteId::write,      SiteId::fsync,      SiteId::connect,
+    SiteId::accept,     SiteId::send,       SiteId::recv,       SiteId::clock_gettime,
+    SiteId::nanosleep,  SiteId::getrandom,  SiteId::crash_node, SiteId::partition,
+    SiteId::pause_node, SiteId::torn_write,
 };
 
 constexpr SiteId site_at_slot(size_t slot) { return kAllSites[slot]; }
@@ -117,7 +120,8 @@ static_assert(slots_are_consistent(), "kAllSites and site_slot() disagree");
 
 constexpr bool is_known_site(SiteId site) { return site_slot(site) != kNoSite; }
 
-// Event sites have no call to wrap, so no rate and no trigger; they fire from episodes (§10.2).
+// Event sites are not wrapper calls: the harness invokes them, and only a site with a legal menu
+// (torn_write) may carry a rate. No event site can carry a trigger (§10.2).
 constexpr bool is_event_site(SiteId site) {
     const size_t slot = site_slot(site);
     return slot != kNoSite && slot >= kWrapperSiteCount;
@@ -133,6 +137,7 @@ constexpr FaultClass class_of(SiteId site) {
     case SiteId::read:
     case SiteId::write:
     case SiteId::fsync:
+    case SiteId::torn_write:
         return FaultClass::Storage;
     case SiteId::connect:
     case SiteId::accept:
@@ -187,6 +192,7 @@ enum class FaultKind : uint8_t {
     ClockStep,
     SleepInterrupted,
     RandomEagain,
+    TornWrite,
     _Count,
 };
 
@@ -226,6 +232,17 @@ constexpr bool is_legal_outcome(SiteId site, FaultKind kind) {
     case SiteId::partition:
     case SiteId::pause_node:
         return false;
+    case SiteId::torn_write:
+        return kind == FaultKind::TornWrite;
+    }
+    return false;
+}
+
+// A site with no legal outcome can never carry a rule (§12); validate() uses this to keep the
+// episode sites inert while letting torn_write take one.
+constexpr bool has_legal_outcome(SiteId site) {
+    for (uint8_t raw = 1; raw < static_cast<uint8_t>(FaultKind::_Count); ++raw) {
+        if (is_legal_outcome(site, static_cast<FaultKind>(raw))) return true;
     }
     return false;
 }
@@ -287,6 +304,8 @@ constexpr const char* name_of(SiteId site) {
         return "partition";
     case SiteId::pause_node:
         return "pause_node";
+    case SiteId::torn_write:
+        return "torn_write";
     }
     return "?";
 }
@@ -331,6 +350,8 @@ constexpr const char* name_of(FaultKind kind) {
         return "SleepInterrupted";
     case FaultKind::RandomEagain:
         return "RandomEagain";
+    case FaultKind::TornWrite:
+        return "TornWrite";
     case FaultKind::_Count:
         break;
     }
@@ -648,10 +669,15 @@ inline std::expected<void, ConfigProblem> FaultConfig::validate(uint32_t node_co
         const SiteId site = site_at_slot(slot);
 
         if (slot >= kWrapperSiteCount) {
-            const ConfigError error = rule.fire_on_eligible_call.has_value()
-                                          ? ConfigError::TriggerOnEventSite
-                                          : ConfigError::RuleOnEventSite;
-            return std::unexpected(ConfigProblem{error, site});
+            // An event site has no wrapper call, so a 1-based eligible-call trigger is meaningless.
+            if (rule.fire_on_eligible_call.has_value()) {
+                return std::unexpected(ConfigProblem{ConfigError::TriggerOnEventSite, site});
+            }
+            // Only an event site with a legal menu can carry a rule; torn_write does, the
+            // episode sites do not (§12).
+            if (!has_legal_outcome(site)) {
+                return std::unexpected(ConfigProblem{ConfigError::RuleOnEventSite, site});
+            }
         }
 
         if (!is_class_enabled(class_of(site))) {
@@ -855,7 +881,7 @@ inline FaultConfig FaultConfig::sample_from(uint64_t swarm_base,
             const bool activated = class_rng.coin(swarm::kSiteProbability);
             if (!on || !activated) continue;
             (void)cfg.activate_site(site);
-            // Event sites have no legal outcome, so they get activation and never a rule.
+            // Episodes arm event sites (P6-S3); the swarm sampler leaves them activation-only.
             if (slot >= kWrapperSiteCount) continue;
             (void)cfg.set_rule(site, swarm::sample_rule(class_rng, site));
         }

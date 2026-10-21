@@ -61,48 +61,16 @@ template <ClockLike Clock> class BasicFaultInjector {
 
     // Gate order is the contract: each early return is what keeps a dead fault from shifting an
     // unrelated class's stream (§10, Rule 3). cls is a cross-check only; the site names the class.
-    FaultKind decide([[maybe_unused]] FaultClass cls, SiteId site) {
-        assert(class_of(site) == cls);
+    // Wrapper sites only: the wrapper has already deemed the call eligible (Rule 3).
+    FaultKind decide(FaultClass cls, SiteId site) {
+        assert(!is_event_site(site));
+        return decide_at(cls, site);
+    }
 
-        // Event sites have no wrapper call, and this keeps every index below in range.
-        const size_t slot = site_slot(site);
-        if (slot >= kWrapperSiteCount) return FaultKind::None;
-
-        if (quiet_depth_ > 0) return FaultKind::None;
-        if (clock_.now() >= cfg_.quiesce_after) return FaultKind::None;
-
-        // From the site, never the argument: gating on one class and drawing from another's
-        // stream would survive NDEBUG.
-        const FaultClass site_class = class_of(site);
-        if (!cfg_.is_class_enabled(site_class)) return FaultKind::None;
-        if (!cfg_.is_site_activated(site)) return FaultKind::None;
-        if (clock_.now() < cfg_.warmup_until) return FaultKind::None;
-
-        // skip_first and the trigger count from here, so this precedes the gates below (§10).
-        ++eligible_calls_[slot];
-
-        // The swarm can activate a site without giving it a rule.
-        const FaultRule* rule = cfg_.rule_for(site);
-        if (rule == nullptr) return FaultKind::None;
-
-        if (eligible_calls_[slot] <= rule->skip_first) return FaultKind::None;
-        if (injections_[slot] >= rule->max_injections) return FaultKind::None;
-
-        if (replaying()) return replay_decide(site_class, site, slot, *rule);
-
-        // Entry 0 is the walk's zero point: every weight is positive, so a draw approaching 0
-        // always lands there. Reading it directly is what keeps the fire zero-draw (Rule 11) —
-        // passing 0.0 to select_outcome() would return None for the legal rate-0 trigger-only rule.
-        if (rule->fire_on_eligible_call == eligible_calls_[slot]) {
-            const FaultKind kind = rule->outcomes.entries[0].kind;
-            record_decision(site, slot, *rule, kind, false);
-            return record_fire(site_class, site, slot, kind, false);
-        }
-
-        const FaultKind kind = draw(site_class, *rule);
-        record_decision(site, slot, *rule, kind, consumes_draw(*rule));
-        if (kind == FaultKind::None) return FaultKind::None;
-        return record_fire(site_class, site, slot, kind, true);
+    // Event sites have no wrapper call; the harness invokes them (crashes, torn writes, episodes).
+    FaultKind decide_event(FaultClass cls, SiteId site) {
+        assert(is_event_site(site));
+        return decide_at(cls, site);
     }
 
     // A counter, not a flag: an inner critical section ending must not re-enable the outer one.
@@ -164,6 +132,50 @@ template <ClockLike Clock> class BasicFaultInjector {
     template <size_t... I>
     static std::array<Rng, sizeof...(I)> make_streams(uint64_t seed, std::index_sequence<I...>) {
         return {Rng(fault_class_seed(seed, static_cast<FaultClass>(I)))...};
+    }
+
+    // Shared gate chain: wrapper calls and harness-driven event sites differ only in who calls it.
+    FaultKind decide_at(FaultClass cls, SiteId site) {
+        assert(class_of(site) == cls);
+
+        const size_t slot = site_slot(site);
+        if (slot == kNoSite) return FaultKind::None;
+
+        if (quiet_depth_ > 0) return FaultKind::None;
+        if (clock_.now() >= cfg_.quiesce_after) return FaultKind::None;
+
+        // From the site, never the argument: gating on one class and drawing from another's
+        // stream would survive NDEBUG.
+        const FaultClass site_class = class_of(site);
+        if (!cfg_.is_class_enabled(site_class)) return FaultKind::None;
+        if (!cfg_.is_site_activated(site)) return FaultKind::None;
+        if (clock_.now() < cfg_.warmup_until) return FaultKind::None;
+
+        // skip_first and the trigger count from here, so this precedes the gates below (§10).
+        ++eligible_calls_[slot];
+
+        // The swarm can activate a site without giving it a rule.
+        const FaultRule* rule = cfg_.rule_for(site);
+        if (rule == nullptr) return FaultKind::None;
+
+        if (eligible_calls_[slot] <= rule->skip_first) return FaultKind::None;
+        if (injections_[slot] >= rule->max_injections) return FaultKind::None;
+
+        if (replaying()) return replay_decide(site_class, site, slot, *rule);
+
+        // Entry 0 is the walk's zero point: every weight is positive, so a draw approaching 0
+        // always lands there. Reading it directly is what keeps the fire zero-draw (Rule 11) —
+        // passing 0.0 to select_outcome() would return None for the legal rate-0 trigger-only rule.
+        if (rule->fire_on_eligible_call == eligible_calls_[slot]) {
+            const FaultKind kind = rule->outcomes.entries[0].kind;
+            record_decision(site, slot, *rule, kind, false);
+            return record_fire(site_class, site, slot, kind, false);
+        }
+
+        const FaultKind kind = draw(site_class, *rule);
+        record_decision(site, slot, *rule, kind, consumes_draw(*rule));
+        if (kind == FaultKind::None) return FaultKind::None;
+        return record_fire(site_class, site, slot, kind, true);
     }
 
     // Rate 0 cannot fire so it never draws (Rule 3); rate 1 still draws, to pick the outcome.
