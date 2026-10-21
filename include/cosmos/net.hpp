@@ -76,6 +76,14 @@ class Net {
     int peer_name(int fd, struct sockaddr* addr, socklen_t* addrlen) const;
     int local_name(int fd, struct sockaddr* addr, socklen_t* addrlen) const;
 
+    // Topology (docs design §6): traffic between the two node groups is dropped until healed.
+    void partition(const NodeSet& a, const NodeSet& b);
+    void heal_partition(const NodeSet& a, const NodeSet& b);
+    void heal_all_partitions();
+    size_t partition_count() const { return splits_.size(); }
+    // Closes every endpoint owned by the node; peers observe the close.
+    void crash_node(NodeId node);
+
   private:
     struct Packet {
         Time deliver_at{};
@@ -90,6 +98,8 @@ class Net {
         bool awaiting_accept = false;
         bool nonblocking = false;
         bool peer_closed = false;
+        // Node that created the endpoint; partitions and crashes compare it.
+        NodeId node = 0;
         uint16_t port = 0;
         // Peer's address as of connect/pair, so getpeername still works after the peer
         // closes and its slot is recycled for an unrelated connection.
@@ -118,10 +128,17 @@ class Net {
     bool room_for(const Endpoint& ep, size_t count) const;
     void signal_change();
     void enqueue(Endpoint& peer, InjectedFault fault, const void* buf, size_t len, Time now);
+    bool separated(NodeId first, NodeId second) const;
+
+    struct Split {
+        NodeSet a;
+        NodeSet b;
+    };
 
     Scheduler& scheduler_;
     VirtualClock& clock_;
     std::array<Endpoint, kMaxEndpoints> endpoints_{};
+    std::vector<Split> splits_;
     uint16_t next_port_ = 40000;
     pthread_mutex_t mu_ = PTHREAD_MUTEX_INITIALIZER;
     pthread_cond_t cond_ = PTHREAD_COND_INITIALIZER;

@@ -129,25 +129,23 @@ In testing builds, virtual time advances deterministically:
 In testing builds, network calls route through an in-process simulated topology:
 
 ```cpp
-struct Address {
-    uint32_t node_id;
-    uint16_t port;
-};
-
 class Net {
 public:
-    void partition(std::vector<uint32_t> group_a, std::vector<uint32_t> group_b);
-    void heal_all();
-
-    using Verdict = std::variant<Drop, DeliverAfter>;
-    std::function<Verdict(const PacketView&)> on_send;
+    // Endpoints remember the node that created them; splits are between node groups.
+    void partition(const NodeSet& a, const NodeSet& b);
+    void heal_partition(const NodeSet& a, const NodeSet& b);
+    void heal_all_partitions();
+    void crash_node(NodeId node);
 };
 ```
 
 ### Delivery Semantics:
-1. `send()` consults partition maps → `on_send` hook → `Network`-class latency/loss draws.
-2. Surviving packets become delivery events scheduled at `virtual_now + sampled_latency`.
-3. Node crash closes endpoints and cancels pending `recv()` calls.
+1. `send()` consults the partition map, then applies the call-level `Network` outcomes
+   (`PacketDrop`, `PacketDelay`, `PacketReorder`, `PacketCorrupt`, `ShortSend`).
+2. A cross-partition packet is dropped: `send` reports success, as a kernel buffer would, and the
+   peer never sees it. A cross-partition `connect` is refused.
+3. Node crash closes the node's endpoints and wakes blocked `recv`/`poll` with the close.
+4. `heal` clears the split and wakes blocked calls; no packet is replayed.
 
 ---
 
@@ -193,8 +191,15 @@ torn writes without moving bytes out of the host file:
 - `StorageModel` covers the surface `write`, `__write_chk`, `pwrite`, `writev`, `pwritev`,
   `fsync` and `fdatasync`, plus application `ftruncate` as a durability event
   (`record_truncate`).
-- `Simulator::crash_node` only marks the node down. `Simulator::reboot_node` discards the
-  node's un-synced bytes and rolls each file back to its durable size, in reverse write order.
+- `Simulator::crash_node` marks the node down and closes its endpoints (peers observe the close).
+  It cannot preempt its fibers: they keep running until their next blocked or wrapped call fails on
+  a closed endpoint, and storage writes are not refused. Treat a crashed node as not running in the
+  harness; that is the same cooperative limitation as `PauseNode`.
+- A file belongs to its last writer: `record_write` re-attributes it to the calling fiber's node, so
+  `Simulator::reboot_node` discards exactly the un-synced bytes that node wrote. Sharing one fd
+  between nodes is unsupported beyond that rule.
+- `Simulator::reboot_node` discards the node's un-synced bytes and rolls each file back to its
+  durable size, in reverse write order.
 - A torn reboot zeroes the last `min(512, last-written)` bytes of the last synced range.
   Whether it tears is one `decide_event(FaultClass::Storage, SiteId::torn_write)` decision,
   with `FaultKind::TornWrite` the only legal outcome.
@@ -246,11 +251,13 @@ and puts the environment back.
 
 Four composable fault mechanisms:
 1. **Declarative Config**: rates applied automatically via the `fault` RNG stream.
-2. **Imperative Scripting**: `Simulator::crash_node(node)` and `Simulator::reboot_node(node)`,
-   delivered: each returns `false` for an unknown node or one already in that state, and the
-   reboot's tear is the `SiteId::torn_write` decision.
-3. **Scheduled Faults**: `sim.at(10s, ...)` — P6.
-4. **Custom Verdict Hooks**: `sim.net().on_send` — P6.
+2. **Imperative Scripting**: `Simulator::crash_node/reboot_node` are the raw state flips; the
+   injector's `crash_node(node, duration)` and `start_partition(a, b, duration)` are the
+   limit-checked episodes, with `heal(id)` / `heal_all()`. Every episode schedules its own heal.
+3. **Scheduled Faults**: `Simulator::at(when, fn, context)` arms a virtual-time callback, and
+   `FaultConfig::scheduled_episodes` is armed at install (crashes, pauses, partitions).
+4. **Custom Verdict Hooks**: `sim.net().on_send` — not delivered; partitions and call-level
+   outcomes cover the shipped surface.
 
 ---
 

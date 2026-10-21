@@ -135,7 +135,7 @@ A small number of faults have **no natural end**: a clock stepped permanently fo
 
 These are **not** episode faults, and the doc keeps them separate precisely so the "every episode schedules its own heal" rule stays absolute. A persistent fault:
 
-- is recorded in the ledger with `duration = ∞` and no scheduled heal event,
+- is recorded in the ledger with a `persistent` marker and no scheduled heal event,
 - is **only** created by an explicit persistent-fault request or the `Liveness` mode transition — never by an episode "forgetting" to heal,
 - is still cleared unconditionally by the quiesce phase (§9.3).
 
@@ -469,7 +469,7 @@ This is the Linux kernel fault-injection framework's `space` parameter (skip the
 
 ### 9.3 Quiesce window — let the dust settle before the photo
 
-At the end of a run: **stop all faults, heal every partition, restart downed nodes, drain the event queue, and only then check the final invariants.**
+At the end of a run: **stop all faults, heal every partition, restart downed nodes, drain the event queue, and only then check the final invariants.** `Scenario::quiesce` calls `begin_quiesce()` first (faults off, every episode healed, persistent included), drains, and records a lifecycle failure if any episode is still active or the terminal flag was never set.
 
 **Why this is essential:** many of the most valuable checks are impossible without it. Take *"all three replicas agree on the data."* That cannot be checked while the network is split — of course they disagree; they cannot talk. Disagreement there is *correct*. The only meaningful version of the check is *"after the network heals and things settle, do all three agree?"*
 
@@ -588,12 +588,24 @@ scenario.check("recovers-from-single-crash", replicas_agree_after_recovery());
 
 ### 10.2 Event Sites & Virtual-Time Triggers (Tier 1b)
 
-**Shipped today (P5).** Imperative crash and reboot exist as `Simulator::crash_node` / `Simulator::reboot_node`: a state flip in `NodeRegistry` that returns `false` for an unknown node or one already in that state. There are no fault-model limits, no automatic heal and no episode registry yet, so they write no ledger entry; P6-S2 adds the registry, limits and heals described below. The one event-site decision already running is `SiteId::torn_write`, asked once at reboot through `decide_event`.
+**Shipped today (P6-S2).** The injector owns the episode registry: `EpisodeId start_partition(a, b, until_heal)`, `crash_node(node, until_reboot)`, `heal(id)`, `heal_all()` and `begin_quiesce()`. Each start checks the fault-model limits, records a `Fired` ledger row, arms its own heal on the scheduler's deadline table, and records the start in the decision trace. A refused start writes a `Skipped` row carrying the reason (`max_crashed_nodes`, `min_healthy_quorum`, `quiesce`, `site_disabled`, `already_crashed`, `unknown_node`, ...). `Simulator::crash_node` / `reboot_node` remain the raw state flips (no limits, no ledger); episodes drive them through callbacks. Note that a crash closes the node's endpoints, and a heal performs the reboot — storage rollback and the `torn_write` decision — so a crashed node comes back with its durable bytes only.
+
+**Crash and pause are cooperative, not preemptive.** A crash marks the node down and closes its
+endpoints; peers see the close, and the crashed node's fibers fail at their next blocked call. A
+fiber that never blocks keeps running, and a write from a crashed node's fiber is not refused — the
+harness must treat the node as not running. Pause is the same limitation, one step earlier: it stops
+a fiber at its next scheduler boundary.
+
+**Pause is node-scoped, approximated at scheduler boundaries.** `PauseNode` parks every fiber of the node the next time it would run (a wake-up, a yield, a blocking call's return); the heal re-readies them in the order they parked. A CPU-bound loop that never yields is not frozen — that is the one difference from Antithesis, whose container-level pause stops the process mid-instruction. A paused node is unhealthy but is not charged to `max_crashed_nodes`; it still counts as live for the quorum. Only one node-fault (crash or pause) may be active per node (`node_busy` otherwise); partitions may overlap.
+
+**Persistent faults and liveness.** `abandon_node(node)` creates a crash with no heal; `enter_liveness_mode(core)` is a one-way transition that heals every active fault touching a core node and converts the rest to persistent (heal deadline withdrawn). After the transition, any new fault touching no core node is created persistent. Quiesce clears persistent faults too. The ledger marks those rows `persistent`, and the trace records the start with `amount = 0`.
+
+**Partitions are node-scoped.** Every endpoint remembers the node that created it, and a split drops cross-group traffic in both directions (`Stopped`, in Antithesis terms). A send still reports success, as a TCP buffer would; a cross-group `connect` is refused. `heal(id)` clears the split and wakes blocked `recv`/`poll`. Latency shaping and `Slowed`/`Jammed` partitions are not implemented; call-level `PacketDelay` remains the only latency knob.
 
 Episode faults (crashes, partitions) are not reached by application calls, so neither the gate chain's occurrence counting nor its per-call draw applies to them. They are triggered two ways, both fully deterministic and both **zero-draw** (Rule 11):
 
-1. **Imperative, from the harness**: `injector.crash_node(n2, 2s)` — the episode form of the shipped `Simulator::crash_node` (`docs/design.md` §9); P6 adds the reboot duration, the limits and the scheduled heal.
-2. **Scheduled, from the config**: `FaultConfig::scheduled_episodes` is a list of `(at, spec, until_heal)` triples. The engine arms one virtual-time event per entry at universe start; when the event fires, the injector attempts the episode start.
+1. **Imperative, from the harness**: `injector.crash_node(n2, 2s)` — the episode form of `Simulator::crash_node` (`docs/design.md` §9), with limits and the scheduled heal.
+2. **Scheduled, from the config**: `FaultConfig::scheduled_episodes` is a list of `(at, spec, until_heal)` triples. `Simulator::install_faults` arms one virtual-time event per entry at universe start (at most `kMaxScheduledEpisodes = 32`, checked by `validate()`), and the injector attempts the start when virtual time reaches `at`.
 
 The attempt is still subject to the **fault-model limits** (§2) and the **quiesce window** (§9.3): if starting the episode would break the promise, it is refused and recorded as `Skipped` with the limit's reason — a scheduled crash is not exempt from the building code. Because no draw is involved, `drew = no`.
 
@@ -853,7 +865,7 @@ struct ScheduledEpisode {
     Time        at;
     EpisodeSpec spec;
     Duration    until_heal;    // every episode schedules its own heal (Rule 5);
-                               // persistent faults use start_persistent() instead
+                               // persistent faults use abandon_node() instead
 };
 
 enum class ConfigError : uint8_t {
@@ -1002,8 +1014,8 @@ class FaultInjector {
                                              Duration until_heal);
     std::optional<EpisodeId> crash_node(NodeId id, Duration until_reboot);
 
-    // Persistent faults (§4.2.1): deliberately created without a heal event.
-    std::optional<EpisodeId> start_persistent(FaultClass cls, PersistentSpec spec);
+    // Persistent fault (§4.2.1): a crash deliberately created without a heal event.
+    std::optional<EpisodeId> abandon_node(NodeId id);
 
     void heal(EpisodeId id);
     void heal_all();                 // used by quiesce and the Restore fault
@@ -1135,8 +1147,8 @@ The declarations in §12 describe the **F6-complete** injector. Phases 1–5 shi
 | Constructor enforces `validate()` | `create()` returns `std::expected<BasicFaultInjector, ConfigProblem>`; the constructor is private, so there is no unchecked path | — the factory is the permanent shape |
 | `const VirtualClock&` | Templated on a `ClockLike` concept (anything answering `now()`). `include/cosmos/virtual_clock.hpp` is a placeholder pending the runtime clock | F6: replacing that header, with no change to the injector |
 | Categorical walk shown inline in `decide()` | Split into a pure `constexpr FaultKind select_outcome(double, const FaultRule&)`; `decide()` still takes exactly one `uniform()` per call | — permanent; see below |
-| Ledger | Records fires in fixed non-allocating storage (Rule 7), with the §11.1 printer. `LedgerEntry` carries `DecisionStatus`: a replay run's withheld fires are rows with `Suppressed`. Nothing yet produces `Skipped` | F6: episodes and heals produce `Skipped` |
-| Episodes, `begin_quiesce()`, mode transitions | Absent | F6 (episodes, limits, mode) |
+| Ledger | Records fires, heals and refusals in fixed non-allocating storage (Rule 7). `LedgerEntry` carries `DecisionStatus`, a `SkipReason` rendered as `reason=<name>` on `Skipped` rows, and a `persistent` marker | — |
+| Episodes, `begin_quiesce()`, mode transitions | Registry, `start_partition`/`crash_node`/`pause_node`/`abandon_node`/`heal`/`heal_all`/`begin_quiesce`, limits, partitions, scheduled arming and the one-way liveness transition exist. `start_persistent(FaultClass, PersistentSpec)` is narrowed to `abandon_node(NodeId)` because `PersistentSpec` was never defined | — (quiesce completeness in F6-S5) |
 
 **`Scheduler` is the event queue.** There is no separate `EventQueue` type: `Scheduler` owns the timer queue (`push_timer`, `advance_to_next_timer`, `run_until_quiescence`), so an episode heal is a timer entry exactly like a sleeping task's wake-up.
 
@@ -1376,6 +1388,12 @@ Fault ledger:
   t=61ms   Process  site=crash_node  FIRED    drew=no   node n2 crashed (scheduled episode)
   t=87ms   ← check "no-committed-data-loss" FAILED here
 ```
+
+**Executed (P6-S5).** `examples/distributed/replicated_kv.c` is this scenario: three node fibers,
+primary-backup replication over the in-process sockets, a buggy ack-after-send path and a fixed twin
+(`RKV_REQUIRE_BACKUP_ACK`). `tests/test_distributed.cpp` runs it under a scheduled partition plus
+crash, has the campaign find the failure, and has the minimizer keep exactly those two episodes.
+The quiesce-time oracle is what detects the loss.
 
 The user does not manually diff two states. The failing harness check **is** the detection: after quiesce it compared the independently observed state with the promised result. Diagnosis is reading the ledger *backward from `t=87ms`*: the network partition at `t=30ms` isolated `n1` right before `n2` crashed at `t=61ms`, which is the obvious suspect — `n1` likely committed a write it believed was replicated to `n2`, but `n2` never actually received it before crashing, and nothing else held a durable copy.
 

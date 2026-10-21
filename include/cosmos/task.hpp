@@ -6,10 +6,12 @@
 // which ready fiber runs next draws from the Schedule stream. Virtual time
 // advances only when no fiber is runnable, to the earliest timer.
 
+#include "cosmos/faults.hpp"
 #include "cosmos/memory.hpp"
 #include "cosmos/random.hpp"
 #include "cosmos/time.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <pthread.h>
@@ -42,6 +44,8 @@ struct Task {
     void* arg = nullptr;
     void* retval = nullptr;
     pthread_t id = 0;
+    // The simulated node this fiber belongs to; every node-scoped fault reads it (docs §9).
+    NodeId node = 0;
     State state = State::Ready;
     bool detached = false;
     // Error to return when resumed via deadlock fallback. 0 means normal wake.
@@ -73,6 +77,14 @@ struct Timer {
     Task* task = nullptr;
 };
 
+// A virtual-time callback; `id` breaks ties so firing order follows arming order.
+struct Deadline {
+    Time at{};
+    uint64_t id = 0;
+    void (*fn)(void*) = nullptr;
+    void* context = nullptr;
+};
+
 class Scheduler {
   public:
     explicit Scheduler(uint64_t schedule_seed, VirtualClock& clock);
@@ -86,6 +98,23 @@ class Scheduler {
     // Spawning. Returns 0 or an errno-style error (EINVAL/EAGAIN). Never
     // switches: the child runs when the current fiber next blocks or drains.
     int spawn(pthread_t* out, void* (*start)(void*), void* arg);
+    // Same, attributing every call the fiber makes to `node` (docs §9, §10.2).
+    int spawn(NodeId node, pthread_t* out, void* (*start)(void*), void* arg);
+
+    // Node of the running fiber; 0 for the main fiber and for engine callbacks.
+    NodeId current_node() const { return current_ != nullptr ? current_->node : 0; }
+
+    // Paused nodes stop at their next scheduler boundary; the resume re-readies their fibers.
+    void pause_node(NodeId node);
+    void resume_node(NodeId node);
+    bool node_paused(NodeId node) const;
+
+    // Fires at virtual `at`, before fibers woken at the same stamp; 0 means the table is full.
+    using DeadlineFn = void (*)(void*);
+    static constexpr size_t kMaxDeadlines = 64;
+    uint64_t schedule_at(Time at, DeadlineFn fn, void* context);
+    bool cancel_deadline(uint64_t id);
+    size_t pending_deadlines() const { return deadline_count_; }
 
     // Joining. Blocks the caller until target completes unless target is
     // already done. Returns 0, ESRCH, EINVAL (detached), or EDEADLK (self).
@@ -149,9 +178,18 @@ class Scheduler {
     void deliver_cond_waiter(SimCond::Waiter waiter);
     bool has_blocked() const;
     void push_timer(Task* task, Time wakeup);
+    // Single wake gate: a paused node's fiber parks instead of becoming runnable.
+    void make_ready(Task* task);
+    // Blocks the caller until its timer is due; deadlines may sit between timers.
+    void sleep_on_timer(Task* self);
+    // Fires every deadline due by `now`, earliest first; a callback may arm another.
+    void fire_deadlines(Time now);
+    void compact_deadlines();
     // Advances to the earliest timer and wakes everything due at that stamp.
-    // Returns false when no timers exist.
+    // Returns false when no timers or deadlines exist.
     bool advance_to_next_timer();
+    // Advances until something is runnable; false when neither timers nor deadlines remain.
+    bool advance_until_ready();
     [[noreturn]] void abort_deadlock(const char* what);
 
     Rng schedule_rng_;
@@ -163,6 +201,11 @@ class Scheduler {
     std::vector<SimMutex, RawRealAllocator<SimMutex>> mutexes_;
     std::vector<SimCond, RawRealAllocator<SimCond>> conds_;
     std::vector<Timer, RawRealAllocator<Timer>> timers_;
+    std::vector<bool> paused_;
+    std::vector<Task*, RawRealAllocator<Task*>> parked_;
+    std::array<Deadline, kMaxDeadlines> deadlines_{};
+    size_t deadline_count_ = 0;
+    uint64_t next_deadline_id_ = 1;
     uint64_t timer_seq_ = 0;
     uint64_t next_id_ = 1;
     bool deadlocked_ = false;

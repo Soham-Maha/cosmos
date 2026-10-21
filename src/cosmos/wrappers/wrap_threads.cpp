@@ -42,7 +42,8 @@ int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr,
     if (!cosmos::Simulator::has_current() || cosmos::wrappers::in_wrapper_logic) {
         return __real_pthread_create(thread, attr, start_routine, arg);
     }
-    return cosmos::Simulator::current()->scheduler().spawn(thread, start_routine, arg);
+    auto& scheduler = cosmos::Simulator::current()->scheduler();
+    return scheduler.spawn(scheduler.current_node(), thread, start_routine, arg);
 }
 
 int __wrap_pthread_join(pthread_t thread, void** retval) {

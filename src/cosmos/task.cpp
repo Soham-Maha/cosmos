@@ -143,20 +143,159 @@ void Scheduler::push_timer(Task* task, Time wakeup) {
     timers_.push_back(Timer{wakeup, timer_seq_++, task});
 }
 
-bool Scheduler::advance_to_next_timer() {
-    if (timers_.empty()) return false;
-    Time earliest = timers_.front().wakeup;
-    for (const Timer& timer : timers_) {
-        if (timer.wakeup < earliest) earliest = timer.wakeup;
+void Scheduler::compact_deadlines() {
+    size_t keep = 0;
+    for (size_t i = 0; i < deadline_count_; ++i) {
+        if (deadlines_[i].fn != nullptr) deadlines_[keep++] = deadlines_[i];
     }
+    deadline_count_ = keep;
+}
+
+bool Scheduler::cancel_deadline(uint64_t id) {
+    if (id == 0) return false;
+    for (size_t i = 0; i < deadline_count_; ++i) {
+        if (deadlines_[i].id == id && deadlines_[i].fn != nullptr) {
+            deadlines_[i].fn = nullptr;
+            compact_deadlines();
+            return true;
+        }
+    }
+    return false;
+}
+
+uint64_t Scheduler::schedule_at(Time at, DeadlineFn fn, void* context) {
+    if (fn == nullptr) return 0;
+    if (deadline_count_ == kMaxDeadlines) {
+        compact_deadlines();
+        if (deadline_count_ == kMaxDeadlines) return 0;
+    }
+    const uint64_t id = next_deadline_id_++;
+    deadlines_[deadline_count_++] = Deadline{at, id, fn, context};
+    return id;
+}
+
+void Scheduler::fire_deadlines(Time now) {
+    // Pick the earliest due entry each pass; the bound stops a self-rearming callback.
+    for (size_t fired = 0; fired <= kMaxDeadlines; ++fired) {
+        size_t best = kMaxDeadlines;
+        for (size_t i = 0; i < deadline_count_; ++i) {
+            const Deadline& due = deadlines_[i];
+            if (due.fn == nullptr || due.at > now) continue;
+            if (best == kMaxDeadlines || due.at < deadlines_[best].at ||
+                (due.at == deadlines_[best].at && due.id < deadlines_[best].id)) {
+                best = i;
+            }
+        }
+        if (best == kMaxDeadlines) break;
+        const Deadline entry = deadlines_[best];
+        deadlines_[best].fn = nullptr;
+        entry.fn(entry.context);
+    }
+    compact_deadlines();
+}
+
+bool Scheduler::node_paused(NodeId node) const { return node < paused_.size() && paused_[node]; }
+
+void Scheduler::make_ready(Task* task) {
+    task->state = Task::State::Ready;
+    task->wake_error = 0;
+    if (node_paused(task->node)) {
+        parked_.push_back(task);
+    } else {
+        ready_.push_back(task);
+    }
+}
+
+void Scheduler::pause_node(NodeId node) {
+    if (node >= paused_.size()) paused_.resize(static_cast<size_t>(node) + 1, false);
+    paused_[node] = true;
+    for (auto it = ready_.begin(); it != ready_.end();) {
+        if ((*it)->node == node) {
+            parked_.push_back(*it);
+            it = ready_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Scheduler::resume_node(NodeId node) {
+    if (node < paused_.size()) paused_[node] = false;
+    for (auto it = parked_.begin(); it != parked_.end();) {
+        if ((*it)->node == node) {
+            ready_.push_back(*it);
+            it = parked_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+bool Scheduler::advance_until_ready() {
+    while (ready_.empty() && (!timers_.empty() || deadline_count_ != 0)) {
+        if (!advance_to_next_timer()) break;
+    }
+    return !ready_.empty();
+}
+
+void Scheduler::sleep_on_timer(Task* self) {
+    self->state = Task::State::Sleeping;
+    self->wake_error = 0;
+    if (!ready_.empty()) {
+        switch_to(pick_next_ready());
+        return;
+    }
+    // Advance past deadlines that sit before this timer.
+    while (timer_holds(timers_, self) && ready_.empty()) {
+        if (!advance_to_next_timer()) break;
+    }
+    if (!timer_holds(timers_, self)) {
+        for (auto it = ready_.begin(); it != ready_.end(); ++it) {
+            if (*it == self) {
+                ready_.erase(it);
+                break;
+            }
+        }
+        // The wake landed on a pause: stay parked and let the drain reach the heal.
+        if (node_paused(self->node)) {
+            self->state = Task::State::Ready;
+            if (drain_requester_ != nullptr) {
+                switch_to(drain_requester_);
+            } else if (!ready_.empty()) {
+                switch_to(pick_next_ready());
+            }
+        }
+        self->state = Task::State::Running;
+        return;
+    }
+    if (!ready_.empty()) switch_to(pick_next_ready());
+}
+
+bool Scheduler::advance_to_next_timer() {
+    bool found = false;
+    Time earliest{};
+    for (const Timer& timer : timers_) {
+        if (!found || timer.wakeup < earliest) {
+            earliest = timer.wakeup;
+            found = true;
+        }
+    }
+    for (size_t i = 0; i < deadline_count_; ++i) {
+        if (deadlines_[i].fn == nullptr) continue;
+        if (!found || deadlines_[i].at < earliest) {
+            earliest = deadlines_[i].at;
+            found = true;
+        }
+    }
+    if (!found) return false;
     clock_.advance_to(earliest);
+    // Events at this stamp land before the fibers woken at the same instant.
+    fire_deadlines(earliest);
     std::vector<Timer, RawRealAllocator<Timer>> remaining;
     remaining.reserve(timers_.size());
     for (const Timer& timer : timers_) {
         if (timer.wakeup <= earliest) {
-            timer.task->state = Task::State::Ready;
-            timer.task->wake_error = 0;
-            ready_.push_back(timer.task);
+            make_ready(timer.task);
         } else {
             remaining.push_back(timer);
         }
@@ -177,6 +316,10 @@ bool Scheduler::advance_to_next_timer() {
 }
 
 int Scheduler::spawn(pthread_t* out, void* (*start)(void*), void* arg) {
+    return spawn(0, out, start, arg);
+}
+
+int Scheduler::spawn(NodeId node, pthread_t* out, void* (*start)(void*), void* arg) {
     if (out == nullptr || start == nullptr) return EINVAL;
     void* task_mem = __real_malloc(sizeof(Task));
     if (task_mem == nullptr) return EAGAIN;
@@ -188,6 +331,7 @@ int Scheduler::spawn(pthread_t* out, void* (*start)(void*), void* arg) {
     auto* task = new (task_mem) Task();
     task->stack = stack;
     task->stack_size = kFiberStackSize;
+    task->node = node;
     task->func = start;
     task->arg = arg;
     do {
@@ -206,7 +350,7 @@ int Scheduler::spawn(pthread_t* out, void* (*start)(void*), void* arg) {
     task->ctx.uc_stack.ss_flags = 0;
     task->ctx.uc_link = nullptr;
     ::makecontext(&task->ctx, reinterpret_cast<void (*)()>(&Scheduler::task_trampoline), 0);
-    ready_.push_back(task);
+    make_ready(task);
     all_tasks_.push_back(task);
     *out = task->id;
     return 0;
@@ -227,8 +371,7 @@ int Scheduler::join(pthread_t id, void** retval) {
     self->wake_error = 0;
     if (!ready_.empty()) {
         switch_to(pick_next_ready());
-    } else if (!timers_.empty()) {
-        advance_to_next_timer();
+    } else if (advance_until_ready()) {
         switch_to(pick_next_ready());
     } else {
         if (drain_requester_ != nullptr) {
@@ -265,7 +408,7 @@ pthread_t Scheduler::self() { return current_->id; }
     if (self == &main_task_) {
         main_task_.retval = retval;
         main_task_.state = Task::State::Done;
-        while (!ready_.empty() || !timers_.empty()) {
+        while (!ready_.empty() || !timers_.empty() || deadline_count_ != 0) {
             if (ready_.empty()) {
                 advance_to_next_timer();
                 continue;
@@ -321,8 +464,7 @@ int Scheduler::mutex_lock(pthread_mutex_t* mu) {
     self->wake_error = 0;
     if (!ready_.empty()) {
         switch_to(pick_next_ready());
-    } else if (!timers_.empty()) {
-        advance_to_next_timer();
+    } else if (advance_until_ready()) {
         switch_to(pick_next_ready());
     } else {
         if (drain_requester_ != nullptr) {
@@ -351,17 +493,13 @@ int Scheduler::mutex_unlock(pthread_mutex_t* mu) {
         Task* waiter = entry->waiters.front();
         entry->waiters.erase(entry->waiters.begin());
         entry->owner = waiter;
-        waiter->state = Task::State::Ready;
-        waiter->wake_error = 0;
-        ready_.push_back(waiter);
+        make_ready(waiter);
     } else {
         entry->locked = false;
         entry->owner = nullptr;
     }
     Task* self = current_;
-    self->state = Task::State::Ready;
-    self->wake_error = 0;
-    ready_.push_back(self);
+    make_ready(self);
     switch_to(pick_next_ready());
     return 0;
 }
@@ -408,9 +546,7 @@ int Scheduler::cond_wait(pthread_cond_t* cond, pthread_mutex_t* mu) {
         Task* waiter = mu_entry.waiters.front();
         mu_entry.waiters.erase(mu_entry.waiters.begin());
         mu_entry.owner = waiter;
-        waiter->state = Task::State::Ready;
-        waiter->wake_error = 0;
-        ready_.push_back(waiter);
+        make_ready(waiter);
     } else {
         mu_entry.locked = false;
         mu_entry.owner = nullptr;
@@ -420,8 +556,7 @@ int Scheduler::cond_wait(pthread_cond_t* cond, pthread_mutex_t* mu) {
     self->wake_error = 0;
     if (!ready_.empty()) {
         switch_to(pick_next_ready());
-    } else if (!timers_.empty()) {
-        advance_to_next_timer();
+    } else if (advance_until_ready()) {
         switch_to(pick_next_ready());
     } else {
         if (drain_requester_ != nullptr) {
@@ -448,9 +583,7 @@ void Scheduler::deliver_cond_waiter(SimCond::Waiter waiter) {
     if (!mu_entry.locked) {
         mu_entry.locked = true;
         mu_entry.owner = task;
-        task->state = Task::State::Ready;
-        task->wake_error = 0;
-        ready_.push_back(task);
+        make_ready(task);
     } else {
         mu_entry.waiters.push_back(task);
         task->state = Task::State::BlockedMutex;
@@ -466,9 +599,7 @@ int Scheduler::cond_signal(pthread_cond_t* cond) {
         deliver_cond_waiter(waiter);
     }
     Task* self = current_;
-    self->state = Task::State::Ready;
-    self->wake_error = 0;
-    ready_.push_back(self);
+    make_ready(self);
     switch_to(pick_next_ready());
     return 0;
 }
@@ -482,18 +613,14 @@ int Scheduler::cond_broadcast(pthread_cond_t* cond) {
             deliver_cond_waiter(waiter);
     }
     Task* self = current_;
-    self->state = Task::State::Ready;
-    self->wake_error = 0;
-    ready_.push_back(self);
+    make_ready(self);
     switch_to(pick_next_ready());
     return 0;
 }
 
 void Scheduler::yield() {
     Task* self = current_;
-    self->state = Task::State::Ready;
-    self->wake_error = 0;
-    ready_.push_back(self);
+    make_ready(self);
     switch_to(pick_next_ready());
 }
 
@@ -513,24 +640,7 @@ int Scheduler::sleep_ns(const struct timespec* req, struct timespec* rem) {
     }
     Task* self = current_;
     push_timer(self, clock_.now() + Duration{ns});
-    self->state = Task::State::Sleeping;
-    self->wake_error = 0;
-    if (!ready_.empty()) {
-        switch_to(pick_next_ready());
-    } else {
-        advance_to_next_timer();
-        if (timer_holds(timers_, self)) {
-            switch_to(pick_next_ready());
-        } else {
-            for (auto it = ready_.begin(); it != ready_.end(); ++it) {
-                if (*it == self) {
-                    ready_.erase(it);
-                    break;
-                }
-            }
-            self->state = Task::State::Running;
-        }
-    }
+    sleep_on_timer(self);
     write_zero(rem);
     return 0;
 }
@@ -573,24 +683,7 @@ int Scheduler::sleep_clock(clockid_t clk, int flags, const struct timespec* req,
         }
         Task* self = current_;
         push_timer(self, target);
-        self->state = Task::State::Sleeping;
-        self->wake_error = 0;
-        if (!ready_.empty()) {
-            switch_to(pick_next_ready());
-        } else {
-            advance_to_next_timer();
-            if (timer_holds(timers_, self)) {
-                switch_to(pick_next_ready());
-            } else {
-                for (auto it = ready_.begin(); it != ready_.end(); ++it) {
-                    if (*it == self) {
-                        ready_.erase(it);
-                        break;
-                    }
-                }
-                self->state = Task::State::Running;
-            }
-        }
+        sleep_on_timer(self);
         return 0;
     }
     const int64_t ns = timespec_ns(*req);
@@ -600,24 +693,7 @@ int Scheduler::sleep_clock(clockid_t clk, int flags, const struct timespec* req,
     }
     Task* self = current_;
     push_timer(self, clock_.now() + Duration{ns});
-    self->state = Task::State::Sleeping;
-    self->wake_error = 0;
-    if (!ready_.empty()) {
-        switch_to(pick_next_ready());
-    } else {
-        advance_to_next_timer();
-        if (timer_holds(timers_, self)) {
-            switch_to(pick_next_ready());
-        } else {
-            for (auto it = ready_.begin(); it != ready_.end(); ++it) {
-                if (*it == self) {
-                    ready_.erase(it);
-                    break;
-                }
-            }
-            self->state = Task::State::Running;
-        }
-    }
+    sleep_on_timer(self);
     write_zero(rem);
     return 0;
 }
@@ -627,7 +703,7 @@ void Scheduler::run_until_quiescence() {
     drain_requester_ = current_;
     deadlocked_ = false;
     while (true) {
-        if (ready_.empty() && timers_.empty()) break;
+        if (ready_.empty() && timers_.empty() && deadline_count_ == 0) break;
         if (ready_.empty()) {
             advance_to_next_timer();
             continue;
@@ -640,9 +716,7 @@ void Scheduler::run_until_quiescence() {
 
 void Scheduler::wake_joiners(Task* done) {
     for (Task* joiner : done->joiners) {
-        joiner->state = Task::State::Ready;
-        joiner->wake_error = 0;
-        ready_.push_back(joiner);
+        make_ready(joiner);
     }
     done->joiners.clear();
 }
@@ -662,8 +736,7 @@ void Scheduler::on_task_exit(Task* done) {
     wake_joiners(done);
     if (!ready_.empty()) {
         switch_to(pick_next_ready());
-    } else if (!timers_.empty()) {
-        advance_to_next_timer();
+    } else if (advance_until_ready()) {
         switch_to(pick_next_ready());
     } else {
         if (drain_requester_ != nullptr) {
