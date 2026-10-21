@@ -228,6 +228,24 @@ void test_install_faults_rejects_an_invalid_config() {
     std::cout << "[PASS] test_install_faults_rejects_an_invalid_config" << std::endl;
 }
 
+// seed() reports exactly the seed the Simulator was built with, including the default: it is
+// the repro key campaign findings will print, so it must never drift from the ctor argument.
+void test_simulator_seed_accessor_reports_ctor_argument() {
+    cosmos::Simulator default_sim;
+    assert(default_sim.seed() == cosmos::kDefaultUniverseSeed);
+
+    cosmos::Simulator sim(42);
+    assert(sim.seed() == 42);
+
+    cosmos::Simulator zero_sim(0);
+    assert(zero_sim.seed() == 0);
+
+    cosmos::Simulator max_sim(~0ULL);
+    assert(max_sim.seed() == ~0ULL);
+
+    std::cout << "[PASS] test_simulator_seed_accessor_reports_ctor_argument" << std::endl;
+}
+
 void test_simulator_virtual_clock() {
     using namespace cosmos::literals;
     cosmos::Simulator sim;
@@ -255,6 +273,7 @@ int main() {
     test_install_faults_derives_the_fault_stream();
     test_install_faults_is_once_only();
     test_install_faults_rejects_an_invalid_config();
+    test_simulator_seed_accessor_reports_ctor_argument();
     test_simulator_virtual_clock();
     std::cout << "All simulator tests passed successfully!" << std::endl;
     return 0;
