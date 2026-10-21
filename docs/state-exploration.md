@@ -133,6 +133,8 @@ State exploration is the process of walking as much of this tree as possible.
 
 ## 4. Level 1 — Seeded Fuzzing Campaign (Phase 3)
 
+> **Status — delivered in P4 (2026-10-14).** `include/cosmos/campaign.hpp` implements this level: fork-per-universe process containment, a fixed parallel worker pool, findings deduplicated by assertion id, `--seed S` repro via `run_single`, and the 10,000-universe swarm test (`tests/test_campaign.cpp`).
+
 ### What It Is
 
 The simplest and most important form of exploration. Run N independent universes, each with a different seed, across all available CPU cores. Collect all assertion failures. Print a `--seed S` repro command for every failure found.
@@ -276,11 +278,11 @@ The invariant that makes multi-threaded campaigning safe: **each universe is a p
 
 ### Crash Containment
 
-The campaign exists to find memory-corruption bugs, and a real segfault inside one universe takes down its worker thread — and, unprepared, the whole campaign process along with every sibling worker's findings. Level 1 mandates the cheap mitigations; subprocess isolation is the robust follow-up:
+The campaign exists to find memory-corruption bugs, and a real segfault inside one universe takes down its worker thread — and, unprepared, the whole campaign process along with every sibling worker's findings. As delivered in P4, subprocess isolation is the baseline; items 1–2 remain the cheap mitigations layered on top of it:
 
 1. **Per-worker current-seed marker.** Before running a seed, a worker publishes it to a per-worker slot. If the process dies, the marker identifies the crashing seed — that seed *is* the finding.
 2. **Incremental flushing.** Findings and `sometimes()` registrations accumulate in per-worker shards, merge into the shared report under one mutex, and the merged report is dumped to disk periodically (e.g. every 100 runs). A crash then loses at most the current universe — never the campaign.
-3. **Subprocess isolation (post-Phase 3).** Fork a child per seed (or per crashing seed) so the OS contains the blast radius. Deferred because items 1–2 already make crashes attributable and cheap to keep.
+3. **Subprocess isolation — delivered as fork-per-universe in P4.** Each worker's slice of seeds runs in a forked child (`include/cosmos/campaign.hpp`), so a segfault takes down one child, not the pool — and the child→parent transport is established as a side effect. Level 2's coverage bitmap (§5) and Level 3's branch forks (§6) both ride it.
 
 ### How `always` and `sometimes` Work
 
@@ -432,6 +434,8 @@ int main(int argc, char** argv) {
 
 ## 5. Level 2 — Coverage-Guided Seed Selection (Phase 5v2)
 
+> **Status — not started.** No sancov references exist outside docs. Two gaps below must be solved before v2 is buildable: the fork-boundary coverage transport ("The Fork Boundary") and the corpus scope decision ("Corpus Scope").
+
 ### What It Is
 
 Seeded fuzzing (Level 1) explores the state space blindly — each seed is as likely to hit new code as any other. Coverage-guided exploration **prefers seeds that exercise novel execution paths**, using compiler-inserted instrumentation to measure which code edges each execution reaches.
@@ -451,6 +455,17 @@ flowchart LR
     Corpus --> Mutate["Mutate seed\n(seed S + δ)"]
     Mutate --> Run
 ```
+
+### The Fork Boundary
+
+The design above assumes in-process runs, but the delivered campaign runs each worker's seed slice in a forked child (§4). The sancov callbacks and their edge bitmap accumulate **in the child** and die at `_exit` with it — without extra plumbing the parent's novelty check never sees a single child's coverage.
+
+Rule: **the edge bitmap rides the existing child→parent transport.** Two acceptable shapes, pick one:
+
+1. **Shared mmap.** The parent maps the bitmap region (and marks it shared) before `fork()`; each child's `__sanitizer_cov_trace_pc_guard` writes land in shared pages; the parent drains and merges after the child exits.
+2. **Pipe dump.** The child serializes its bitmap (or just the set of hit guard ids) and writes it over the existing child→parent channel immediately before `_exit`; the parent merges into the campaign-wide novelty union.
+
+Corpus state stays single-owner either way: **novelty is evaluated only in the parent.** Children never read the corpus; they only report what they hit — the same division of labor the findings transport already uses.
 
 ### Coverage Bitmap
 
@@ -482,6 +497,10 @@ new_seed = corpus_seed XOR splitmix64(mutation_counter)
 
 This ensures mutations explore seeds near interesting ones in the decision space, not random jumps.
 
+### Corpus Scope
+
+The corpus is **per-campaign by default**: `union_of_all_previous_bitmaps` spans only the universes run in this campaign, and the corpus evaporates when the campaign ends. Persistence across campaigns (store the interesting seeds and their bitmaps on disk; warm-start the next run) is a possible extension, not a Phase 5v2 requirement — revisit it only if campaigns' novel-edge rate demonstrably collapses.
+
 ### What This Catches That Level 1 Misses
 
 Level 1 might run 10,000 seeds and never exercise the error-handling branch inside `recv()` after a partial write. Coverage-guidance notices that no seed has hit that branch and **actively steers** new seeds toward it via mutation.
@@ -490,11 +509,13 @@ Level 1 might run 10,000 seeds and never exercise the error-handling branch insi
 
 ## 6. Level 3 — Snapshot Branching / Multiverse (Phase 5v3)
 
+> **Status — half delivered.** Decision-log minimization ships in P5-S3 (2026-10-18, `include/cosmos/minimize.hpp`): 1-minimal reduction, each replay trial in a forked child. What does not exist: the `Snapshot`/branch API itself, and the trace exporter (chrome-trace/file form of the canonical encoding in `include/cosmos/trace.hpp`). The fork()-first decision in this section is therefore the implementation plan, not a description of shipped code.
+
 ### What It Is
 
 The most powerful exploration mode. Instead of running every universe from scratch, the engine **forks** an execution at a choice point, explores one branch, then **rewinds** to the fork point and explores another branch — without replaying from the beginning.
 
-This is what Antithesis does at the hypervisor level (full VM memory snapshots). Cosmos does it in-process via explicit heap + RNG + event queue serialization.
+This is what Antithesis does at the hypervisor level (full VM memory snapshots). Cosmos does it via **`fork()`-COW universe branching** — the kernel does the state copy — with in-process serialization (explicit heap + RNG + event queue capture) kept only as the fallback design for a substrate that cannot fork.
 
 ### The Core Insight
 
@@ -595,6 +616,8 @@ struct Snapshot {
 };
 ```
 
+> **Normative struct.** This `Snapshot` is the authoritative Level 3 shape. `docs/architecture.md §6` shows a reduced 4-field sketch for the substrate-seam perspective — treat it as illustrative only. A snapshot missing the five fault sub-streams, budget counters, active episodes, quiet depth, `ledger_snapshot`, or sampled `config` cannot realign replay (`docs/fault-injection.md §7` Rule 2) and must not be implemented.
+
 ### Snapshot Allocation Discipline
 
 The `std::vector` fields above illustrate the shape, not the storage strategy. In production, snapshots must be captured from **pre-allocated arena storage, not `std::vector`**. Two reasons:
@@ -606,17 +629,17 @@ The rule that resolves both: **branch only at scheduler choice points** (which n
 
 ### Heap Capture Cost
 
-A naive L3 that deep-copies `heap_image` at *every* choice point copies the whole live heap hundreds of times per universe — the dominant cost of the whole exploration. Mitigation strategies, in the order they should be adopted:
+A naive L3 that deep-copies `heap_image` at *every* choice point copies the whole live heap hundreds of times per universe — the dominant cost of the whole exploration. The fork()-first decision dissolves it. Adopt strategies in this order:
 
-1. **Lazy capture** — snapshot at a choice point only when the explorer actually backtracks past it. The first pass through each point is free; typical explorations backtrack only at a small fraction of points.
-2. **Dirty tracking** — a per-allocation generation counter on `TrackedHeap` (which already tracks every allocation in `active_map_`, `include/cosmos/memory.hpp`), so restore-to-checkpoint copies only allocations modified since the previous capture rather than the full image.
-3. **`fork()` COW** — graduate to this earlier than "eventually" if universe heaps are large (see the strategy table below); the kernel does the copy-on-write work and the in-process heap image disappears entirely.
+1. **`fork()` COW** — the primary path. The kernel does the copy-on-write work, the in-process heap image never exists, and everything below becomes moot. One forked child per explored branch; the parent retains one branch and explores it in-process.
+2. **Lazy capture** — fallback for the in-process path: snapshot at a choice point only when the explorer actually backtracks past it. The first pass through each point is free; typical explorations backtrack only at a small fraction of points.
+3. **Dirty tracking** — last resort on the in-process path: a per-allocation generation counter on `TrackedHeap` (which already tracks every allocation in `active_map_`, `include/cosmos/memory.hpp`), so restore-to-checkpoint copies only allocations modified since the previous capture rather than the full image.
 
 The exploration loop should be budgeted in `CampaignConfig` (max snapshots, max retained per depth) so worst-case memory is bounded regardless of strategy chosen.
-```
-
 
 ### Save and Restore
+
+> The code below is the **fallback path's** shape: an in-process serialize/restore pair on `ISubstrate`. On the `fork()`-COW path (primary), neither method runs — the forked child *is* the snapshot, and restore semantics are "start the child at the fork point with the universe already live."
 
 ```cpp
 class SimSubstrate : public ISubstrate {
@@ -683,6 +706,17 @@ flowchart TD
     Next --> Run
 ```
 
+### Findings Under Branching
+
+`--seed S` stops identifying a finding the moment branching exists. Seed S's default draws pick one branch at every fork point; a finding reached on branch 3 of fork point 17 was not produced by the plain seed run, and replaying `--seed S` alone would explore the default branch again.
+
+Rules for branched findings — pin these before v3c builds:
+
+1. **A finding carries `{seed, branch_path}`.** `branch_path` is the ordered list of injected alternatives in the form `(fork_seq, choice)` — `fork_seq` is the ledger-entry sequence of the fork point, `choice` the rewritten alternative's index. Fork points are scheduler choice points, so they already have ledger entries to point at.
+2. **Repro honors the path with the minimizer's pattern.** `run_single` accepts an optional branch path (CLI form: `--path 17=3,...`) and applies each entry as a ledger rewrite — replay consumes the recorded alternative instead of the seeded draw, exactly how the minimizer's `--only-faults` seq filter works today. A branched finding prints both `--seed S` and `--path ...`.
+3. **The default path is the plain seed run.** An empty path injects nothing, so the run stays bit-identical to today's unbranched universe; every existing v1/v3a repro contract remains valid unchanged.
+4. **`trace_hash()` stays as-is; the path is part of the run's definition, not a hash input.** The verify double-run of a branched universe re-runs with the same path applied and compares the two branched runs' hashes.
+
 ### Decision Log and Minimization
 
 Every branch taken — both scheduler choices and fault decisions — is recorded in the **FaultLedger** (defined fully in `docs/fault-injection.md §11`). The ledger is the authoritative replay input for minimization.
@@ -728,7 +762,7 @@ The snapshot must capture all of this and restore it exactly. Two implementation
 | **Stack copy** | `memcpy` the full fiber stack into `FiberSnapshot::stack_bytes` | Simple; works for any fiber library |
 | **`fork()` COW** | `fork()` the process at the snapshot point; child explores branch A, parent explores branch B via COW pages | Zero copy cost; requires careful fd/signal cleanup |
 
-Phase 5v3 starts with stack copy (simpler, fully in-process) and may graduate to `fork()` COW for larger heaps.
+Phase 5v3 starts with `fork()` COW: the fork boundary already carries findings to the parent (§4, Crash Containment), COW dissolves both the heap-capture cost and the arena-storage problem above, and a forked child needs no stack restoration — its branch exploration starts at the fork point with the universe already live. The stack-copy path is the fallback, not the start: take it only for a substrate that cannot fork, and only after verifying the snapshot-first scheduler constraint below against the shipped Phase 1 scheduler.
 
 > **Scheduler design constraint:** "works for any fiber library" is true only of the *mechanism*, not the *scheduler*. Stack-copy snapshots require the Phase 1 fiber scheduler to be designed snapshot-first: each fiber on an isolated, contiguous stack, saved context as plain data (ucontext/assembly swapcontext, not a library with hidden per-fiber state), and no fiber-local TLS or side tables that a restore would miss. This must be pinned as a Phase 1 scheduler requirement, or Level 3 will have to rewrite the scheduler.
 
@@ -779,6 +813,14 @@ flowchart TD
 | `Campaign::run()` | All exploration | Phase 3 |
 | Sancov instrumentation | Coverage-guided | Phase 5v2 |
 | `save/restore_snapshot()` | Snapshot branching | Phase 5v3 |
+
+### Remaining Build Order (recommended, 2026-10-21)
+
+Level 1 is delivered (§4) and Level 3's decision-log half (minimization) is delivered (§6). No dependency edge above forces an order between Coverage and Snapshot — both depend only on Campaign — so the recommended order is value per effort:
+
+1. **v3b — trace export.** Build the chrome-trace/file exporter over the canonical encoding `include/cosmos/trace.hpp` already defines (encode/decode + FNV-1a). Smallest item; with the shipped minimizer it completes the "minimized repro traces" half of Phase 5's exit criteria immediately.
+2. **v3c — `fork()`-COW branching.** The child→parent transport exists (§4, Crash Containment); the remaining design answers are pinned in §6: the normative snapshot fields and the branched-finding repro contract ("Findings Under Branching").
+3. **v2 — sancov guidance.** Requires the fork-boundary coverage transport (§5, "The Fork Boundary") and the corpus scope decision; do it last — branching reduces how much blind-seed breadth is left to buy.
 
 ---
 
